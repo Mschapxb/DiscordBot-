@@ -1,0 +1,4 @@
+# Fichiers à ignorer
+.env
+history.json
+memory.json
