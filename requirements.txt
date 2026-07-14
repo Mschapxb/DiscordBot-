@@ -12,3 +12,5 @@ cerebras-cloud-sdk>=1.0.0
 python-dotenv>=1.0.0
 yt-dlp>=2024.1.0         # à garder à jour : YouTube casse régulièrement l'extraction
 aiohttp>=3.9.0           # keep-alive, panneau admin, ET les appels Groq/Gemini
+
+chess 

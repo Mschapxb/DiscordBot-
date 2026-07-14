@@ -489,7 +489,9 @@ _MEMORY = None
 _memory_dirty = False
 
 def _blank_memory():
-    return {"memories": [], "users": {}, "admins": [], "settings": {}, "audit": [], "reminders": [], "guilds": {}}
+    return {"memories": [], "users": {}, "admins": [], "settings": {}, "audit": [], "reminders": [],
+            "guilds": {}, "missions": [], "listen_channels": [], "mute_channels": [],
+            "rp_channels": []}
 
 def memory():
     """Accès au cache mémoire (chargé paresseusement)."""
@@ -1136,6 +1138,8 @@ DEFAULT_SETTINGS = {
     "persona_evolution": True,    # sa personnalité s'adapte à ce qu'elle apprend des membres
     "share_between_users": SHARE_USER_MEMORY,  # réutiliser la mémoire d'un membre pour un autre (§confidentialité)
     "rp_mode": "intelligent",     # intelligent | auto | toujours | jamais -> comment décide-t-on du roleplay
+    "bavardage": "jamais",        # jamais | discret | normal | bavard -> se mêle-t-elle aux discussions ?
+    "ecoute": "tous",             # tous | selection | aucune -> quels salons elle suit (défaut : tous)
 }
 AUDIT_MAX = 300
 IMPORTANCE_ORDER = {"faible": 0, "normale": 1, "haute": 2}
@@ -1950,8 +1954,8 @@ def resolve_role(guild, nom):
 MISSION_CHECK_MIN = 1           # la boucle bat toutes les minutes (chaque mission a SON rythme)
 MISSION_MAX_NEW = 3             # nb de nouveautés annoncées par passage (anti-flood)
 MISSION_KNOWN_CAP = 400         # mémoire des sujets déjà vus
-MISSION_TYPES = ("forum", "rappel", "consigne")
-MISSION_MIN_INTERVAL = {"forum": 15, "rappel": 5, "consigne": 10}   # minutes, par type
+MISSION_TYPES = ("forum", "rappel", "consigne", "meme")
+MISSION_MIN_INTERVAL = {"forum": 15, "rappel": 5, "consigne": 10, "meme": 15}   # minutes, par type
 
 def missions():
     return memory().setdefault("missions", [])
@@ -2143,6 +2147,133 @@ async def _mission_consigne(m, force=False, progress=None):
         progress(100, "Publié")
     return 1
 
+# ============================================================
+# MÈMES — récupération d'images par thème
+# ============================================================
+# Deux sources, la seconde en secours : Reddit bloque parfois les IP de
+# datacenter (Render), donc on passe d'abord par un relais public.
+MEME_API = "https://meme-api.com/gimme/{sub}"
+MEME_REDDIT = "https://www.reddit.com/r/{sub}/hot.json?limit=60"
+MEME_SEEN_CAP = 300
+
+MEME_THEMES = {
+    "général":       ["memes", "dankmemes", "funny"],
+    "programmation": ["ProgrammerHumor", "programmingmemes", "softwaregore"],
+    "jeux vidéo":    ["gamingmemes", "gaming", "pcmasterrace"],
+    "sombre":        ["dankmemes", "blackmagicfuckery", "cursedcomments"],
+    "fantasy":       ["dndmemes", "lotrmemes", "Eldenring"],
+    "chat":          ["cats", "catmemes", "IllegallySmolCats"],
+    "chien":         ["dogpictures", "rarepuppers"],
+    "science":       ["sciencememes", "physicsmemes"],
+    "histoire":      ["HistoryMemes"],
+    "animé":         ["Animemes", "goodanimemes"],
+    "français":      ["rance", "FranceDetendue"],
+    "absurde":       ["surrealmemes", "bonehurtingjuice"],
+}
+
+def meme_subs(theme):
+    """Traduit un thème libre en subreddits. Un thème inconnu est pris tel quel."""
+    t = (theme or "général").strip().lower()
+    for cle, subs in MEME_THEMES.items():
+        if t == cle or t in cle or cle in t:
+            return subs
+    return [re.sub(r"[^A-Za-z0-9_]", "", t.replace(" ", ""))] or ["memes"]
+
+def _est_image(url):
+    return bool(url) and re.search(r"\.(png|jpe?g|gif|webp)(\?|$)", url, re.I)
+
+async def fetch_meme(theme="général", exclus=()):
+    """Renvoie un mème {id, titre, image, lien, sub} — ou None."""
+    subs = meme_subs(theme)
+    random.shuffle(subs)
+    exclus = set(exclus or ())
+    async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
+        # --- Source 1 : relais public (rapide, un mème au hasard) ---
+        for sub in subs:
+            for _essai in range(3):        # on retente si on retombe sur du déjà-vu
+                try:
+                    async with session.get(MEME_API.format(sub=sub),
+                                           timeout=aiohttp.ClientTimeout(total=12)) as r:
+                        if r.status != 200:
+                            break
+                        d = await r.json()
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    break
+                url = d.get("url", "")
+                pid = d.get("postLink") or url
+                if d.get("nsfw") or d.get("spoiler") or not _est_image(url) or pid in exclus:
+                    continue
+                return {"id": pid, "titre": (d.get("title") or "")[:240], "image": url,
+                        "lien": d.get("postLink", ""), "sub": d.get("subreddit", sub)}
+
+        # --- Source 2 : Reddit en direct ---
+        for sub in subs:
+            try:
+                async with session.get(MEME_REDDIT.format(sub=sub),
+                                       timeout=aiohttp.ClientTimeout(total=12)) as r:
+                    if r.status != 200:
+                        continue
+                    d = await r.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                continue
+            posts = [p["data"] for p in d.get("data", {}).get("children", [])]
+            random.shuffle(posts)
+            for p in posts:
+                url = p.get("url_overridden_by_dest") or p.get("url", "")
+                pid = "https://reddit.com" + p.get("permalink", "")
+                if p.get("over_18") or p.get("stickied") or not _est_image(url) or pid in exclus:
+                    continue
+                return {"id": pid, "titre": (p.get("title") or "")[:240], "image": url,
+                        "lien": pid, "sub": p.get("subreddit", sub)}
+    return None
+
+async def publier_meme(channel, theme="général", exclus=(), mention_id=None):
+    """Poste un mème dans un salon. Renvoie son id (pour ne pas le reservir), ou None."""
+    m = await fetch_meme(theme, exclus)
+    if not m:
+        return None
+    embed = discord.Embed(title=m["titre"] or "…", url=m["lien"] or None,
+                          color=COULEURS["sombre"], timestamp=datetime.now(PARIS_TZ))
+    embed.set_image(url=m["image"])
+    embed.set_author(name=f"Mème — {theme}")
+    embed.set_footer(text=f"r/{m['sub']} · servi par Tenebris")
+    contenu = f"<@{mention_id}>" if mention_id else None
+    try:
+        await channel.send(content=contenu, embed=embed)
+    except (discord.errors.Forbidden, discord.HTTPException):
+        return None
+    return m["id"]
+
+async def _mission_meme(m, force=False, progress=None):
+    """Sert un mème du thème choisi, à intervalle régulier, sans jamais se répéter."""
+    if progress:
+        progress(15, "Recherche du salon…")
+    channel = await mission_destination(m)
+    if channel is None:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        return 0
+    theme = m.get("message") or "général"
+    if progress:
+        progress(50, f"Je fouille les mèmes « {theme} »…")
+    pid = await publier_meme(channel, theme, exclus=m.get("connus", []),
+                             mention_id=m.get("mention_id"))
+    if not pid:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
+        if progress:
+            progress(100, "Aucun mème trouvé cette fois.")
+        return 0
+    m["erreurs"] = 0
+    m["connus"] = ([pid] + list(m.get("connus", [])))[:MEME_SEEN_CAP]
+    m["envois"] = m.get("envois", 0) + 1
+    m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
+    m["dernier_trouve"] = m["dernier_check"]
+    mark_memory_dirty()
+    audit_log("meme", f"{m['nom']} — thème « {theme} »", actor="IA")
+    if progress:
+        progress(100, "Mème publié")
+    return 1
+
 async def _mission_forum(m, force=False, progress=None):
     """Regarde le forum, repère les sujets NOUVEAUX, les annonce dans le salon."""
     channel = bot.get_channel(int(m["channel_id"])) if m.get("channel_id") else None
@@ -2258,6 +2389,8 @@ async def run_mission(m, force=False, progress=None):
         return await _mission_rappel(m, force=force, progress=progress)
     if t == "consigne":
         return await _mission_consigne(m, force=force, progress=progress)
+    if t == "meme":
+        return await _mission_meme(m, force=force, progress=progress)
     return await _mission_forum(m, force=force, progress=progress)
 
 async def tool_lire_page(urls):
@@ -4151,6 +4284,397 @@ def tool_resoudre_attaques(nom_attaque="Attaque", attaquants=1, actions_chacun=1
     return DICE_DIRECTIVE + "\n".join(L)
 
 # ============================================================
+# JEUX — Puissance 4 (boutons) & Échecs (coups tapés dans le salon)
+# ============================================================
+# Deux moteurs de jeu réels, avec une IA qui réfléchit vraiment (minimax
+# alpha-bêta). Le calcul part dans un THREAD : sans ça, elle bloquerait tout le
+# bot pendant sa réflexion (Discord la croirait morte).
+try:
+    import chess as _chess
+    CHESS_OK = True
+except ImportError:                       # la lib n'est pas installée : on le dit proprement
+    _chess = None
+    CHESS_OK = False
+
+P4_COLS, P4_ROWS = 7, 6
+P4_DEPTH = 5                              # profondeur de réflexion (5 = solide, instantané)
+P4_PIECES = {0: "⚫", 1: "🔴", 2: "🟡"}
+P4_NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣"]
+CHESS_DEPTH = 3                           # profondeur des échecs (3 = ~1 s, honnête)
+GAME_TIMEOUT_MIN = 20                     # une partie abandonnée s'efface toute seule
+
+_P4 = {}        # channel_id -> partie de puissance 4
+_CHESS = {}     # channel_id -> partie d'échecs
+
+# ---------- Puissance 4 ----------
+def _p4_new(user_id, user_name):
+    return {"grille": [[0] * P4_COLS for _ in range(P4_ROWS)],
+            "joueur": int(user_id), "nom": user_name, "fini": False,
+            "coups": 0, "debut": time.time()}
+
+def _p4_libre(grille, col):
+    return grille[0][col] == 0
+
+def _p4_poser(grille, col, jeton):
+    for r in range(P4_ROWS - 1, -1, -1):
+        if grille[r][col] == 0:
+            grille[r][col] = jeton
+            return r
+    return None
+
+def _p4_lignes(grille):
+    """Toutes les fenêtres de 4 cases (horizontales, verticales, diagonales)."""
+    for r in range(P4_ROWS):
+        for c in range(P4_COLS):
+            if c + 3 < P4_COLS:
+                yield [grille[r][c + i] for i in range(4)]
+            if r + 3 < P4_ROWS:
+                yield [grille[r + i][c] for i in range(4)]
+            if c + 3 < P4_COLS and r + 3 < P4_ROWS:
+                yield [grille[r + i][c + i] for i in range(4)]
+            if c - 3 >= 0 and r + 3 < P4_ROWS:
+                yield [grille[r + i][c - i] for i in range(4)]
+
+def _p4_gagnant(grille):
+    for f in _p4_lignes(grille):
+        if f[0] and f.count(f[0]) == 4:
+            return f[0]
+    return 0
+
+def _p4_plein(grille):
+    return all(grille[0][c] != 0 for c in range(P4_COLS))
+
+def _p4_score(grille, moi=2):
+    lui = 1 if moi == 2 else 2
+    score = 0
+    for c in range(P4_COLS):              # le centre vaut de l'or
+        col = [grille[r][c] for r in range(P4_ROWS)]
+        score += col.count(moi) * (4 - abs(c - 3))
+    for f in _p4_lignes(grille):
+        a, b, vide = f.count(moi), f.count(lui), f.count(0)
+        if a == 4:
+            score += 100000
+        elif a == 3 and vide == 1:
+            score += 60
+        elif a == 2 and vide == 2:
+            score += 8
+        if b == 4:
+            score -= 100000
+        elif b == 3 and vide == 1:
+            score -= 75      # bloquer prime légèrement sur construire
+        elif b == 2 and vide == 2:
+            score -= 8
+    return score
+
+def _p4_minimax(grille, prof, alpha, beta, maximise):
+    gagnant = _p4_gagnant(grille)
+    if gagnant == 2:
+        return (None, 1000000 + prof)
+    if gagnant == 1:
+        return (None, -1000000 - prof)
+    if _p4_plein(grille):
+        return (None, 0)
+    if prof == 0:
+        return (None, _p4_score(grille))
+
+    ordre = sorted(range(P4_COLS), key=lambda c: abs(c - 3))   # on explore le centre d'abord
+    valides = [c for c in ordre if _p4_libre(grille, c)]
+    best = valides[0]
+    if maximise:
+        val = float("-inf")
+        for c in valides:
+            r = _p4_poser(grille, c, 2)
+            _, s = _p4_minimax(grille, prof - 1, alpha, beta, False)
+            grille[r][c] = 0
+            if s > val:
+                val, best = s, c
+            alpha = max(alpha, val)
+            if alpha >= beta:
+                break
+        return best, val
+    val = float("inf")
+    for c in valides:
+        r = _p4_poser(grille, c, 1)
+        _, s = _p4_minimax(grille, prof - 1, alpha, beta, True)
+        grille[r][c] = 0
+        if s < val:
+            val, best = s, c
+        beta = min(beta, val)
+        if alpha >= beta:
+            break
+    return best, val
+
+def _p4_reflechir(grille):
+    col, _ = _p4_minimax([row[:] for row in grille], P4_DEPTH, float("-inf"), float("inf"), True)
+    return col
+
+def p4_rendu(g, fin=""):
+    lignes = ["".join(P4_PIECES[c] for c in row) for row in g["grille"]]
+    plateau = "\n".join(lignes) + "\n" + "".join(P4_NUMS)
+    tete = f"**Puissance 4** — 🔴 {g['nom']}  vs  🟡 Tenebris"
+    return f"{tete}\n{plateau}" + (f"\n\n{fin}" if fin else "")
+
+class P4View(discord.ui.View):
+    """Les 7 colonnes, en boutons. Seul le joueur de la partie peut cliquer."""
+    def __init__(self, channel_id):
+        super().__init__(timeout=GAME_TIMEOUT_MIN * 60)
+        self.channel_id = int(channel_id)
+        for i in range(P4_COLS):
+            b = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.secondary,
+                                  row=0 if i < 4 else 1)
+            b.callback = self._faire(i)
+            self.add_item(b)
+
+    def _faire(self, col):
+        async def cb(interaction):
+            await p4_coup(interaction, self.channel_id, col, self)
+        return cb
+
+    async def on_timeout(self):
+        _P4.pop(self.channel_id, None)
+
+async def p4_coup(interaction, cid, col, view):
+    g = _P4.get(cid)
+    if not g or g["fini"]:
+        await interaction.response.send_message("Cette partie n'existe plus.", ephemeral=True)
+        return
+    if interaction.user.id != g["joueur"]:
+        await interaction.response.send_message(
+            f"Ce n'est pas ta partie — c'est celle de {g['nom']}.", ephemeral=True)
+        return
+    if not _p4_libre(g["grille"], col):
+        await interaction.response.send_message("Cette colonne est pleine.", ephemeral=True)
+        return
+
+    _p4_poser(g["grille"], col, 1)
+    g["coups"] += 1
+    if _p4_gagnant(g["grille"]) == 1:
+        g["fini"] = True
+        _P4.pop(cid, None)
+        for it in view.children:
+            it.disabled = True
+        await interaction.response.edit_message(
+            content=p4_rendu(g, f"🔴 **{g['nom']} l'emporte.** Savoure — je n'oublie pas."), view=view)
+        return
+    if _p4_plein(g["grille"]):
+        g["fini"] = True
+        _P4.pop(cid, None)
+        for it in view.children:
+            it.disabled = True
+        await interaction.response.edit_message(content=p4_rendu(g, "⚖️ **Match nul.**"), view=view)
+        return
+
+    await interaction.response.edit_message(content=p4_rendu(g, "🟡 *Je réfléchis…*"), view=view)
+    mien = await asyncio.to_thread(_p4_reflechir, g["grille"])
+    _p4_poser(g["grille"], mien, 2)
+    g["coups"] += 1
+
+    if _p4_gagnant(g["grille"]) == 2:
+        g["fini"] = True
+        _P4.pop(cid, None)
+        for it in view.children:
+            it.disabled = True
+        await interaction.edit_original_response(
+            content=p4_rendu(g, "🟡 **J'ai gagné.** Tu apprendras."), view=view)
+        return
+    if _p4_plein(g["grille"]):
+        g["fini"] = True
+        _P4.pop(cid, None)
+        for it in view.children:
+            it.disabled = True
+        await interaction.edit_original_response(content=p4_rendu(g, "⚖️ **Match nul.**"), view=view)
+        return
+    await interaction.edit_original_response(content=p4_rendu(g, f"🔴 À toi, {g['nom']}."), view=view)
+
+async def tool_puissance4(channel, user_id, user_name, action="commencer"):
+    if channel is None:
+        return "Il me faut un salon pour poser un plateau."
+    cid = int(channel.id)
+    if action == "abandonner":
+        if _P4.pop(cid, None):
+            return "Partie de Puissance 4 abandonnée."
+        return "Aucune partie de Puissance 4 en cours ici."
+    if cid in _P4:
+        return (f"Une partie est déjà en cours dans ce salon (contre {_P4[cid]['nom']}). "
+                "Termine-la, ou demande-moi d'abandonner.")
+    g = _p4_new(user_id, user_name)
+    _P4[cid] = g
+    view = P4View(cid)
+    await channel.send(p4_rendu(g, f"🔴 À toi, {g['nom']} — choisis ta colonne."), view=view)
+    return f"Plateau posé. {user_name} joue les rouges, je prends les jaunes."
+
+# ---------- Échecs ----------
+CHESS_VAL = {1: 100, 2: 320, 3: 330, 4: 500, 5: 900, 6: 0}   # P N B R Q K
+CHESS_CENTRE = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    5, 5, 5, 5, 5, 5, 5, 5,
+    5, 10, 15, 20, 20, 15, 10, 5,
+    5, 10, 20, 30, 30, 20, 10, 5,
+    5, 10, 20, 30, 30, 20, 10, 5,
+    5, 10, 15, 20, 20, 15, 10, 5,
+    5, 5, 5, 5, 5, 5, 5, 5,
+    0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+def _chess_eval(board):
+    """Positif = les Noirs (Tenebris) sont mieux. Matériel + occupation du centre."""
+    if board.is_checkmate():
+        return -999999 if board.turn == _chess.BLACK else 999999
+    if board.is_stalemate() or board.is_insufficient_material():
+        return 0
+    score = 0
+    for sq, piece in board.piece_map().items():
+        v = CHESS_VAL[piece.piece_type] + (CHESS_CENTRE[sq] // 3)
+        score += v if piece.color == _chess.BLACK else -v
+    return score
+
+def _chess_negamax(board, prof, alpha, beta):
+    if prof == 0 or board.is_game_over():
+        return _chess_eval(board) if board.turn == _chess.BLACK else -_chess_eval(board)
+    val = float("-inf")
+    coups = sorted(board.legal_moves, key=lambda m: (board.is_capture(m), board.gives_check(m)),
+                   reverse=True)      # captures et échecs d'abord : l'élagage mord bien mieux
+    for m in coups:
+        board.push(m)
+        s = -_chess_negamax(board, prof - 1, -beta, -alpha)
+        board.pop()
+        if s > val:
+            val = s
+        alpha = max(alpha, val)
+        if alpha >= beta:
+            break
+    return val
+
+def _chess_reflechir(board):
+    best, meilleur = None, float("-inf")
+    coups = sorted(board.legal_moves, key=lambda m: (board.is_capture(m), board.gives_check(m)),
+                   reverse=True)
+    for m in coups:
+        board.push(m)
+        s = -_chess_negamax(board, CHESS_DEPTH - 1, float("-inf"), float("inf"))
+        board.pop()
+        if s > meilleur or best is None:
+            meilleur, best = s, m
+    return best
+
+def chess_rendu(g, fin=""):
+    b = g["board"]
+    grille = str(b).split("\n")
+    symboles = {"P": "♟", "N": "♞", "B": "♝", "R": "♜", "Q": "♛", "K": "♚",
+                "p": "♙", "n": "♘", "b": "♗", "r": "♖", "q": "♕", "k": "♔", ".": "·"}
+    lignes = []
+    for i, row in enumerate(grille):
+        cases = " ".join(symboles.get(c, c) for c in row.split())
+        lignes.append(f"{8 - i} | {cases}")
+    lignes.append("    ---------------")
+    lignes.append("    a b c d e f g h")
+    plateau = "```\n" + "\n".join(lignes) + "\n```"
+    tete = f"**Échecs** — ⚪ {g['nom']}  vs  ⚫ Tenebris"
+    dernier = f"\nDernier coup : `{g['dernier']}`" if g.get("dernier") else ""
+    trait = "" if fin else ("\n⚠️ **Échec au roi.**" if b.is_check() else "")
+    pied = fin or f"À toi — écris ton coup (`e4`, `Cf3`, `e2e4`)."
+    return f"{tete}{dernier}\n{plateau}{trait}\n{pied}"
+
+def chess_fin(board):
+    """Le mot de la fin, ou None si la partie continue."""
+    if board.is_checkmate():
+        return ("♚ **Échec et mat — je l'emporte.**" if board.turn == _chess.WHITE
+                else "♔ **Échec et mat — tu m'as eue.** Je m'en souviendrai.")
+    if board.is_stalemate():
+        return "⚖️ **Pat.** Personne ne gagne."
+    if board.is_insufficient_material():
+        return "⚖️ **Nulle** — plus assez de matière pour tuer."
+    if board.can_claim_threefold_repetition():
+        return "⚖️ **Nulle par répétition.**"
+    if board.is_fifty_moves():
+        return "⚖️ **Nulle** — cinquante coups sans rien."
+    return None
+
+CHESS_FR = {"R": "K", "D": "Q", "T": "R", "F": "B", "C": "N"}   # Roi Dame Tour Fou Cavalier
+
+def _chess_fr_vers_en(coup):
+    """« Cf3 » → « Nf3 ». Uniquement en DERNIER recours : « Re1 » est une tour en anglais
+    et un roi en français — on ne traduit donc qu'après avoir échoué en notation standard."""
+    c = coup.strip()
+    if c and c[0] in CHESS_FR:
+        return CHESS_FR[c[0]] + c[1:]
+    return c
+
+async def chess_jouer_coup(channel, g, texte):
+    """Applique le coup du joueur puis répond. Renvoie le message à afficher, ou None."""
+    b = g["board"]
+    coup = None
+    essais = [texte, texte, _chess_fr_vers_en(texte)]
+    for parse, brut in ((b.parse_san, essais[0]), (b.parse_uci, essais[1]), (b.parse_san, essais[2])):
+        try:
+            coup = parse(brut)
+            break
+        except Exception:
+            continue
+    if coup is None or coup not in b.legal_moves:
+        return f"`{texte}` n'est pas un coup légal. Écris `e4`, `Cf3` (ou `Nf3`), ou `e2e4`."
+
+    b.push(coup)
+    g["dernier"] = texte
+    fin = chess_fin(b)
+    if fin:
+        _CHESS.pop(int(channel.id), None)
+        return chess_rendu(g, fin)
+
+    async with channel.typing():
+        mien = await asyncio.to_thread(_chess_reflechir, b)
+    if mien is None:
+        _CHESS.pop(int(channel.id), None)
+        return chess_rendu(g, "⚖️ **Partie terminée.**")
+    san = b.san(mien)
+    b.push(mien)
+    g["dernier"] = san
+    fin = chess_fin(b)
+    if fin:
+        _CHESS.pop(int(channel.id), None)
+        return chess_rendu(g, fin)
+    return chess_rendu(g)
+
+async def tool_echecs(channel, user_id, user_name, action="commencer", coup=""):
+    if not CHESS_OK:
+        return ("Je ne peux pas jouer aux échecs : la bibliothèque `chess` manque. "
+                "Ajoute la ligne `chess` à requirements.txt et redéploie-moi.")
+    if channel is None:
+        return "Il me faut un salon pour poser un échiquier."
+    cid = int(channel.id)
+
+    if action == "abandonner":
+        if _CHESS.pop(cid, None):
+            return "Partie d'échecs abandonnée. Sage."
+        return "Aucune partie d'échecs en cours ici."
+
+    if action in ("coup", "jouer"):
+        g = _CHESS.get(cid)
+        if not g:
+            return "Aucune partie en cours. Demande-moi d'en commencer une."
+        if int(user_id) != g["joueur"]:
+            return f"Ce n'est pas ta partie — c'est celle de {g['nom']}."
+        rendu = await chess_jouer_coup(channel, g, (coup or "").strip())
+        await channel.send(rendu)
+        return "(plateau publié)"
+
+    if action == "plateau":
+        g = _CHESS.get(cid)
+        if not g:
+            return "Aucune partie en cours ici."
+        await channel.send(chess_rendu(g))
+        return "(plateau publié)"
+
+    if cid in _CHESS:
+        return f"Une partie est déjà en cours ici (contre {_CHESS[cid]['nom']})."
+    g = {"board": _chess.Board(), "joueur": int(user_id), "nom": user_name,
+         "dernier": "", "debut": time.time()}
+    _CHESS[cid] = g
+    await channel.send(chess_rendu(g, f"⚪ Tu as les Blancs, {user_name}. Ouvre le bal — "
+                                       "écris ton coup dans le salon (`e4`, `Cf3`, `e2e4`)."))
+    return "Échiquier posé. Le joueur a les Blancs, je prends les Noirs."
+
+# ============================================================
 # TOOL CALLING NATIF (Cerebras)
 # ============================================================
 TOOLS = [
@@ -4411,6 +4935,31 @@ TOOLS = [
             "nom": {"type": "string", "description": "Nom court du rappel (facultatif)"}},
             "required": ["message", "toutes_les_min", "jusqu_au"]}}},
     {"type": "function", "function": {
+        "name": "jouer_a",
+        "description": "JOUE À UN JEU avec la personne. Appelle cet outil dès qu'on te propose une partie : « on joue au puissance 4 ? », « une partie d'échecs ? », « joue avec moi », « t'es cap de me battre aux échecs ». Le Puissance 4 se joue avec des boutons ; aux échecs la personne écrit ses coups directement dans le salon (e4, Cf3, e2e4). Tu joues vraiment : tu calcules tes coups.",
+        "parameters": {"type": "object", "properties": {
+            "jeu": {"type": "string", "enum": ["puissance4", "echecs"], "description": "Le jeu voulu"},
+            "action": {"type": "string", "enum": ["commencer", "coup", "plateau", "abandonner"],
+                       "description": "commencer une partie (défaut), jouer un coup, revoir le plateau, ou abandonner"},
+            "coup": {"type": "string", "description": "Aux échecs : le coup (e4, Cf3, e2e4). Au puissance 4 : la colonne 1-7."}},
+            "required": ["jeu"]}}},
+    {"type": "function", "function": {
+        "name": "poster_meme",
+        "description": "Publie un MÈME sur un thème. Pour « envoie un mème », « balance un meme de programmeur », « fais-moi rire ». Thèmes connus : général, programmation, jeux vidéo, sombre, fantasy, chat, chien, science, histoire, animé, français, absurde — ou n'importe quel nom de subreddit.",
+        "parameters": {"type": "object", "properties": {
+            "theme": {"type": "string", "description": "Le thème du mème (défaut : général)"},
+            "salon": {"type": "string", "description": "Salon où publier (défaut : le salon courant)"}}}}},
+    {"type": "function", "function": {
+        "name": "memes_reguliers",
+        "description": "Te charge d'une MISSION : publier un mème d'un thème donné à intervalle régulier, jusqu'à une date de fin (ou sans fin). Pour « poste un mème par jour dans #détente », « balance-nous un meme de dev toutes les 4 h ». Réservé aux admins.",
+        "parameters": {"type": "object", "properties": {
+            "theme": {"type": "string", "description": "Thème des mèmes (ex : programmation, chat, fantasy)"},
+            "toutes_les_min": {"type": "integer", "description": "Intervalle en minutes (minimum 15)"},
+            "salon": {"type": "string", "description": "Salon où publier (défaut : le salon courant)"},
+            "jusqu_au": {"type": "string", "description": "Date de fin facultative ('2026-09-01', '+30j'). Vide = sans fin."},
+            "nom": {"type": "string", "description": "Nom de la mission (facultatif)"}},
+            "required": ["theme", "toutes_les_min"]}}},
+    {"type": "function", "function": {
         "name": "arreter_mission",
         "description": "Arrête et supprime une mission en cours (veille de forum, rappel récurrent, consigne récurrente) via son identifiant — voir lister_missions. Réservé aux admins.",
         "parameters": {"type": "object", "properties": {
@@ -4424,7 +4973,7 @@ TOOLS = [
 # - lancer_des / resoudre_attaques restent PUBLICS : ils ne touchent à rien, ils tirent des dés.
 ELEVATED_TOOLS = {"noter_consigne", "envoyer_salon", "envoyer_mp", "programmer_rappel", "annuler_rappel",
                   "creer_sondage", "reagir", "epingler", "creer_fil", "annoncer", "surveiller_forum",
-                  "rappel_recurrent", "arreter_mission"}
+                  "rappel_recurrent", "arreter_mission", "memes_reguliers"}
 MSCHAP_ONLY_TOOLS = ELEVATED_TOOLS  # alias rétro-compatible
 PUBLIC_TOOL_NAMES = {t["function"]["name"] for t in TOOLS} - ELEVATED_TOOLS
 PUBLIC_TOOLS = [t for t in TOOLS if t["function"]["name"] in PUBLIC_TOOL_NAMES]
@@ -4793,6 +5342,54 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             n_prevu = max(1, int((fin_dt - now()).total_seconds() // (interval * 60)))
             return (f"✅ Rappel récurrent programmé : toutes les {interval} min {ou}, "
                     f"jusqu'au {fin_dt:%d/%m/%Y à %H:%M} (environ {n_prevu} envoi(s)). [id {mid}]")
+        if name == "jouer_a":
+            ch = here or (guild and resolve_channel_anywhere(guild, None))
+            if ch is None:
+                return "Il me faut un salon pour poser un plateau."
+            jeu = (args.get("jeu") or "").lower()
+            act = (args.get("action") or "commencer").lower()
+            nom = caller_name or "toi"
+            if "echec" in jeu or "chess" in jeu:
+                return await tool_echecs(ch, caller_id, nom, action=act, coup=args.get("coup", ""))
+            if act in ("coup", "jouer"):
+                return ("Au Puissance 4, on joue avec les boutons sous le plateau — "
+                        "clique ta colonne.")
+            return await tool_puissance4(ch, caller_id, nom, action=act)
+        if name == "poster_meme":
+            ch = (resolve_channel_anywhere(guild, args.get("salon")) if (guild and args.get("salon"))
+                  else here)
+            if ch is None:
+                return "Je ne sais pas où poster ce mème."
+            theme = (args.get("theme") or "général").strip()
+            pid = await publier_meme(ch, theme)
+            if not pid:
+                return f"Je n'ai rien trouvé de potable sur le thème « {theme} »."
+            audit_log("meme", f"{theme} → #{getattr(ch, 'name', '?')}", actor=(caller_name or "?"))
+            return f"Mème « {theme} » publié dans #{getattr(ch, 'name', '?')}."
+        if name == "memes_reguliers":
+            if not caller_is_admin:
+                return "Me confier une mission de mèmes est réservé à mes administrateurs."
+            if guild is None:
+                return "Il me faut un serveur et un salon."
+            ch = resolve_channel_anywhere(guild, args.get("salon")) or here
+            if ch is None:
+                return f"Salon introuvable : {args.get('salon')}"
+            theme = (args.get("theme") or "général").strip()
+            interval = max(15, int(args.get("toutes_les_min") or 240))
+            fin_txt = ""
+            if args.get("jusqu_au"):
+                fin_dt = parse_when(args.get("jusqu_au"))
+                if fin_dt is None or fin_dt <= now():
+                    return "Je n'ai pas compris la date de fin (ou elle est déjà passée)."
+                fin_txt = fin_dt.strftime("%Y-%m-%d %H:%M")
+            mid = add_mission(args.get("nom") or f"Mèmes — {theme}", "", guild.id, ch.id,
+                              interval_min=interval, type_="meme", message=theme,
+                              fin=fin_txt, demarrer_maintenant=True)
+            await flush_memory()
+            audit_log("mission_creee", f"mèmes « {theme} » → #{ch.name}", actor=(caller_name or "?"))
+            bout = f" jusqu'au {fin_txt}" if fin_txt else " sans fin"
+            return (f"✅ Mission acceptée : un mème « {theme} » dans #{ch.name} toutes les "
+                    f"{interval} min{bout}. [id {mid}]")
         if name == "arreter_mission":
             if not caller_is_admin:
                 return "Arrêter une mission est réservé à mes administrateurs."
@@ -5013,6 +5610,239 @@ RP_PROMPT_SUFFIX = (
     "laisse toujours une prise à l'autre joueur. Ne parle pas à la place de son personnage. "
     "Si une demande sort vraiment du cadre, détourne-la DANS la narration plutôt que de rompre l'illusion."
 )
+
+
+# ============================================================
+# ÉCOUTE — elle suit la discussion, y prend part, et apprend des gens
+# ============================================================
+# Jusqu'ici elle était SOURDE : sans mention, elle n'entendait rien. Ici elle
+# écoute les salons qu'on lui ouvre, retient qui parle de quoi, et intervient
+# de temps en temps — jamais à chaque message (spam + facture de tokens).
+#
+# Trois verrous, dans cet ordre, avant qu'elle n'ouvre la bouche :
+#   1. le salon doit être explicitement ouvert à l'écoute (²T ecoute)
+#   2. un délai minimum depuis sa dernière intervention dans ce salon
+#   3. un plafond horaire, puis un tirage au sort selon le niveau de bavardage
+LISTEN_BUF_MAX = 40             # messages gardés par salon (fenêtre d'écoute)
+LISTEN_LEARN_EVERY = 25         # apprend des gens tous les N messages entendus
+LISTEN_LEARN_AUTHORS = 3        # nb d'auteurs analysés par passage
+LISTEN_LEARN_MAX_HOUR = 12      # plafond GLOBAL d'apprentissages/heure (protège le quota)
+LISTEN_COOLDOWN_MIN = 6         # délai minimum entre deux interventions spontanées
+LISTEN_MIN_MESSAGES = 4         # messages à entendre avant de pouvoir reparler
+LISTEN_MAX_PER_HOUR = 5         # plafond dur d'interventions, quel que soit le niveau
+LISTEN_CHANCE = {"jamais": 0.0, "discret": 0.06, "normal": 0.15, "bavard": 0.32}
+
+_chan_buf = {}          # channel_id -> [ {uid, nom, texte, quand} ]
+_chan_heard = {}        # channel_id -> messages entendus depuis le dernier apprentissage
+_chan_since = {}        # channel_id -> messages entendus depuis sa dernière prise de parole
+_chan_last = {}         # channel_id -> instant de sa dernière prise de parole
+_chan_hour = {}         # channel_id -> [début de l'heure, nb d'interventions]
+_learning = set()       # salons dont l'apprentissage est en cours
+_learn_hour = [0, 0]    # [début de l'heure, nb d'apprentissages] — plafond global
+
+# --- Qui écoute-t-elle ? -----------------------------------------------------
+# Par DÉFAUT : tous les salons de tous les serveurs (mode « tous »). Elle y apprend
+# en silence ; elle n'y PARLE que si le bavardage est réglé au-dessus de « jamais ».
+# On ferme les salons au cas par cas (liste noire). Le mode « selection » inverse la
+# logique : elle n'écoute alors QUE les salons explicitement ouverts.
+def listen_mode():
+    return get_setting("ecoute", "tous")
+
+def listen_channels():
+    """Salons explicitement OUVERTS (utile seulement en mode « selection »)."""
+    return set(memory().get("listen_channels", []) or [])
+
+def mute_channels():
+    """Salons explicitement FERMÉS (la liste noire du mode « tous »)."""
+    return set(memory().get("mute_channels", []) or [])
+
+def is_listening(channel):
+    """Écoute-t-elle CE salon, ici, maintenant ?"""
+    if channel is None or getattr(channel, "guild", None) is None:
+        return False
+    mode = listen_mode()
+    if mode == "aucune":
+        return False
+    cid = int(channel.id)
+    if mode == "selection":
+        return cid in listen_channels()
+    return cid not in mute_channels()          # mode « tous » : écoute sauf si mise en sourdine
+
+def toggle_listen_channel(channel_id, on=None):
+    """Ouvre ou ferme un salon, quel que soit le mode. Renvoie l'état final (écoutée ou non)."""
+    cid = int(channel_id)
+    mode = listen_mode()
+    if mode == "selection":
+        ids = listen_channels()
+        etat = (cid not in ids) if on is None else bool(on)
+        ids.add(cid) if etat else ids.discard(cid)
+        memory()["listen_channels"] = sorted(ids)
+    else:
+        muets = mute_channels()
+        etat = (cid in muets) if on is None else bool(on)
+        muets.discard(cid) if etat else muets.add(cid)
+        memory()["mute_channels"] = sorted(muets)
+    if not etat:
+        _chan_buf.pop(cid, None)
+    mark_memory_dirty()
+    return etat
+
+def note_presence(user_id, username, display_name=None):
+    """Met à jour la fiche SANS compter une interaction : elle a entendu, pas conversé."""
+    rec = _user_record(str(user_id))
+    rec["username"] = username
+    if display_name:
+        rec["display_name"] = display_name
+    rec["last_seen"] = now().strftime("%Y-%m-%d %H:%M")
+    rec["entendus"] = rec.get("entendus", 0) + 1
+    mark_memory_dirty()
+
+def _learn_budget():
+    """Elle écoute peut-être 30 salons : sans plafond global, le quota Cerebras fond."""
+    if time.time() - _learn_hour[0] > 3600:
+        _learn_hour[0], _learn_hour[1] = time.time(), 0
+    return _learn_hour[1] < LISTEN_LEARN_MAX_HOUR
+
+def _transcript(cid, limite=20):
+    return "\n".join(f"{m['nom']} : {m['texte']}" for m in _chan_buf.get(cid, [])[-limite:])
+
+def _peut_parler(cid, niveau):
+    """Les trois verrous. Renvoie True si elle a le droit de s'inviter maintenant."""
+    if niveau == "jamais":
+        return False
+    if _chan_since.get(cid, 0) < LISTEN_MIN_MESSAGES:
+        return False
+    if time.time() - _chan_last.get(cid, 0) < LISTEN_COOLDOWN_MIN * 60:
+        return False
+    heure, n = _chan_hour.get(cid, (0, 0))
+    if time.time() - heure > 3600:
+        _chan_hour[cid] = (time.time(), 0)
+    elif n >= LISTEN_MAX_PER_HOUR:
+        return False
+    return random.random() < LISTEN_CHANCE.get(niveau, 0.0)
+
+_APPELEE = re.compile(r"\bt[eé]n[eè]bris\b|\bteneb\b", re.IGNORECASE)
+
+async def learn_from_chatter(cid, guild):
+    """Tire des notes durables sur les gens à partir de ce qu'elle a entendu.
+    Même moteur que l'observation de serveur, mais en continu et sur le vif."""
+    if cid in _learning or not get_setting("auto_note", True) or quota_exhausted():
+        return
+    if not _learn_budget():
+        print("👂 Apprentissage passif en pause : plafond horaire atteint.")
+        return
+    _learn_hour[1] += 1
+    _learning.add(cid)
+    try:
+        par_auteur = {}
+        for m in _chan_buf.get(cid, []):
+            if len((m.get("texte") or "").strip()) < 12:
+                continue                       # « lol », « ok » : rien à en tirer
+            par_auteur.setdefault(m["uid"], {"nom": m["nom"], "msgs": []})["msgs"].append(m["texte"][:300])
+        ordre = sorted(par_auteur.items(), key=lambda kv: -len(kv[1]["msgs"]))[:LISTEN_LEARN_AUTHORS]
+        for uid, d in ordre:
+            if len(d["msgs"]) < 3:
+                continue
+            try:
+                resp = await extract_completion(
+                    [{"role": "system", "content": OBSERVE_SYSTEM},
+                     {"role": "user", "content": OBSERVE_PROMPT.format(
+                         name=d["nom"], msgs="\n".join(f"- {x}" for x in d["msgs"][:15]))}],
+                    max_tokens=350,
+                )
+                faits = _parse_json_loose(resp.choices[0].message.content)
+                if isinstance(faits, dict):
+                    faits = faits.get("notes") or faits.get("facts") or []
+                for f in faits if isinstance(faits, list) else []:
+                    texte = f.get("text") if isinstance(f, dict) else (f if isinstance(f, str) else None)
+                    if not texte:
+                        continue
+                    imp = f.get("importance", "normale") if isinstance(f, dict) else "normale"
+                    if add_user_note(uid, texte, category="écoute", importance=imp, author="IA"):
+                        print(f"👂 Apprise sur {d['nom']} : {texte[:80]}")
+            except Exception as e:
+                if note_quota_error(e):
+                    break
+                print(f"⚠️ Apprentissage passif : {str(e)[:90]}")
+        mark_memory_dirty()
+    finally:
+        _learning.discard(cid)
+
+async def intervenir(message, cid):
+    """Elle s'invite dans la conversation. Court, à propos, sans outils (donc pas cher)."""
+    guild_ctx = get_guild_context(message)
+    system = "\n\n".join([
+        persona_block(),
+        f"CONTEXTE : {guild_ctx}",
+        "TU T'INVITES DANS LA CONVERSATION.\n"
+        "Personne ne t'a appelée : tu écoutais, et tu prends la parole parce que tu as quelque "
+        "chose à dire. Une ou deux phrases, PAS PLUS. Tu rebondis sur ce qui vient d'être dit, "
+        "tu t'adresses aux gens par leur nom, tu ne te présentes pas, tu ne demandes pas ce "
+        "qu'on veut, tu ne récites pas ce que tu sais d'eux. Si tu n'as rien de vraiment "
+        "intéressant à apporter, réponds exactement : RIEN",
+    ])
+    transcript = _transcript(cid, 14)
+    try:
+        resp = await llm_completion(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": "Derniers messages du salon :\n" + transcript +
+                                         "\n\nTa remarque (ou RIEN) :"}],
+            route="chat", tools=None, temperature=0.9, max_tokens=200,
+        )
+        texte = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"⚠️ Intervention avortée : {str(e)[:90]}")
+        return
+
+    if not texte or texte.upper().startswith("RIEN") or len(texte) < 4:
+        _chan_since[cid] = 0          # elle s'est tue : on repart pour un tour d'écoute
+        return
+
+    try:
+        await message.channel.send(texte[:1900])
+    except (discord.errors.Forbidden, discord.HTTPException):
+        return
+
+    _chan_last[cid] = time.time()
+    _chan_since[cid] = 0
+    h, n = _chan_hour.get(cid, (time.time(), 0))
+    _chan_hour[cid] = (h, n + 1)
+    print(f"🗣️ Intervention spontanée dans #{message.channel.name} : {texte[:70]}")
+
+async def ecouter(message):
+    """Appelée pour CHAQUE message d'un salon écouté (sans mention).
+    Elle mémorise, apprend, et décide si elle a quelque chose à dire."""
+    cid = int(message.channel.id)
+    texte = (message.content or "").strip()
+    if not texte or texte.startswith("²T "):
+        return
+
+    buf = _chan_buf.setdefault(cid, [])
+    buf.append({"uid": message.author.id, "nom": message.author.display_name,
+                "texte": texte[:400], "quand": time.time()})
+    if len(buf) > LISTEN_BUF_MAX:
+        del buf[:-LISTEN_BUF_MAX]
+    note_presence(message.author.id, message.author.name, message.author.display_name)
+
+    _chan_heard[cid] = _chan_heard.get(cid, 0) + 1
+    _chan_since[cid] = _chan_since.get(cid, 0) + 1
+
+    # --- Apprentissage : en tâche de fond, elle ne fait pas attendre le salon ---
+    if _chan_heard[cid] >= LISTEN_LEARN_EVERY:
+        _chan_heard[cid] = 0
+        asyncio.create_task(learn_from_chatter(cid, message.guild))
+
+    # --- Prise de parole ---
+    if quota_exhausted():
+        return
+    niveau = get_setting("bavardage", "jamais")
+    appelee = bool(_APPELEE.search(texte))     # on la nomme sans la ping : elle répond
+    if appelee:
+        if time.time() - _chan_last.get(cid, 0) < 30:
+            return
+    elif not _peut_parler(cid, niveau):
+        return
+    asyncio.create_task(intervenir(message, cid))
 
 
 def rp_channels():
@@ -7254,6 +8084,49 @@ async def admin_reminders(request):
 
     return web.json_response({"error": "action inconnue"}, status=400)
 
+async def admin_listen(request):
+    """Les salons que Tenebris écoute. Par défaut : tous — on les met en sourdine un par un."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+
+    def etat():
+        serveurs = []
+        for g in getattr(bot, "guilds", []):
+            serveurs.append({
+                "gid": str(g.id), "name": g.name,
+                "salons": [{"id": str(c.id), "name": c.name, "ouvert": is_listening(c)}
+                           for c in g.text_channels][:80],
+            })
+        ouverts = sum(1 for s in serveurs for c in s["salons"] if c["ouvert"])
+        total = sum(len(s["salons"]) for s in serveurs)
+        return {"serveurs": serveurs, "mode": listen_mode(),
+                "niveau": get_setting("bavardage", "jamais"),
+                "ouverts": ouverts, "total": total, "muets": len(mute_channels())}
+
+    if request.method == "GET":
+        return web.json_response(etat())
+
+    data = await _read_json(request)
+
+    if data.get("mode"):                       # changement de mode d'écoute
+        mode = str(data["mode"])
+        if mode not in ("tous", "selection", "aucune"):
+            return web.json_response({"error": "mode inconnu"}, status=400)
+        set_settings({"ecoute": mode})
+        await flush_memory()
+        audit_log("ecoute_mode", mode)
+        return web.json_response({"ok": True, **etat()})
+
+    cid = str(data.get("salon_id") or "")
+    if not cid.isdigit():
+        return web.json_response({"error": "salon invalide"}, status=400)
+    ouvert = toggle_listen_channel(int(cid), bool(data.get("ouvert")))
+    await flush_memory()
+    ch = bot.get_channel(int(cid))
+    audit_log("ecoute", f"#{ch.name if ch else cid} → {'écoutée' if ouvert else 'sourdine'}")
+    return web.json_response({"ok": True, **etat()})
+
 async def admin_missions(request):
     """Les missions : veille de forum, rappel récurrent, consigne récurrente.
     Création, activation, suppression, exécution manuelle (en tâche de fond)."""
@@ -7322,10 +8195,12 @@ async def admin_missions(request):
             return web.json_response(
                 {"error": f"fréquence trop courte pour ce type : minimum {mini} min"}, status=400)
 
-        # --- Échéance (obligatoire pour un rappel/une consigne : sinon ça tourne à vie) ---
+        # --- Échéance : obligatoire pour un rappel/une consigne (sinon ça tourne à vie),
+        #     facultative pour les mèmes (on peut vouloir un mème par jour, indéfiniment).
         fin_txt = ""
-        if type_ in ("rappel", "consigne"):
-            fin_dt = parse_when(str(data.get("fin") or ""))
+        brut_fin = str(data.get("fin") or "").strip()
+        if type_ in ("rappel", "consigne") or (type_ == "meme" and brut_fin):
+            fin_dt = parse_when(brut_fin)
             if fin_dt is None:
                 return web.json_response(
                     {"error": "date de fin incomprise (ex : « 2026-08-01 14:00 », « +3j », « dans 6h »)"},
@@ -7335,7 +8210,7 @@ async def admin_missions(request):
             fin_txt = fin_dt.strftime("%Y-%m-%d %H:%M")
 
         # --- Destination ---
-        if en_prive and type_ != "forum":
+        if en_prive and type_ in ("rappel", "consigne"):
             if not uid.isdigit():
                 return web.json_response({"error": "pour un MP, donne l'ID Discord du destinataire"},
                                          status=400)
@@ -7357,6 +8232,9 @@ async def admin_missions(request):
             if not message:
                 return web.json_response({"error": "le message du rappel est vide"}, status=400)
             nom = nom or "Rappel récurrent"
+        elif type_ == "meme":
+            message = str(data.get("message") or "général").strip() or "général"
+            nom = nom or f"Mèmes — {message}"
         else:
             consigne = str(data.get("consigne") or "").strip()
             if not consigne:
@@ -7478,6 +8356,8 @@ def _register_admin_routes(app):
     app.router.add_post("/admin/api/reminders", admin_reminders)
     app.router.add_get("/admin/api/actions", admin_actions)
     app.router.add_get("/admin/api/task", admin_task)
+    app.router.add_get("/admin/api/listen", admin_listen)
+    app.router.add_post("/admin/api/listen", admin_listen)
     app.router.add_get("/admin/api/missions", admin_missions)
     app.router.add_post("/admin/api/missions", admin_missions)
 
@@ -7870,6 +8750,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           <label>Type de mission</label>
           <select id="ms_type" class="inp" onchange="switchMisType()">
             <option value="rappel">Rappel récurrent (jusqu'à une date)</option>
+            <option value="meme">Mèmes réguliers (thème au choix)</option>
             <option value="consigne">Consigne récurrente (calculs, dés…)</option>
             <option value="forum">Veille de forum</option>
           </select>
@@ -7885,6 +8766,16 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           <div id="ms_f_rappel">
             <label>Message répété</label>
             <textarea id="ms_msg" class="inp" rows="2" placeholder="N'oubliez pas de poster vos actions du tour."></textarea>
+          </div>
+
+          <div id="ms_f_meme" class="hidden">
+            <label>Thème des mèmes</label>
+            <input id="ms_theme" class="inp" placeholder="programmation · jeux vidéo · fantasy · chat · sombre · absurde…">
+            <div style="color:var(--dim);font-size:12px;margin-top:4px">
+              Thèmes connus : général, programmation, jeux vidéo, sombre, fantasy, chat, chien,
+              science, histoire, animé, français, absurde. Tu peux aussi donner un nom de subreddit.
+              Elle ne resert jamais deux fois le même mème.
+            </div>
           </div>
 
           <div id="ms_f_consigne" class="hidden">
@@ -7927,6 +8818,25 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <h2 class="title">Console d'administration</h2>
 
       <div class="adm-sec">
+        <h3>Salons écoutés</h3>
+        <div style="color:var(--dim);font-size:13px;margin-bottom:10px">
+          Dans un salon écouté, Tenebris suit la discussion <b>sans être mentionnée</b> :
+          elle apprend des gens (notes automatiques) et s'invite parfois dans la conversation,
+          selon le niveau de <b>bavardage</b> réglé plus bas. Elle répond toujours si on l'appelle par son nom.
+          <br><b>Écouter n'est pas parler</b> : tant que le bavardage est sur « jamais », elle se contente d'apprendre.
+        </div>
+        <div class="frm" style="margin-bottom:14px">
+          <label>Mode d'écoute</label>
+          <select id="s_ecoute" onchange="setListenMode()">
+            <option value="tous">Tous les salons (défaut) — sourdine au cas par cas</option>
+            <option value="selection">Sélection — seulement ceux que j'ouvre</option>
+            <option value="aucune">Aucune — elle est sourde</option>
+          </select>
+        </div>
+        <div id="listenBox"></div>
+      </div>
+
+      <div class="adm-sec">
         <h3>Paramètres de l'IA</h3>
         <div class="frm">
           <label>Niveau d'autonomie</label>
@@ -7941,6 +8851,13 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           <select id="s_thresh"><option value="faible">Faible</option><option value="normale">Normale</option><option value="haute">Haute</option></select>
           <label>Mode roleplay (modèles peu censurés)</label>
           <select id="s_rp"><option value="intelligent">Intelligent (comprend seule)</option><option value="auto">Auto (indices only)</option><option value="toujours">Toujours</option><option value="jamais">Jamais</option></select>
+          <label>Bavardage (interventions spontanées)</label>
+          <select id="s_bavard">
+            <option value="jamais">Jamais — elle écoute et apprend, sans jamais couper</option>
+            <option value="discret">Discret — une remarque de temps en temps</option>
+            <option value="normal">Normal — elle se mêle à la conversation</option>
+            <option value="bavard">Bavard — elle a toujours quelque chose à dire</option>
+          </select>
         </div>
         <div class="btnrow"><button id="saveSettings">Enregistrer les paramètres</button></div>
       </div>
@@ -8677,27 +9594,30 @@ async function cancelReminder(id){
 }
 function switchMisType(){
   const t = $('#ms_type').value;
-  const prive = $('#ms_prive').checked && t !== 'forum';
+  const prive = $('#ms_prive').checked && (t === 'rappel' || t === 'consigne');
   $('#ms_f_forum').classList.toggle('hidden', t !== 'forum');
   $('#ms_f_rappel').classList.toggle('hidden', t !== 'rappel');
   $('#ms_f_consigne').classList.toggle('hidden', t !== 'consigne');
+  $('#ms_f_meme').classList.toggle('hidden', t !== 'meme');
   $('#ms_f_fin').classList.toggle('hidden', t === 'forum');
-  $('#ms_prive').parentElement.classList.toggle('hidden', t === 'forum');
+  $('#ms_prive').parentElement.classList.toggle('hidden', t === 'forum' || t === 'meme');
   $('#ms_f_salon').classList.toggle('hidden', prive);
   $('#ms_lab_uid').textContent = prive
     ? 'Destinataire du MP (ID Discord — obligatoire)'
     : 'Personne à mentionner (facultatif — ID Discord)';
-  const mini = (t==='forum') ? 15 : (t==='consigne' ? 10 : 5);
+  const mini = (t==='rappel') ? 5 : (t==='consigne' ? 10 : 15);
   $('#ms_freq').min = mini;
-  if(parseInt($('#ms_freq').value||'0',10) < mini) $('#ms_freq').value = (t==='forum' ? 60 : mini);
+  if(parseInt($('#ms_freq').value||'0',10) < mini) $('#ms_freq').value = (t==='rappel' ? 30 : (t==='meme' ? 240 : 60));
   $('#ms_btn').textContent = (t==='forum') ? 'Confier la veille'
                            : (t==='rappel') ? 'Programmer le rappel récurrent'
+                           : (t==='meme') ? 'Lancer les mèmes'
                            : 'Confier la consigne';
 }
 
 function misTypeBadge(t){
   if(t==='rappel')   return '<span class="badge srv">⏰ RAPPEL</span>';
   if(t==='consigne') return '<span class="badge master">🎲 CONSIGNE</span>';
+  if(t==='meme')     return '<span class="badge mp">😹 MÈMES</span>';
   return '<span class="badge unk">📰 VEILLE</span>';
 }
 
@@ -8716,13 +9636,15 @@ function renderMissions(ms){
       : '<span style="color:#7ddc9a">💬 ' + esc(m.destination) + (m.serveur ? ' · ' + esc(m.serveur) : '') + '</span>';
     const quoi = (m.type === 'forum') ? esc(m.url || '')
                : (m.type === 'rappel') ? esc((m.message || '').slice(0,140))
+               : (m.type === 'meme') ? ('thème : <b>' + esc(m.message || 'général') + '</b>')
                : esc((m.consigne || '').slice(0,140));
     const err = m.erreurs > 0 ? ' · <span style="color:#e88">' + m.erreurs + ' échec(s)</span>' : '';
     const fin = m.fin ? ' · jusqu\'au <b>' + esc(m.fin) + '</b>' : ' · sans échéance';
     const nxt = (m.prochain && m.actif && !m.termine) ? ' · prochain passage ' + esc(m.prochain) : '';
     const env = m.envois ? ' · ' + m.envois + ' envoi(s)' : '';
     const con = (m.type === 'forum') ? ' · ' + m.connus + ' sujets connus'
-                + (m.amorcee ? '' : ' · <span style="color:var(--dim)">pas encore amorcée</span>') : '';
+                + (m.amorcee ? '' : ' · <span style="color:var(--dim)">pas encore amorcée</span>')
+              : (m.type === 'meme') ? ' · ' + m.connus + ' déjà servis' : '';
     return '<div class="noteitem"><div class="nt">' +
       misTypeBadge(m.type) + ' <b>' + esc(m.nom) + '</b> → ' + dest +
       '<div class="nd">' + quoi + '</div>' +
@@ -8741,12 +9663,12 @@ async function createMission(){
     type: t,
     nom: $('#ms_nom').value.trim(),
     url: $('#ms_url').value.trim(),
-    message: $('#ms_msg').value.trim(),
+    message: (t === 'meme') ? ($('#ms_theme').value.trim() || 'général') : $('#ms_msg').value.trim(),
     consigne: $('#ms_consigne').value.trim(),
     gid: $('#ms_gid').value,
     salon_id: $('#ms_salon').value,
     personne_id: $('#ms_uid').value.trim(),
-    en_prive: $('#ms_prive').checked && t !== 'forum',
+    en_prive: $('#ms_prive').checked && (t === 'rappel' || t === 'consigne'),
     frequence_min: parseInt($('#ms_freq').value || '60', 10),
     fin: $('#ms_fin').value.trim(),
     demarrer_maintenant: $('#ms_now').checked,
@@ -8757,6 +9679,8 @@ async function createMission(){
     $('#ms_url').value=''; $('#ms_nom').value=''; $('#ms_msg').value=''; $('#ms_consigne').value='';
     toast(t === 'forum'
       ? "Veille confiée. J'ai noté les sujets existants ; j'annoncerai les nouveaux."
+      : t === 'meme'
+      ? "Mission de mèmes lancée. Elle ne servira jamais deux fois le même."
       : "Mission confiée. Elle tournera jusqu'à l'échéance, puis s'arrêtera seule.");
   } else toast((body && body.error) || 'Échec.', true);
 }
@@ -8794,7 +9718,51 @@ async function loadActions(){
 }
 
 /* ---------- Console d'administration ---------- */
-async function loadAdmin(){ await loadSettings(); await loadAdminUsers(); await loadActions(); await loadAudit(); }
+async function loadAdmin(){ await loadSettings(); await loadListen(); await loadAdminUsers(); await loadActions(); await loadAudit(); }
+
+function renderListen(body){
+  const box = $('#listenBox');
+  $('#s_ecoute').value = body.mode || 'tous';
+  const srv = body.serveurs||[];
+  if(!srv.length){ box.innerHTML='<div style="color:var(--dim)">Aucun serveur.</div>'; return; }
+  if(body.mode === 'aucune'){
+    box.innerHTML = '<div style="color:var(--dim);font-size:13px">Elle est sourde : elle n\'entend aucun salon, et n\'apprend plus rien passivement.</div>';
+    return;
+  }
+  const aide = (body.mode === 'tous')
+    ? 'Elle écoute tout. Clique un salon pour le mettre <b>en sourdine</b>.'
+    : 'Elle n\'écoute que ce que tu ouvres. Clique un salon pour <b>l\'ouvrir</b>.';
+  box.innerHTML = '<div style="color:var(--dim);font-size:12px;margin-bottom:8px">'+aide+'</div>' +
+    srv.map(g =>
+      '<div style="margin-bottom:12px"><div class="fk" style="margin-bottom:6px">'+esc(g.name)+'</div>'+
+      '<div class="chips">'+ g.salons.map(c =>
+        '<span class="chip" style="cursor:pointer;'+(c.ouvert?'border-color:#7ddc9a;color:#7ddc9a':'opacity:.55')+'" '+
+        'onclick="toggleListen(\''+c.id+'\','+(c.ouvert?'false':'true')+')">'+
+        (c.ouvert?'👂 ':'🔇 ')+'#'+esc(c.name)+'</span>').join(' ')+
+      '</div></div>').join('') +
+    '<div style="color:var(--dim);font-size:12px;margin-top:6px">'+
+      body.ouverts+' salon(s) écouté(s) sur '+body.total+
+      (body.muets ? ' · '+body.muets+' en sourdine' : '')+
+      ' · bavardage : <b>'+esc(body.niveau)+'</b></div>';
+}
+async function loadListen(){
+  const {status, body} = await jget('/admin/api/listen');
+  if(status!==200){ if(status===401) showLogin(); return; }
+  renderListen(body);
+}
+async function setListenMode(){
+  const {status, body} = await jpost('/admin/api/listen', {mode: $('#s_ecoute').value});
+  if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
+  renderListen(body);
+  toast('Mode d\'écoute mis à jour.');
+}
+async function toggleListen(cid, ouvert){
+  const on = (ouvert===true||ouvert==='true');
+  const {status, body} = await jpost('/admin/api/listen', {salon_id: cid, ouvert: on});
+  if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
+  renderListen(body);
+  toast(on ? 'Salon ouvert à son écoute.' : 'Salon mis en sourdine.');
+}
 
 async function loadSettings(){
   const {status, body} = await jget('/admin/api/settings');
@@ -8809,6 +9777,7 @@ async function loadSettings(){
   $('#s_reten').value = (s.retention_days!=null)?s.retention_days:0;
   $('#s_thresh').value = s.note_threshold||'normale';
   $('#s_rp').value = s.rp_mode||'intelligent';
+  $('#s_bavard').value = s.bavardage||'jamais';
 }
 $('#saveSettings').onclick = async () => {
   const patch = {
@@ -8821,6 +9790,7 @@ $('#saveSettings').onclick = async () => {
     retention_days: parseInt($('#s_reten').value||'0',10),
     note_threshold: $('#s_thresh').value,
     rp_mode: $('#s_rp').value,
+    bavardage: $('#s_bavard').value,
   };
   const {status} = await jpost('/admin/api/settings', {settings: patch});
   if(status===200){ const b=$('#saveSettings'); b.textContent='Enregistré ✓'; setTimeout(()=>b.textContent='Enregistrer les paramètres',1500); }
@@ -8933,7 +9903,7 @@ async def missions_loop():
             audit_log("mission_terminee",
                       f"{m.get('nom')} — échéance atteinte ({m.get('envois', 0)} envoi(s))", actor="IA")
             print(f"🏁 Mission « {m.get('nom')} » terminée (échéance atteinte).")
-            if m.get("type") in ("rappel", "consigne"):
+            if m.get("type") in ("rappel", "consigne", "meme"):
                 try:
                     ch = await mission_destination(m)
                     if ch is not None:
@@ -9121,7 +10091,28 @@ async def on_message(message):
         return  # on ne répond jamais à un bot, et on ne le fiche jamais
 
     is_dm = isinstance(message.channel, discord.DMChannel)
+    cid = int(message.channel.id)
+
+    # --- Partie d'échecs en cours ici : le joueur écrit son coup, sans me mentionner ---
+    jeu = _CHESS.get(cid)
+    if (jeu and not is_dm and message.author.id == jeu["joueur"]
+            and not message.content.startswith("²T ")
+            and re.fullmatch(r"[a-hA-H][1-8][a-hA-H][1-8][qrbnQRBN]?|[KQRBNCFTPRkqrbncftp]?[a-h]?[1-8]?x?[a-h][1-8](=[QRBNqrbn])?[+#]?|O-O(-O)?|0-0(-0)?",
+                             message.content.strip())):
+        try:
+            rendu = await chess_jouer_coup(message.channel, jeu, message.content.strip())
+            await message.channel.send(rendu)
+        except Exception as e:
+            print(f"⚠️ Échecs : {str(e)[:90]}")
+        return
+
     if not (bot.user.mentioned_in(message) or is_dm):
+        # --- Salon écouté : elle suit la discussion, apprend, et s'invite parfois ---
+        if message.guild is not None and is_listening(message.channel):
+            try:
+                await ecouter(message)
+            except Exception as e:
+                print(f"⚠️ Écoute : {str(e)[:90]}")
         await bot.process_commands(message)
         return
     if message.content.startswith("²T "):
@@ -9435,6 +10426,88 @@ async def onboard(ctx):
         lines.append("❌ Erreurs : " + " | ".join(str(e)[:120] for e in rep["erreurs"][:3]))
     for chunk in smart_split("\n".join(lines)):
         await ctx.send(chunk)
+
+@bot.command(name="p4", help="Lance une partie de Puissance 4 contre Tenebris")
+async def p4_cmd(ctx, action: str = "commencer"):
+    res = await tool_puissance4(ctx.channel, ctx.author.id, ctx.author.display_name,
+                                action=("abandonner" if action.lower().startswith("aband") else "commencer"))
+    if res and not res.startswith("Plateau"):
+        await ctx.send(res)
+
+@bot.command(name="echecs", help="Lance une partie d'échecs (tu écris tes coups : e4, Cf3, e2e4)")
+async def echecs_cmd(ctx, action: str = "commencer"):
+    a = action.lower()
+    act = ("abandonner" if a.startswith("aband") else
+           "plateau" if a.startswith("plat") else "commencer")
+    res = await tool_echecs(ctx.channel, ctx.author.id, ctx.author.display_name, action=act)
+    if res and not res.startswith(("Échiquier", "(plateau")):
+        await ctx.send(res)
+
+@bot.command(name="meme", help="Publie un mème sur un thème (ex : ²T meme programmation)")
+async def meme_cmd(ctx, *, theme: str = "général"):
+    async with ctx.typing():
+        pid = await publier_meme(ctx.channel, theme.strip())
+    if not pid:
+        await ctx.send(f"Rien de potable sur « {theme} ». Essaie un autre thème.")
+
+@bot.command(name="ecoute", help="Met ce salon en sourdine, ou le rouvre à son écoute")
+async def ecoute_cmd(ctx, etat: str = None):
+    if not is_admin(ctx.author.id, ctx.author.name):
+        await ctx.send("Régler mon oreille est réservé à mes administrateurs.")
+        return
+    if ctx.guild is None:
+        await ctx.send("L'écoute ne concerne que les salons de serveur.")
+        return
+    mode = listen_mode()
+    if mode == "aucune":
+        await ctx.send("Je n'écoute plus rien du tout (mode « aucune » dans le panneau). "
+                       "Remets-moi en « tous » ou « selection » d'abord.")
+        return
+    on = None
+    if etat:
+        e = etat.lower()
+        if e in ("on", "oui", "actif", "true", "1"):
+            on = True
+        elif e in ("off", "non", "stop", "muet", "false", "0"):
+            on = False
+    ouvert = toggle_listen_channel(ctx.channel.id, on)
+    await flush_memory()
+    niveau = get_setting("bavardage", "jamais")
+    if ouvert:
+        suite = (" Je n'interviendrai pas tant que le bavardage reste sur « jamais » — "
+                 "règle-le dans le panneau." if niveau == "jamais"
+                 else f" Bavardage : **{niveau}** — je m'inviterai parfois.")
+        await ctx.send(f"👂 J'écoute #{ctx.channel.name}. J'apprends de ce qui s'y dit.{suite}")
+    else:
+        await ctx.send(f"🔇 #{ctx.channel.name} est en sourdine — je n'y entends plus rien.")
+
+@bot.command(name="salons_ecoutes", help="Où Tenebris écoute, et où elle est en sourdine")
+async def salons_ecoutes_cmd(ctx):
+    mode = listen_mode()
+    niveau = get_setting("bavardage", "jamais")
+    if mode == "aucune":
+        await ctx.send("🔇 Je n'écoute aucun salon (mode « aucune »).")
+        return
+    if mode == "selection":
+        ids = listen_channels()
+        if not ids:
+            await ctx.send("Mode « selection » : je n'écoute aucun salon. `²T ecoute` pour m'en ouvrir un.")
+            return
+        lignes = []
+        for cid in ids:
+            ch = bot.get_channel(int(cid))
+            lignes.append(f"• #{ch.name} ({ch.guild.name})" if ch else f"• salon {cid} (introuvable)")
+        await ctx.send(f"👂 Mode « selection » — bavardage : **{niveau}**\nJ'écoute :\n" + "\n".join(lignes))
+        return
+    muets = mute_channels()
+    lignes = []
+    for cid in muets:
+        ch = bot.get_channel(int(cid))
+        lignes.append(f"• #{ch.name} ({ch.guild.name})" if ch else f"• salon {cid} (introuvable)")
+    corps = ("Aucune sourdine : j'entends tout." if not lignes
+             else "En sourdine :\n" + "\n".join(lignes))
+    await ctx.send(f"👂 Mode « tous » — j'écoute **tous les salons** de tous les serveurs. "
+                   f"Bavardage : **{niveau}**.\n{corps}")
 
 @bot.command(name="rappels", help="Liste les rappels et échéances en attente")
 async def rappels(ctx):
