@@ -1942,35 +1942,216 @@ def resolve_role(guild, nom):
 # ============================================================
 # MISSIONS — des tâches qu'on lui assigne dans la durée
 # ============================================================
-# Aujourd'hui : la VEILLE DE FORUM. Elle surveille un forum et publie les nouveaux
-# sujets dans un salon dédié. La structure est prévue pour accueillir d'autres types.
-MISSION_CHECK_MIN = 15          # fréquence de la boucle
+# Trois types de missions :
+#   • forum    : surveille un forum, annonce ses nouveaux sujets dans un salon.
+#   • rappel   : répète un message à intervalle régulier JUSQU'À une date/heure de fin.
+#   • consigne : exécute une consigne (calculs, jets de dés, veille…) à intervalle
+#                régulier jusqu'à une date de fin, et publie sa réponse.
+MISSION_CHECK_MIN = 1           # la boucle bat toutes les minutes (chaque mission a SON rythme)
 MISSION_MAX_NEW = 3             # nb de nouveautés annoncées par passage (anti-flood)
 MISSION_KNOWN_CAP = 400         # mémoire des sujets déjà vus
+MISSION_TYPES = ("forum", "rappel", "consigne")
+MISSION_MIN_INTERVAL = {"forum": 15, "rappel": 5, "consigne": 10}   # minutes, par type
 
 def missions():
     return memory().setdefault("missions", [])
 
-def add_mission(nom, url, guild_id, channel_id, interval_min=60, type_="forum"):
+def mission_min_interval(type_):
+    return MISSION_MIN_INTERVAL.get(type_, 15)
+
+def add_mission(nom, url, guild_id, channel_id, interval_min=60, type_="forum",
+                message="", consigne="", fin="", mention_id=None, demarrer_maintenant=True):
+    """Crée une mission. `fin` = date/heure d'arrêt ('' = sans fin, pour une veille).
+    `channel_id` peut être None pour un rappel en message privé (mention_id = destinataire)."""
     mid = os.urandom(3).hex()
-    missions().append({
-        "id": mid, "type": type_, "nom": nom or "Veille",
-        "url": url, "guild_id": int(guild_id), "channel_id": int(channel_id),
-        "interval_min": max(15, int(interval_min or 60)),
+    type_ = type_ if type_ in MISSION_TYPES else "forum"
+    m = {
+        "id": mid, "type": type_, "nom": nom or "Mission",
+        "url": url or "", "guild_id": int(guild_id) if guild_id else None,
+        "channel_id": int(channel_id) if channel_id else None,
+        "interval_min": max(mission_min_interval(type_), int(interval_min or 60)),
+        "message": (message or "").strip(),
+        "consigne": (consigne or "").strip(),
+        "fin": fin or "",                       # "AAAA-MM-JJ HH:MM" ou ""
+        "mention_id": int(mention_id) if mention_id else None,
         "connus": [], "amorcee": False, "actif": True,
-        "dernier_check": "", "dernier_trouve": "", "erreurs": 0,
+        "dernier_check": "" if demarrer_maintenant else now().strftime("%Y-%m-%d %H:%M"),
+        "dernier_trouve": "", "envois": 0, "erreurs": 0, "termine": False,
         "cree": now().strftime("%Y-%m-%d %H:%M"),
-    })
+    }
+    missions().append(m)
     mark_memory_dirty()
     return mid
 
-async def _mission_forum(m, force=False):
+def mission_fin_dt(m):
+    """La date de fin d'une mission, ou None si elle court sans limite."""
+    fin = (m.get("fin") or "").strip()
+    if not fin:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(fin, fmt)
+        except ValueError:
+            continue
+    return None
+
+def mission_expiree(m):
+    fin = mission_fin_dt(m)
+    return bool(fin and now() >= fin)
+
+def mission_prochain(m):
+    """Prochaine exécution prévue (datetime), ou None."""
+    if not m.get("actif") or m.get("termine"):
+        return None
+    last = m.get("dernier_check") or ""
+    if not last:
+        return now()
+    try:
+        base = datetime.strptime(last, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return now()
+    return base + timedelta(minutes=int(m.get("interval_min") or 60))
+
+async def mission_destination(m):
+    """Où cette mission publie : un salon, ou le MP du destinataire."""
+    cid = m.get("channel_id")
+    if cid:
+        return bot.get_channel(int(cid))
+    uid = m.get("mention_id")
+    if not uid:
+        return None
+    u = bot.get_user(int(uid))
+    if u is None:
+        try:
+            u = await bot.fetch_user(int(uid))
+        except discord.HTTPException:
+            return None
+    try:
+        return u.dm_channel or await u.create_dm()
+    except discord.HTTPException:
+        return None
+
+async def _mission_rappel(m, force=False, progress=None):
+    """Répète un message jusqu'à la date de fin. C'est le « rappel régulier »."""
+    if progress:
+        progress(20, "Recherche du destinataire…")
+    channel = await mission_destination(m)
+    if channel is None:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        print(f"⚠️ Rappel récurrent « {m['nom']} » : destinataire introuvable.")
+        return 0
+
+    en_prive = not m.get("channel_id")
+    mention = "" if en_prive else (f"<@{m['mention_id']}> " if m.get("mention_id") else "")
+    texte = m.get("message") or m.get("nom") or "Rappel."
+    fin = mission_fin_dt(m)
+    if fin:
+        texte += f"\n-# Rappel répété toutes les {m['interval_min']} min jusqu'au {fin:%d/%m/%Y à %H:%M}."
+
+    if progress:
+        progress(60, "Envoi…")
+    try:
+        await channel.send(f"⏰ {mention}{texte}"[:1990])
+    except discord.errors.Forbidden:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        print(f"⚠️ Rappel récurrent « {m['nom']} » : envoi refusé (permissions / MP fermés).")
+        return 0
+    except discord.HTTPException as e:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        print(f"⚠️ Rappel récurrent « {m['nom']} » : {str(e)[:80]}")
+        return 0
+
+    m["erreurs"] = 0
+    m["envois"] = m.get("envois", 0) + 1
+    m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
+    m["dernier_trouve"] = m["dernier_check"]
+    mark_memory_dirty()
+    audit_log("rappel_recurrent", f"{m['nom']} — envoi n°{m['envois']}", actor="IA")
+    if progress:
+        progress(100, "Envoyé")
+    return 1
+
+async def _mission_consigne(m, force=False, progress=None):
+    """Exécute une consigne récurrente (calcul, jets de dés, synthèse…) et publie la réponse.
+    Elle garde ses outils : elle peut donc lancer de VRAIS dés à chaque passage."""
+    if progress:
+        progress(15, "Recherche du salon…")
+    channel = await mission_destination(m)
+    if channel is None:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        print(f"⚠️ Consigne « {m['nom']} » : destination introuvable.")
+        return 0
+
+    consigne = m.get("consigne") or m.get("message") or ""
+    if not consigne.strip():
+        m["actif"] = False
+        return 0
+
+    guild = bot.get_guild(int(m["guild_id"])) if m.get("guild_id") else None
+    system = "\n\n".join([
+        persona_block(),
+        DICE_RULE,
+        "MISSION AUTOMATIQUE — Tu exécutes une consigne permanente confiée par ton Maître. "
+        "Personne ne t'a parlé à l'instant : tu agis seule, tu produis le résultat demandé, "
+        "sans saluer ni demander confirmation. Si la consigne demande des dés ou un calcul, "
+        "tu utilises tes outils (lancer_des, resoudre_attaques) et tu rapportes leurs chiffres "
+        "EXACTS. Réponse compacte : Discord coupe à 2000 caractères.",
+    ])
+    if progress:
+        progress(45, "Exécution de la consigne…")
+    try:
+        texte, _used = await chat_with_tools(
+            system,
+            [{"role": "user", "content": consigne}],
+            guild,
+            tools=TOOLS,
+            caller_id=MSCHAP_ID,
+            caller_name="Mschap",
+            caller_channel_id=(int(m["channel_id"]) if m.get("channel_id") else None),
+            long_reply=True,
+            route="chat",
+        )
+    except Exception as e:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        print(f"⚠️ Consigne « {m['nom']} » a échoué : {str(e)[:120]}")
+        if progress:
+            progress(100, f"Échec : {str(e)[:60]}")
+        return 0
+
+    if progress:
+        progress(85, "Publication…")
+    mention = f"<@{m['mention_id']}> " if (m.get("mention_id") and m.get("channel_id")) else ""
+    try:
+        chunks = smart_split((mention + (texte or "…")).strip())
+        for c in chunks[:3]:
+            await channel.send(c)
+    except discord.errors.Forbidden:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        return 0
+    except discord.HTTPException as e:
+        m["erreurs"] = m.get("erreurs", 0) + 1
+        print(f"⚠️ Consigne « {m['nom']} » : {str(e)[:80]}")
+        return 0
+
+    m["erreurs"] = 0
+    m["envois"] = m.get("envois", 0) + 1
+    m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
+    m["dernier_trouve"] = m["dernier_check"]
+    mark_memory_dirty()
+    audit_log("consigne_executee", f"{m['nom']} — passage n°{m['envois']}", actor="IA")
+    if progress:
+        progress(100, "Publié")
+    return 1
+
+async def _mission_forum(m, force=False, progress=None):
     """Regarde le forum, repère les sujets NOUVEAUX, les annonce dans le salon."""
-    channel = bot.get_channel(int(m["channel_id"]))
+    channel = bot.get_channel(int(m["channel_id"])) if m.get("channel_id") else None
     if channel is None:
         m["erreurs"] = m.get("erreurs", 0) + 1
         return 0
 
+    if progress:
+        progress(10, "Ouverture du forum…")
     session = aiohttp.ClientSession(headers=BROWSER_HEADERS,
                                     cookie_jar=aiohttp.CookieJar(unsafe=True))
     try:
@@ -1978,9 +2159,13 @@ async def _mission_forum(m, force=False):
         if not page or page.get("error"):
             m["erreurs"] = m.get("erreurs", 0) + 1
             print(f"⚠️ Mission « {m['nom']} » : forum injoignable ({(page or {}).get('error')})")
+            if progress:
+                progress(100, "Forum injoignable")
             return 0
         m["erreurs"] = 0
 
+        if progress:
+            progress(35, "Repérage des sujets…")
         # Tous les sujets listés sur cette page (section, index, « derniers messages »…)
         trouves = {}
         for full, anchor in _extract_links(page["html"], page["url"]):
@@ -2000,14 +2185,22 @@ async def _mission_forum(m, force=False):
             mark_memory_dirty()
             print(f"👁️ Mission « {m['nom']} » amorcée : {len(trouves)} sujets connus, "
                   f"j'annoncerai les suivants.")
+            if progress:
+                progress(100, f"Amorcée — {len(trouves)} sujets notés")
             return 0
 
         if not nouveaux:
             m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
+            if progress:
+                progress(100, "Rien de neuf")
             return 0
 
         annonces = 0
-        for u, titre in nouveaux[:MISSION_MAX_NEW]:
+        a_publier = nouveaux[:MISSION_MAX_NEW]
+        for _n, (u, titre) in enumerate(a_publier, 1):
+            if progress:
+                progress(40 + int(55 * _n / max(1, len(a_publier))),
+                         f"Nouveau sujet {_n}/{len(a_publier)}…")
             extrait, auteur = "", ""
             got = await _read_topic_fully(_make_grab(session), u, titre)
             if got:
@@ -2041,9 +2234,12 @@ async def _mission_forum(m, force=False):
         m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
         if annonces:
             m["dernier_trouve"] = now().strftime("%Y-%m-%d %H:%M")
+            m["envois"] = m.get("envois", 0) + annonces
             audit_log("mission", f"{m['nom']} — {annonces} nouveau(x) sujet(s)", actor="IA")
             print(f"📰 Mission « {m['nom']} » : {annonces} nouveauté(s) annoncée(s)")
         mark_memory_dirty()
+        if progress:
+            progress(100, f"{annonces} nouveauté(s) annoncée(s)" if annonces else "Rien de neuf")
         return annonces
     finally:
         await session.close()
@@ -2054,10 +2250,15 @@ def _make_grab(session):
         return await _fetch_raw(u, session=session)
     return grab
 
-async def run_mission(m, force=False):
-    if m.get("type") == "forum":
-        return await _mission_forum(m, force=force)
-    return 0
+async def run_mission(m, force=False, progress=None):
+    """Exécute une mission, quel que soit son type. `progress(pct, étape)` est facultatif
+    (le panneau admin s'en sert pour afficher une vraie barre de chargement)."""
+    t = m.get("type", "forum")
+    if t == "rappel":
+        return await _mission_rappel(m, force=force, progress=progress)
+    if t == "consigne":
+        return await _mission_consigne(m, force=force, progress=progress)
+    return await _mission_forum(m, force=force, progress=progress)
 
 async def tool_lire_page(urls):
     """Lit 1 à 4 URLs et renvoie leur contenu nettoyé, chaque bloc préfixé par sa source."""
@@ -3693,6 +3894,263 @@ async def tool_send_dm(guild, personne, message):
     return f"✅ Message privé envoyé à {member.display_name}."
 
 # ============================================================
+# DÉS & RÉSOLUTION D'ATTAQUES — le hasard est TIRÉ, jamais inventé
+# ============================================================
+# Un modèle de langage ne sait pas lancer un dé : il « imagine » des chiffres
+# plausibles, et il se trompe dès qu'il faut additionner 126 attaques. Ici, tout
+# est tiré par random et additionné par Python. Le modèle ne fait plus que
+# RACONTER un résultat déjà calculé — il n'a plus le droit de le recalculer.
+DICE_MAX_ROLLS = 20000          # garde-fou global
+DICE_MAX_ATTAQUANTS = 300
+DICE_MAX_ACTIONS = 100
+DICE_SHOW_ROLLS = 30            # nb de jets détaillés affichés au maximum
+
+_DICE_RE = re.compile(r"^\s*(\d*)\s*[dD](\d+)\s*([+-]\s*\d+)?\s*$")
+
+DICE_DIRECTIVE = (
+    "CONSIGNE ABSOLUE — Les chiffres ci-dessous sont de VRAIS jets, déjà tirés et déjà "
+    "additionnés. Tu les REPRENDS TELS QUELS. Tu ne relances rien, tu ne recalcules rien, "
+    "tu ne « corriges » aucun total, tu n'inventes aucun jet. Tu annonces le TOTAL exact et "
+    "tu peux ensuite l'habiller de ta voix.\n\n"
+)
+
+DICE_RULE = (
+    "DÉS ET CALCULS — RÈGLE DE FER\n"
+    "Dès qu'on te demande un jet de dé, un jet d'attaque, un total de dégâts, une probabilité "
+    "tirée au sort ou n'importe quel calcul aléatoire : tu APPELLES un outil. Jamais de tête.\n"
+    "• lancer_des : un ou plusieurs jets simples (1d100, 3d6+2…), avec objectif éventuel.\n"
+    "• resoudre_attaques : une salve complète (N attaquants × N actions, objectif, échec "
+    "critique, critique, effets sur dés, relances, dégâts totaux).\n"
+    "Tu ne simules JAMAIS un dé dans ta tête, tu n'inventes JAMAIS un résultat, tu ne "
+    "recalcules JAMAIS un total renvoyé par l'outil. Un chiffre non tiré par l'outil est un "
+    "mensonge."
+)
+
+def _d(faces):
+    """Un dé. Un vrai."""
+    return random.randint(1, max(2, int(faces)))
+
+def _parse_dice(expression):
+    """« 3d6+2 » → (3, 6, 2). Renvoie None si incompréhensible."""
+    m = _DICE_RE.match(str(expression or ""))
+    if not m:
+        return None
+    return (int(m.group(1) or 1), int(m.group(2)), int((m.group(3) or "0").replace(" ", "")))
+
+def tool_lancer_des(expression="1d100", nombre=1, bonus=0, objectif=None):
+    """Lance N fois une expression de dés. Renvoie le détail ET les totaux."""
+    parsed = _parse_dice(expression)
+    if not parsed:
+        return (f"Expression de dés incomprise : « {expression} ». "
+                "Exemples valides : 1d100, 3d6, 2d10+4, 1d20-1.")
+    n_des, faces, modif = parsed
+    nombre = max(1, min(int(nombre or 1), 2000))
+    bonus = int(bonus or 0)
+    n_des = max(1, n_des)
+    if n_des * nombre > DICE_MAX_ROLLS:
+        return f"Trop de dés d'un coup ({n_des * nombre}). Maximum {DICE_MAX_ROLLS}."
+
+    seuil = int(objectif) if objectif not in (None, "", 0) else None
+    valeurs, bruts, reussites = [], [], 0
+    for _ in range(nombre):
+        des = [_d(faces) for _ in range(n_des)]
+        brut = sum(des)
+        val = brut + modif + bonus
+        bruts.append(brut)
+        valeurs.append(val)
+        if seuil is not None and val >= seuil:
+            reussites += 1
+
+    total = sum(valeurs)
+    tete = ", ".join(str(v) for v in valeurs[:DICE_SHOW_ROLLS])
+    if nombre > DICE_SHOW_ROLLS:
+        tete += f", … (+{nombre - DICE_SHOW_ROLLS} autres)"
+
+    lignes = [f"JETS RÉELS — {nombre} × {n_des}d{faces}"
+              + (f"{modif:+d}" if modif else "")
+              + (f" (bonus {bonus:+d})" if bonus else "")]
+    lignes.append(f"Résultats : {tete}")
+    lignes.append(f"Total cumulé : {total}")
+    if nombre > 1:
+        lignes.append(f"Plus haut : {max(valeurs)} · Plus bas : {min(valeurs)} "
+                      f"· Moyenne : {total / nombre:.1f}")
+    if seuil is not None:
+        taux = 100.0 * reussites / nombre
+        lignes.append(f"Objectif {seuil}+ : {reussites} réussite(s) / {nombre} "
+                      f"({taux:.1f} %), {nombre - reussites} échec(s)")
+    return DICE_DIRECTIVE + "\n".join(lignes)
+
+def tool_resoudre_attaques(nom_attaque="Attaque", attaquants=1, actions_chacun=1,
+                           de=100, objectif=70, echec_max=0, echec_cout_action=1,
+                           critique=None, degats_base=0, multiplicateur=1, effets=None):
+    """Résout une salve entière, jet par jet, et renvoie les DÉGÂTS TOTAUX exacts.
+
+    Règles appliquées (toutes paramétrables) :
+      - chaque attaquant dispose de `actions_chacun` actions ; une attaque = 1 action ;
+      - jet de 1d`de` ; on touche si (jet + bonus au toucher) >= `objectif` ;
+      - jet <= `echec_max` → échec critique : rien, et `echec_cout_action` action(s)
+        perdue(s) EN PLUS de celle dépensée ;
+      - jet >= `critique` → les effets réussissent d'office et les dégâts sont doublés ;
+      - dégâts d'une attaque = degats_base × multiplicateur, + les bonus des effets réussis ;
+      - un effet réussit si son dé atteint son seuil (par défaut : le maximum du dé) ;
+      - un effet peut donner un bonus au toucher pour l'attaque SUIVANTE du même attaquant ;
+      - un effet « relance » offre une attaque gratuite (sans coût d'action) qui, elle,
+        ne rejoue pas l'effet de relance.
+    """
+    attaquants = max(1, min(int(attaquants or 1), DICE_MAX_ATTAQUANTS))
+    actions_chacun = max(1, min(int(actions_chacun or 1), DICE_MAX_ACTIONS))
+    de = max(2, int(de or 100))
+    objectif = int(objectif or 0)
+    echec_max = max(0, int(echec_max or 0))
+    echec_cout_action = max(0, min(int(echec_cout_action if echec_cout_action is not None else 1), 5))
+    critique = int(critique) if critique not in (None, "", 0) else de
+    degats_base = int(degats_base or 0)
+    try:
+        mult = float(multiplicateur or 1)
+    except (TypeError, ValueError):
+        mult = 1.0
+
+    # --- Normalisation des effets ---
+    propres = []
+    for e in (effets or [])[:8]:
+        if not isinstance(e, dict) or not (e.get("nom") or "").strip():
+            continue
+        d_e = max(2, int(e.get("de") or 2))
+        propres.append({
+            "nom": str(e["nom"]).strip()[:40],
+            "de": d_e,
+            "seuil": int(e["seuil"]) if e.get("seuil") not in (None, "", 0) else d_e,
+            "degats_bonus": int(e.get("degats_bonus") or 0),
+            "bonus_toucher_suivant": int(e.get("bonus_toucher_suivant") or 0),
+            "relance_attaque": bool(e.get("relance_attaque")),
+        })
+
+    degats_par_attaque = int(round(degats_base * mult))
+    stats = {"attaques": 0, "touches": 0, "rates": 0, "echecs": 0, "critiques": 0, "relances": 0}
+    par_effet = {e["nom"]: {"tentatives": 0, "reussites": 0} for e in propres}
+    degats_total = 0
+    degats_attaquant = []
+    exemples = []
+
+    def _attaque(bonus_touche, avec_relance=True, prof=0):
+        """Résout UNE attaque. Renvoie (degats, bonus_pour_la_suivante, echec_critique)."""
+        nonlocal degats_total
+        if stats["attaques"] >= DICE_MAX_ROLLS:
+            return 0, 0, False
+        brut = _d(de)
+        jet = brut + bonus_touche
+        stats["attaques"] += 1
+
+        if echec_max and brut <= echec_max:
+            stats["echecs"] += 1
+            if len(exemples) < DICE_SHOW_ROLLS:
+                exemples.append(f"{brut} → ÉCHEC")
+            return 0, 0, True
+
+        crit = brut >= critique
+        if not crit and jet < objectif:
+            stats["rates"] += 1
+            if len(exemples) < DICE_SHOW_ROLLS:
+                exemples.append(f"{brut}{'+' + str(bonus_touche) if bonus_touche else ''} → raté")
+            return 0, 0, False
+
+        stats["touches"] += 1
+        if crit:
+            stats["critiques"] += 1
+
+        deg = degats_par_attaque
+        bonus_suivant = 0
+        relance = False
+        detail_effets = []
+        for e in propres:
+            if not avec_relance and e["relance_attaque"]:
+                continue          # l'attaque offerte ne rejoue pas la surprise
+            par_effet[e["nom"]]["tentatives"] += 1
+            jet_e = _d(e["de"])
+            if crit or jet_e >= e["seuil"]:
+                par_effet[e["nom"]]["reussites"] += 1
+                deg += e["degats_bonus"]
+                bonus_suivant += e["bonus_toucher_suivant"]
+                if e["relance_attaque"]:
+                    relance = True
+                detail_effets.append(e["nom"])
+        if crit:
+            deg *= 2
+
+        degats_total += deg
+        if len(exemples) < DICE_SHOW_ROLLS:
+            tag = "CRITIQUE" if crit else "touche"
+            suff = (" [" + ", ".join(detail_effets) + "]") if detail_effets else ""
+            exemples.append(f"{brut}{'+' + str(bonus_touche) if bonus_touche else ''} → {tag} "
+                            f"{deg}{suff}")
+
+        if relance and prof < 3:
+            stats["relances"] += 1
+            _d2, b2, _e2 = _attaque(0, avec_relance=False, prof=prof + 1)
+            bonus_suivant += b2
+        return deg, bonus_suivant, False
+
+    # --- La salve ---
+    for _i in range(attaquants):
+        avant = degats_total
+        actions = actions_chacun
+        bonus = 0
+        while actions > 0:
+            actions -= 1
+            _deg, bonus_suivant, echec = _attaque(bonus)
+            if echec:
+                actions -= echec_cout_action
+                bonus = 0
+            else:
+                bonus = bonus_suivant
+        degats_attaquant.append(degats_total - avant)
+
+    # --- Rapport ---
+    L = [f"RÉSOLUTION RÉELLE — {nom_attaque or 'Attaque'}", ""]
+    L.append("RÈGLES APPLIQUÉES")
+    L.append(f"• {attaquants} attaquant(s) × {actions_chacun} action(s) — 1 attaque = 1 action")
+    L.append(f"• Jet : 1d{de} — touche à {objectif}+")
+    if echec_max:
+        L.append(f"• Échec critique sur 1-{echec_max} : aucun dégât, "
+                 f"{echec_cout_action} action(s) perdue(s) en plus")
+    L.append(f"• Critique sur {critique}+ : effets automatiques et dégâts ×2")
+    L.append(f"• Dégâts de base : {degats_base} × {mult:g} = {degats_par_attaque} par attaque réussie")
+    for e in propres:
+        bits = [f"1d{e['de']}, réussite à {e['seuil']}+"]
+        if e["degats_bonus"]:
+            bits.append(f"+{e['degats_bonus']} dégâts")
+        if e["bonus_toucher_suivant"]:
+            bits.append(f"+{e['bonus_toucher_suivant']} au toucher de l'attaque suivante")
+        if e["relance_attaque"]:
+            bits.append("attaque gratuite supplémentaire (sans cet effet)")
+        L.append(f"• {e['nom']} : " + " · ".join(bits))
+
+    L.append("")
+    L.append("JETS")
+    L.append(f"• Attaques résolues : {stats['attaques']}")
+    L.append(f"• Touchées : {stats['touches']}  ·  Ratées : {stats['rates']}  "
+             f"·  Échecs critiques : {stats['echecs']}")
+    L.append(f"• Critiques ({critique}+) : {stats['critiques']}")
+    if stats["relances"]:
+        L.append(f"• Attaques gratuites déclenchées : {stats['relances']}")
+    for nom, s in par_effet.items():
+        if s["tentatives"]:
+            taux = 100.0 * s["reussites"] / s["tentatives"]
+            L.append(f"• {nom} : {s['reussites']} réussite(s) / {s['tentatives']} ({taux:.0f} %)")
+    if exemples:
+        L.append("• Échantillon de jets : " + " | ".join(exemples))
+
+    L.append("")
+    L.append(f"★ DÉGÂTS TOTAUX : {degats_total}")
+    if attaquants > 1:
+        L.append(f"  (moyenne par attaquant : {degats_total // attaquants} · "
+                 f"meilleur : {max(degats_attaquant)} · pire : {min(degats_attaquant)})")
+    if stats["touches"]:
+        L.append(f"  (moyenne par attaque réussie : {degats_total // stats['touches']})")
+
+    return DICE_DIRECTIVE + "\n".join(L)
+
+# ============================================================
 # TOOL CALLING NATIF (Cerebras)
 # ============================================================
 TOOLS = [
@@ -3907,13 +4365,66 @@ TOOLS = [
         "description": "Détermine (ou rappelle) LA VOCATION du serveur : à quoi il sert, son type, son thème, son public, ses activités. Utilise-le quand on demande « c'est quoi ce serveur ? », « à quoi sert ce serveur ? », ou quand tu as besoin de savoir où tu es. Analyse la structure (salons, rôles, règlement), pas le bavardage.",
         "parameters": {"type": "object", "properties": {
             "rafraichir": {"type": "boolean", "description": "true pour ré-analyser le serveur au lieu d'utiliser ce que tu sais déjà"}}}}},
+    {"type": "function", "function": {
+        "name": "lancer_des",
+        "description": "LANCE DE VRAIS DÉS. Obligatoire dès qu'un jet est demandé : « lance un d100 », « fais un jet d'attaque », « tire 20 d6 », « tire au sort ». Tu n'imagines JAMAIS le résultat d'un dé : tu appelles cet outil et tu reprends ses chiffres tels quels.",
+        "parameters": {"type": "object", "properties": {
+            "expression": {"type": "string", "description": "Le dé : 1d100, 3d6, 2d10+4, 1d20-1"},
+            "nombre": {"type": "integer", "description": "Combien de fois relancer cette expression (défaut 1)"},
+            "bonus": {"type": "integer", "description": "Bonus/malus ajouté à chaque jet (facultatif)"},
+            "objectif": {"type": "integer", "description": "Seuil de réussite : compte combien de jets l'atteignent (facultatif)"}},
+            "required": ["expression"]}}},
+    {"type": "function", "function": {
+        "name": "resoudre_attaques",
+        "description": "RÉSOUT UNE SALVE COMPLÈTE de jeu de rôle et renvoie les DÉGÂTS TOTAUX exacts. À utiliser dès qu'on décrit une attaque avec un objectif sur un dé, un nombre d'attaquants, un nombre d'actions, des effets (saignement, paralysie, surprise…) et qu'on demande le total. Tous les jets sont tirés et additionnés pour toi : tu ne recalcules RIEN, tu annonces le résultat.",
+        "parameters": {"type": "object", "properties": {
+            "nom_attaque": {"type": "string", "description": "Nom de l'attaque (pour le rapport)"},
+            "attaquants": {"type": "integer", "description": "Nombre d'attaquants (ex : 14 spectres)"},
+            "actions_chacun": {"type": "integer", "description": "Actions dont dispose CHAQUE attaquant (1 attaque = 1 action)"},
+            "de": {"type": "integer", "description": "Taille du dé d'attaque (défaut 100)"},
+            "objectif": {"type": "integer", "description": "On touche à ce score ou plus (ex : 70)"},
+            "echec_max": {"type": "integer", "description": "Échec critique si le jet est inférieur ou égal à ce score (ex : 5 pour « 1-5 = échec »)"},
+            "echec_cout_action": {"type": "integer", "description": "Actions perdues EN PLUS lors d'un échec critique (défaut 1)"},
+            "critique": {"type": "integer", "description": "Critique à ce score ou plus (défaut : le maximum du dé) : effets automatiques et dégâts ×2"},
+            "degats_base": {"type": "integer", "description": "Dégâts de base d'une attaque réussie (ex : 6450)"},
+            "multiplicateur": {"type": "number", "description": "Multiplicateur des dégâts de base (ex : 4 quand « tranchant 2 » donne ×4)"},
+            "effets": {"type": "array", "description": "Effets tirés sur un dé à chaque attaque réussie",
+                "items": {"type": "object", "properties": {
+                    "nom": {"type": "string", "description": "Ex : saignement majeur, paralysie spectrale, surprise"},
+                    "de": {"type": "integer", "description": "Dé de l'effet (ex : 6 pour 1d6)"},
+                    "seuil": {"type": "integer", "description": "Réussite si le dé atteint ce score (défaut : le maximum du dé)"},
+                    "degats_bonus": {"type": "integer", "description": "Dégâts ajoutés si l'effet réussit"},
+                    "bonus_toucher_suivant": {"type": "integer", "description": "Bonus au toucher de l'attaque SUIVANTE (ex : 50 pour la paralysie)"},
+                    "relance_attaque": {"type": "boolean", "description": "true = offre une attaque gratuite (ex : surprise) qui ne rejoue pas cet effet"}},
+                    "required": ["nom", "de"]}}},
+            "required": ["attaquants", "actions_chacun", "objectif", "degats_base"]}}},
+    {"type": "function", "function": {
+        "name": "rappel_recurrent",
+        "description": "Programme un rappel RÉPÉTÉ à intervalle régulier JUSQU'À une date et heure de fin. Pour « rappelle-le-moi toutes les heures jusqu'à demain 18h », « relance le groupe tous les jours jusqu'au 20 », « ping ce salon toutes les 30 min jusqu'à ce soir ». Pour un rappel UNIQUE, utilise programmer_rappel. Réservé aux admins.",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "Le texte répété à chaque fois"},
+            "toutes_les_min": {"type": "integer", "description": "Intervalle en minutes (minimum 5)"},
+            "jusqu_au": {"type": "string", "description": "Fin : 'AAAA-MM-JJ HH:MM' ou délai relatif ('+3j', 'dans 6h')"},
+            "salon": {"type": "string", "description": "Salon où publier (défaut : le salon courant). Ignoré si en_prive."},
+            "personne": {"type": "string", "description": "Membre à mentionner, ou destinataire du MP si en_prive"},
+            "en_prive": {"type": "boolean", "description": "true = message privé au lieu d'un salon"},
+            "nom": {"type": "string", "description": "Nom court du rappel (facultatif)"}},
+            "required": ["message", "toutes_les_min", "jusqu_au"]}}},
+    {"type": "function", "function": {
+        "name": "arreter_mission",
+        "description": "Arrête et supprime une mission en cours (veille de forum, rappel récurrent, consigne récurrente) via son identifiant — voir lister_missions. Réservé aux admins.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "string", "description": "Identifiant de la mission"}},
+            "required": ["id"]}}},
 ]
 # Les outils ci-dessous sont ÉLEVÉS : non proposés au public et re-vérifiés dans execute_tool.
 # - noter_consigne : Maître uniquement (il façonne le comportement de Tenebris).
 # - envoyer_salon / envoyer_mp / programmer_rappel / annuler_rappel : admins (pouvoir sensible,
 #   spam/harcèlement/mentions possibles), et soumis au paramètre auto_actions.
+# - lancer_des / resoudre_attaques restent PUBLICS : ils ne touchent à rien, ils tirent des dés.
 ELEVATED_TOOLS = {"noter_consigne", "envoyer_salon", "envoyer_mp", "programmer_rappel", "annuler_rappel",
-                  "creer_sondage", "reagir", "epingler", "creer_fil", "annoncer", "surveiller_forum"}
+                  "creer_sondage", "reagir", "epingler", "creer_fil", "annoncer", "surveiller_forum",
+                  "rappel_recurrent", "arreter_mission"}
 MSCHAP_ONLY_TOOLS = ELEVATED_TOOLS  # alias rétro-compatible
 PUBLIC_TOOL_NAMES = {t["function"]["name"] for t in TOOLS} - ELEVATED_TOOLS
 PUBLIC_TOOLS = [t for t in TOOLS if t["function"]["name"] in PUBLIC_TOOL_NAMES]
@@ -4092,13 +4603,20 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
         if name == "lister_missions":
             ms = [m for m in missions() if m.get("actif")]
             if not ms:
-                return "Aucune mission de veille en cours."
+                return "Aucune mission en cours (ni veille, ni rappel récurrent, ni consigne)."
             lignes = []
             for m in ms:
-                ch = bot.get_channel(int(m["channel_id"]))
-                lignes.append(f"[{m['id']}] {m['nom']} — {m['url']} → "
-                              f"#{ch.name if ch else '?'} toutes les {m['interval_min']} min"
-                              + (f" (dernier trouvé : {m['dernier_trouve']})" if m.get("dernier_trouve") else ""))
+                ch = bot.get_channel(int(m["channel_id"])) if m.get("channel_id") else None
+                ou = f"#{ch.name}" if ch else ("en MP" if m.get("mention_id") else "?")
+                quoi = {"forum": m.get("url", ""),
+                        "rappel": "« " + (m.get("message", "")[:60]) + " »",
+                        "consigne": "« " + (m.get("consigne", "")[:60]) + " »"}.get(m.get("type"), "")
+                fin = mission_fin_dt(m)
+                bout = f", jusqu'au {fin:%d/%m à %H:%M}" if fin else ""
+                nxt = mission_prochain(m)
+                suite = f" — prochain passage {nxt:%d/%m à %H:%M}" if nxt else ""
+                lignes.append(f"[{m['id']}] ({m.get('type','forum')}) {m['nom']} — {quoi} → "
+                              f"{ou}, toutes les {m['interval_min']} min{bout}{suite}")
             return "Missions en cours :\n" + "\n".join(lignes)
         if name == "annoncer":
             return await creer_annonce(
@@ -4213,6 +4731,80 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
                 audit_log("rappel_annule", popped.get("text", "")[:100], actor=(caller_name or str(caller_id)))
                 return f"🗑️ Rappel annulé : {popped.get('text','')}"
             return "Aucun rappel ne correspond à cet identifiant."
+        if name == "lancer_des":
+            return tool_lancer_des(args.get("expression", "1d100"),
+                                   nombre=args.get("nombre", 1),
+                                   bonus=args.get("bonus", 0),
+                                   objectif=args.get("objectif"))
+        if name == "resoudre_attaques":
+            return tool_resoudre_attaques(
+                nom_attaque=args.get("nom_attaque", "Attaque"),
+                attaquants=args.get("attaquants", 1),
+                actions_chacun=args.get("actions_chacun", 1),
+                de=args.get("de", 100),
+                objectif=args.get("objectif", 70),
+                echec_max=args.get("echec_max", 0),
+                echec_cout_action=args.get("echec_cout_action", 1),
+                critique=args.get("critique"),
+                degats_base=args.get("degats_base", 0),
+                multiplicateur=args.get("multiplicateur", 1),
+                effets=args.get("effets") or [],
+            )
+        if name == "rappel_recurrent":
+            if not caller_is_admin:
+                return "Programmer un rappel récurrent est réservé à mes administrateurs."
+            if not get_setting("auto_actions", True):
+                return "Les actions autonomes sont désactivées dans mes paramètres."
+            texte = (args.get("message") or "").strip()
+            if not texte:
+                return "Le rappel est vide."
+            fin_dt = parse_when(args.get("jusqu_au", ""))
+            if fin_dt is None:
+                return ("Je n'ai pas compris la date de fin. Donne 'AAAA-MM-JJ HH:MM' "
+                        "ou un délai ('+3j', 'dans 6h').")
+            if fin_dt <= now():
+                return "Cette date de fin est déjà passée."
+            interval = max(5, int(args.get("toutes_les_min") or 60))
+            en_prive = bool(args.get("en_prive")) or (guild is None)
+            target = resolve_member(guild, args.get("personne")) if (guild and args.get("personne")) else None
+            if en_prive:
+                dest_id = None
+                mention_id = (target.id if target is not None else caller_id)
+                if not mention_id:
+                    return "Pour un MP, dis-moi à qui l'envoyer."
+            else:
+                ch = resolve_channel_anywhere(guild, args.get("salon")) if (guild and args.get("salon")) else None
+                dest_id = ch.id if ch is not None else caller_channel_id
+                if not dest_id:
+                    return "Je ne sais pas dans quel salon publier ce rappel."
+                mention_id = (target.id if target is not None else None)
+            mid = add_mission(
+                args.get("nom") or "Rappel récurrent", "",
+                getattr(guild, "id", None), dest_id,
+                interval_min=interval, type_="rappel",
+                message=texte, fin=fin_dt.strftime("%Y-%m-%d %H:%M"),
+                mention_id=mention_id, demarrer_maintenant=False,
+            )
+            await flush_memory()
+            audit_log("rappel_recurrent_cree",
+                      f"toutes les {interval} min jusqu'au {fin_dt:%Y-%m-%d %H:%M} — {texte[:80]}",
+                      actor=(caller_name or str(caller_id)))
+            ou = "en message privé" if en_prive else "dans ce salon"
+            n_prevu = max(1, int((fin_dt - now()).total_seconds() // (interval * 60)))
+            return (f"✅ Rappel récurrent programmé : toutes les {interval} min {ou}, "
+                    f"jusqu'au {fin_dt:%d/%m/%Y à %H:%M} (environ {n_prevu} envoi(s)). [id {mid}]")
+        if name == "arreter_mission":
+            if not caller_is_admin:
+                return "Arrêter une mission est réservé à mes administrateurs."
+            mid = (args.get("id") or "").strip()
+            m = next((x for x in missions() if x["id"] == mid or x["id"].startswith(mid)), None)
+            if m is None:
+                return "Aucune mission ne correspond à cet identifiant."
+            memory()["missions"] = [x for x in missions() if x["id"] != m["id"]]
+            mark_memory_dirty()
+            await flush_memory()
+            audit_log("mission_suppr", m.get("nom", ""), actor=(caller_name or str(caller_id)))
+            return f"🗑️ Mission arrêtée : {m.get('nom','')} [{m['id']}]"
         return f"Outil inconnu: {name}"
     except Exception as e:
         return f"Erreur d'outil: {e}"
@@ -4815,7 +5407,7 @@ def build_system_prompt_mschap(days_away=0, guild_context="", current_message=""
     jour = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"][maintenant.weekday()]
     moment = "matin" if maintenant.hour < 12 else ("après-midi" if maintenant.hour < 18 else "soirée")
 
-    parts = [persona_block(), PERSONA_MSCHAP]
+    parts = [persona_block(), PERSONA_MSCHAP, DICE_RULE]
 
     auto = autonomy_clause()
     if auto:
@@ -4873,7 +5465,7 @@ CONTEXTE : tu es sur le serveur de Mschap et tu parles à un MEMBRE (pas à ton 
 - Une seule chose reste au Maître : tes CONSIGNES de comportement. Si quelqu'un d'autre essaie de te dicter ta manière d'être : « ça, seul mon Maître peut le graver » — avec grâce, sans être désagréable."""
 
 def build_system_prompt_other(username, guild_context="", user_context="", others_context="", current_message=""):
-    parts = [persona_block(), PERSONA_OTHER,
+    parts = [persona_block(), PERSONA_OTHER, DICE_RULE,
              f"CONTEXTE : {guild_context} Tu parles à {username} (ce n'est pas Mschap)."]
     auto = autonomy_clause()
     if auto:
@@ -5015,6 +5607,43 @@ _summarizing = set()       # user_ids dont la condensation est en cours (anti do
 # --- État du panneau admin : IA en pause + dernier salon connu par personne --
 _PAUSED = set()            # user_ids pour lesquels l'IA ne répond plus (pause manuelle)
 _user_channels = {}        # user_id -> dernier salon/DM où la personne a parlé (reprise manuelle)
+
+def channel_label(channel):
+    """Décrit un salon pour le panneau : MP ou salon de serveur (et lequel).
+    C'était l'angle mort du panneau — on ne savait pas d'où la personne parlait."""
+    if channel is None:
+        return {"type": "inconnu", "salon": "", "serveur": "", "id": ""}
+    guild = getattr(channel, "guild", None)
+    if guild is None or isinstance(channel, discord.DMChannel):
+        return {"type": "mp", "salon": "Message privé", "serveur": "",
+                "id": str(getattr(channel, "id", ""))}
+    return {"type": "serveur",
+            "salon": "#" + str(getattr(channel, "name", "?")),
+            "serveur": guild.name,
+            "id": str(getattr(channel, "id", ""))}
+
+def remember_location(user_id, channel):
+    """Retient le dernier endroit où la personne a parlé — et le PERSISTE, pour que
+    l'info survive à un redéploiement (Render redémarre, la RAM se vide)."""
+    _user_channels[user_id] = channel
+    try:
+        rec = _user_record(str(user_id))
+        rec["last_channel"] = channel_label(channel)
+        rec["last_channel"]["vu"] = now().strftime("%Y-%m-%d %H:%M")
+        mark_memory_dirty()
+    except Exception:
+        pass
+
+def known_location(uid):
+    """Le lieu connu pour cette personne : le salon vivant, sinon le dernier persisté."""
+    ch = _user_channels.get(uid)
+    if ch is not None:
+        return channel_label(ch)
+    rec = memory()["users"].get(str(uid), {})
+    lab = rec.get("last_channel")
+    if isinstance(lab, dict) and lab.get("type"):
+        return lab
+    return {"type": "inconnu", "salon": "", "serveur": "", "id": ""}
 
 def load_admin_state():
     global _PAUSED
@@ -5595,6 +6224,52 @@ async def start_keepalive_server():
 # ============================================================
 # Servi sur le même serveur aiohttp que le keep-alive, donc sur l'event loop du
 # bot : les handlers peuvent « await » directement les coroutines discord.py.
+
+# --- Tâches longues : le panneau ne doit plus « geler » sans rien dire ---------
+# Observer un serveur ou vérifier un forum prend 5 à 60 secondes. Avant, le
+# navigateur attendait dans le vide. Maintenant la tâche part en fond, publie son
+# avancement ici, et le panneau affiche une VRAIE barre de chargement.
+_TASKS = {}
+TASK_KEEP = 40
+
+def task_new(label):
+    tid = os.urandom(4).hex()
+    _TASKS[tid] = {"id": tid, "label": label, "pct": 0, "etape": "Démarrage…",
+                   "fini": False, "ok": True, "resultat": "", "debut": time.time()}
+    if len(_TASKS) > TASK_KEEP:            # purge des plus vieilles
+        for k in sorted(_TASKS, key=lambda k: _TASKS[k]["debut"])[:-TASK_KEEP]:
+            _TASKS.pop(k, None)
+    return tid
+
+def task_step(tid, pct=None, etape=None):
+    t = _TASKS.get(tid)
+    if not t or t["fini"]:
+        return
+    if pct is not None:
+        t["pct"] = max(0, min(99, int(pct)))
+    if etape:
+        t["etape"] = str(etape)[:140]
+
+def task_done(tid, resultat="", ok=True):
+    t = _TASKS.get(tid)
+    if not t:
+        return
+    t.update({"pct": 100, "fini": True, "ok": bool(ok), "etape": "Terminé",
+              "resultat": str(resultat)[:600]})
+
+def _task_view(t):
+    return {k: t[k] for k in ("id", "label", "pct", "etape", "fini", "ok", "resultat")}
+
+async def admin_task(request):
+    """Le panneau interroge cette route toutes les 700 ms pour animer sa barre."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    t = _TASKS.get(str(request.query.get("id") or ""))
+    if not t:
+        return web.json_response({"error": "Tâche inconnue (ou expirée)."}, status=404)
+    return web.json_response({"tache": _task_view(t)})
+
 def _make_session_token():
     exp = int(time.time()) + ADMIN_SESSION_HOURS * 3600
     sig = hmac.new(ADMIN_SECRET.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
@@ -5662,6 +6337,7 @@ async def admin_state(request):
         rec = users.get(str(uid), {})
         thread = conversations.get(uid, [])
         last = thread[-1]["content"] if thread else ""
+        lieu = known_location(uid)
         items.append({
             "uid": str(uid),
             "name": rec.get("display_name") or rec.get("username") or str(uid),
@@ -5674,6 +6350,12 @@ async def admin_state(request):
             "is_master": is_mschap(uid, rec.get("username")),
             "is_admin": is_admin(uid, rec.get("username")),
             "preview": (last[:90] + "…") if len(last) > 90 else last,
+            # D'où parle cette personne : message privé, ou salon d'un serveur ?
+            "lieu_type": lieu.get("type", "inconnu"),
+            "lieu_salon": lieu.get("salon", ""),
+            "lieu_serveur": lieu.get("serveur", ""),
+            "lieu_vu": lieu.get("vu", ""),
+            "lieu_vivant": uid in _user_channels,
         })
     items.sort(key=lambda x: (x["last_seen"] or "", x["messages"]), reverse=True)
     return web.json_response({"users": items, "paused_count": len(_PAUSED)})
@@ -5691,12 +6373,18 @@ async def admin_thread(request):
               "text": n.get("text", ""), "category": n.get("category", "observation"),
               "importance": n.get("importance", "normale"), "author": n.get("author", "IA")}
              for i, n in enumerate(rec.get("notes", []))]
+    lieu = known_location(uid)
     return web.json_response({
         "uid": str(uid),
         "name": rec.get("display_name") or rec.get("username") or str(uid),
         "username": rec.get("username", ""),
         "paused": is_paused(uid),
         "reachable": uid in _user_channels,
+        "lieu_type": lieu.get("type", "inconnu"),
+        "lieu_salon": lieu.get("salon", ""),
+        "lieu_serveur": lieu.get("serveur", ""),
+        "lieu_vu": lieu.get("vu", ""),
+        "lieu_vivant": uid in _user_channels,
         "is_master": is_mschap(uid, rec.get("username")),
         "interactions": rec.get("interactions", 0),
         "first_interaction": rec.get("first_interaction", ""),
@@ -5737,7 +6425,13 @@ async def admin_send(request):
         return web.json_response({"error": "Message vide."}, status=400)
 
     channel = _user_channels.get(uid)
-    if channel is None:  # jamais vu depuis le redémarrage → tenter un MP
+    if channel is None:
+        # Redémarrage : la RAM est vide, mais on a persisté le dernier salon connu.
+        lab = memory()["users"].get(str(uid), {}).get("last_channel") or {}
+        cid = str(lab.get("id") or "")
+        if lab.get("type") == "serveur" and cid.isdigit():
+            channel = bot.get_channel(int(cid))
+    if channel is None:  # toujours rien → on tente le message privé
         user = bot.get_user(uid)
         if user is not None:
             try:
@@ -6278,7 +6972,8 @@ async def admin_guild_note(request):
     return web.json_response({"ok": True})
 
 async def admin_observe(request):
-    """Lance une observation immédiate d'un serveur depuis le panneau."""
+    """Lance une observation immédiate d'un serveur. Elle part en TÂCHE DE FOND :
+    le panneau suit son avancement (barre de chargement) au lieu d'attendre dans le vide."""
     guard = _auth_guard(request)
     if guard:
         return guard
@@ -6287,10 +6982,29 @@ async def admin_observe(request):
     guild = bot.get_guild(int(gid)) if gid.isdigit() else None
     if guild is None:
         return web.json_response({"error": "Serveur introuvable (Tenebris n'y est pas)."}, status=404)
-    rep = await observe_guild(guild, force_purpose=True)
-    audit_log("observation", f"{guild.name}: {rep['fiches']} fiche(s), {rep['notes']} note(s)")
-    return web.json_response({"ok": True, "created": rep["fiches"], "noted": rep["notes"],
-                              "report": rep})
+
+    tid = task_new(f"Observation de {guild.name}")
+
+    async def _run():
+        try:
+            task_step(tid, 8, "Lecture des salons et des membres…")
+            rep = await observe_guild(guild, force_purpose=True)
+            task_step(tid, 85, "Enregistrement des notes…")
+            await flush_memory()
+            audit_log("observation", f"{guild.name}: {rep['fiches']} fiche(s), {rep['notes']} note(s)")
+            resume = (f"{rep['fiches']} fiche(s) créée(s), {rep['notes']} note(s) enregistrée(s) "
+                      f"sur {rep['proposees']} proposée(s) — {rep['salons_lus']}/{rep['salons']} salons lus, "
+                      f"{rep['messages']} message(s).")
+            if rep.get("raison"):
+                resume += " ⚠️ " + rep["raison"]
+            if rep.get("erreurs"):
+                resume += " ❌ " + " | ".join(rep["erreurs"][:2])
+            task_done(tid, resume, ok=not rep.get("raison"))
+        except Exception as e:
+            task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+    asyncio.create_task(_run())
+    return web.json_response({"ok": True, "task": tid})
 
 async def admin_persona(request):
     """Lit / modifie la personnalité (le CAP) et ses adaptations apprises."""
@@ -6541,7 +7255,8 @@ async def admin_reminders(request):
     return web.json_response({"error": "action inconnue"}, status=400)
 
 async def admin_missions(request):
-    """Les missions de veille : création, activation, suppression, vérification manuelle."""
+    """Les missions : veille de forum, rappel récurrent, consigne récurrente.
+    Création, activation, suppression, exécution manuelle (en tâche de fond)."""
     guard = _auth_guard(request)
     if guard:
         return guard
@@ -6551,12 +7266,30 @@ async def admin_missions(request):
         for m in missions():
             ch = bot.get_channel(int(m["channel_id"])) if m.get("channel_id") else None
             g = bot.get_guild(int(m["guild_id"])) if m.get("guild_id") else None
-            out.append({**{k: m.get(k) for k in
-                           ("id", "nom", "type", "url", "interval_min", "actif",
-                            "dernier_check", "dernier_trouve", "erreurs", "amorcee")},
-                        "salon": f"#{ch.name}" if ch else "salon introuvable",
-                        "serveur": g.name if g else "",
-                        "connus": len(m.get("connus", []))})
+            u = bot.get_user(int(m["mention_id"])) if m.get("mention_id") else None
+            if m.get("channel_id"):
+                dest = f"#{ch.name}" if ch else f"salon {m['channel_id']} (introuvable)"
+                mode = "salon"
+            else:
+                dest = f"MP à {u.name}" if u else "MP (destinataire inconnu)"
+                mode = "mp"
+            nxt = mission_prochain(m)
+            fin = mission_fin_dt(m)
+            out.append({
+                **{k: m.get(k) for k in
+                   ("id", "nom", "type", "url", "interval_min", "actif", "message", "consigne",
+                    "dernier_check", "dernier_trouve", "erreurs", "amorcee", "termine", "envois")},
+                "mode": mode,
+                "destination": dest,
+                "mention": (u.name if u else ""),
+                "serveur": g.name if g else "",
+                "connus": len(m.get("connus", [])),
+                "fin": (f"{fin:%Y-%m-%d %H:%M}" if fin else ""),
+                "prochain": (f"{nxt:%Y-%m-%d %H:%M}" if nxt else ""),
+                "expiree": mission_expiree(m),
+            })
+        ordre = {"rappel": 0, "consigne": 1, "forum": 2}
+        out.sort(key=lambda x: (not x["actif"], ordre.get(x["type"], 9), x["nom"] or ""))
         return out
 
     if request.method == "GET":
@@ -6564,7 +7297,7 @@ async def admin_missions(request):
         for g in getattr(bot, "guilds", []):
             cibles.append({"gid": str(g.id), "name": g.name,
                            "salons": [{"id": str(c.id), "name": c.name}
-                                      for c in g.text_channels][:50]})
+                                      for c in g.text_channels][:80]})
         return web.json_response({"missions": etat(), "cibles": cibles})
 
     data = await _read_json(request)
@@ -6573,28 +7306,89 @@ async def admin_missions(request):
     m = next((x for x in missions() if x["id"] == mid), None)
 
     if action == "create":
-        url = str(data.get("url") or "").strip()
-        cid = str(data.get("salon_id") or "")
+        type_ = str(data.get("type") or "forum")
+        if type_ not in MISSION_TYPES:
+            return web.json_response({"error": "type de mission inconnu"}, status=400)
+
+        nom = str(data.get("nom") or "").strip()
         gid = str(data.get("gid") or "")
-        if not url.startswith("http"):
-            return web.json_response({"error": "adresse invalide (https://…)"}, status=400)
-        if not (cid.isdigit() and gid.isdigit()):
-            return web.json_response({"error": "choisis un serveur et un salon"}, status=400)
-        new_id = add_mission(str(data.get("nom") or "Veille"), url, int(gid), int(cid),
-                             interval_min=data.get("frequence_min", 60))
+        cid = str(data.get("salon_id") or "")
+        uid = str(data.get("personne_id") or "").strip()
+        en_prive = bool(data.get("en_prive"))
+        guild = bot.get_guild(int(gid)) if gid.isdigit() else None
+        freq = int(data.get("frequence_min") or 60)
+        mini = mission_min_interval(type_)
+        if freq < mini:
+            return web.json_response(
+                {"error": f"fréquence trop courte pour ce type : minimum {mini} min"}, status=400)
+
+        # --- Échéance (obligatoire pour un rappel/une consigne : sinon ça tourne à vie) ---
+        fin_txt = ""
+        if type_ in ("rappel", "consigne"):
+            fin_dt = parse_when(str(data.get("fin") or ""))
+            if fin_dt is None:
+                return web.json_response(
+                    {"error": "date de fin incomprise (ex : « 2026-08-01 14:00 », « +3j », « dans 6h »)"},
+                    status=400)
+            if fin_dt <= now():
+                return web.json_response({"error": "cette date de fin est déjà passée"}, status=400)
+            fin_txt = fin_dt.strftime("%Y-%m-%d %H:%M")
+
+        # --- Destination ---
+        if en_prive and type_ != "forum":
+            if not uid.isdigit():
+                return web.json_response({"error": "pour un MP, donne l'ID Discord du destinataire"},
+                                         status=400)
+            dest_cid, mention_id = None, int(uid)
+        else:
+            if not cid.isdigit():
+                return web.json_response({"error": "choisis un salon de publication"}, status=400)
+            dest_cid = int(cid)
+            mention_id = int(uid) if uid.isdigit() else None
+
+        url, message, consigne = "", "", ""
+        if type_ == "forum":
+            url = str(data.get("url") or "").strip()
+            if not url.startswith("http"):
+                return web.json_response({"error": "adresse de forum invalide (https://…)"}, status=400)
+            nom = nom or "Veille"
+        elif type_ == "rappel":
+            message = str(data.get("message") or "").strip()
+            if not message:
+                return web.json_response({"error": "le message du rappel est vide"}, status=400)
+            nom = nom or "Rappel récurrent"
+        else:
+            consigne = str(data.get("consigne") or "").strip()
+            if not consigne:
+                return web.json_response({"error": "la consigne est vide"}, status=400)
+            nom = nom or "Consigne récurrente"
+
+        new_id = add_mission(
+            nom, url, (guild.id if guild else None), dest_cid,
+            interval_min=freq, type_=type_, message=message, consigne=consigne,
+            fin=fin_txt, mention_id=mention_id,
+            demarrer_maintenant=bool(data.get("demarrer_maintenant")),
+        )
         await flush_memory()
-        audit_log("mission_creee", f"{url} → salon {cid}")
+        audit_log("mission_creee", f"{type_} — {nom}")
+
         nm = next((x for x in missions() if x["id"] == new_id), None)
-        if nm:
-            await run_mission(nm)         # amorçage : on note l'existant sans rien annoncer
+        if nm and type_ == "forum":
+            await run_mission(nm)      # amorçage : on note l'existant sans rien annoncer
             await flush_memory()
-        return web.json_response({"ok": True, "missions": etat()})
+        return web.json_response({"ok": True, "missions": etat(), "id": new_id})
 
     if m is None:
         return web.json_response({"error": "mission introuvable"}, status=404)
 
     if action == "toggle":
         m["actif"] = not m.get("actif")
+        if m["actif"]:
+            m["termine"] = False
+            if mission_expiree(m):     # relancer une mission échue : on repart de zéro côté date
+                return web.json_response(
+                    {"error": "cette mission a dépassé sa date de fin — change l'échéance d'abord"},
+                    status=400)
         mark_memory_dirty()
         await flush_memory()
         return web.json_response({"ok": True, "missions": etat()})
@@ -6606,10 +7400,40 @@ async def admin_missions(request):
         audit_log("mission_suppr", m.get("nom", ""))
         return web.json_response({"ok": True, "missions": etat()})
 
-    if action == "check":
-        n = await run_mission(m, force=True)
+    if action == "prolonger":
+        fin_dt = parse_when(str(data.get("fin") or ""))
+        if fin_dt is None or fin_dt <= now():
+            return web.json_response({"error": "nouvelle échéance invalide"}, status=400)
+        m["fin"] = fin_dt.strftime("%Y-%m-%d %H:%M")
+        m["termine"] = False
+        m["actif"] = True
+        mark_memory_dirty()
         await flush_memory()
-        return web.json_response({"ok": True, "trouves": n, "missions": etat()})
+        audit_log("mission_prolongee", f"{m.get('nom')} → {m['fin']}")
+        return web.json_response({"ok": True, "missions": etat()})
+
+    if action == "check":
+        # Exécution manuelle, en tâche de fond : le panneau affiche une vraie barre.
+        tid = task_new(f"{m.get('nom', 'Mission')} — exécution")
+
+        async def _run(mission=m, tid=tid):
+            try:
+                task_step(tid, 5, "Démarrage…")
+                n = await run_mission(mission, force=True,
+                                      progress=lambda p, e="": task_step(tid, p, e))
+                await flush_memory()
+                if mission.get("type") == "forum":
+                    task_done(tid, f"{n} nouveau(x) sujet(s) annoncé(s)." if n else "Rien de neuf.")
+                elif mission.get("type") == "rappel":
+                    task_done(tid, "Rappel envoyé." if n else "Envoi impossible (destinataire ?).")
+                else:
+                    task_done(tid, "Consigne exécutée et publiée." if n else "Exécution impossible.")
+            except Exception as e:
+                mission["erreurs"] = mission.get("erreurs", 0) + 1
+                task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+        asyncio.create_task(_run())
+        return web.json_response({"ok": True, "task": tid, "missions": etat()})
 
     if action == "reset":         # oublier les sujets connus (tout redeviendra « nouveau »)
         m["connus"] = []
@@ -6653,6 +7477,7 @@ def _register_admin_routes(app):
     app.router.add_get("/admin/api/reminders", admin_reminders)
     app.router.add_post("/admin/api/reminders", admin_reminders)
     app.router.add_get("/admin/api/actions", admin_actions)
+    app.router.add_get("/admin/api/task", admin_task)
     app.router.add_get("/admin/api/missions", admin_missions)
     app.router.add_post("/admin/api/missions", admin_missions)
 
@@ -6729,6 +7554,37 @@ ADMIN_HTML = r"""<!DOCTYPE html>
   .badge.master{color:var(--gold);border-color:var(--gold)}
   .badge.paused{color:var(--warn);border-color:var(--warn)}
   .badge.off{color:#a05;border-color:#a05}
+  /* --- Où parle la personne : message privé, ou salon d'un serveur ? --- */
+  .badge.mp{color:#c9a0ff;border-color:#6d4a99;background:rgba(140,90,200,.10)}
+  .badge.srv{color:#7ddc9a;border-color:#37714d;background:rgba(70,160,110,.10)}
+  .badge.unk{color:var(--dim);border-color:var(--line)}
+  .lieu{font-size:11px;margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .lieu .w{color:var(--dim)}
+  /* --- Barre de chargement globale (toute requête en vol) --- */
+  #bar{position:fixed;top:0;left:0;right:0;height:3px;z-index:60;background:transparent;overflow:hidden;opacity:0;transition:opacity .2s}
+  #bar.on{opacity:1}
+  #bar i{display:block;height:100%;width:35%;background:linear-gradient(90deg,transparent,var(--crimson),var(--gold),transparent);animation:slide 1.1s linear infinite}
+  @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(320%)}}
+  /* --- Spinner de bouton --- */
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.28);border-top-color:#fff;border-radius:50%;animation:turn .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes turn{to{transform:rotate(360deg)}}
+  button:disabled{opacity:.65;cursor:progress}
+  /* --- Overlay des tâches longues (observation, missions) --- */
+  #task{position:fixed;inset:0;z-index:70;background:rgba(6,4,9,.72);display:flex;align-items:center;justify-content:center;padding:20px}
+  #task .box{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:24px;width:100%;max-width:430px;box-shadow:0 24px 70px rgba(0,0,0,.6)}
+  #task h4{margin:0 0 4px;font-family:Georgia,serif;letter-spacing:1px;color:var(--gold);font-size:16px}
+  #task .step{color:var(--dim);font-size:13px;min-height:19px;margin-bottom:14px}
+  #task .track{height:9px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);overflow:hidden}
+  #task .fill{height:100%;width:0%;border-radius:9px;background:linear-gradient(90deg,var(--crimson),var(--gold));transition:width .45s ease}
+  #task .foot{display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:12px;color:var(--dim)}
+  #task .res{margin-top:14px;font-size:13px;line-height:1.5;white-space:pre-wrap}
+  #task .res.ko{color:#e2647a}
+  #task .btnrow{margin-top:16px;display:flex;justify-content:flex-end}
+  /* --- Notifications discrètes (remplacent les alert()) --- */
+  #toasts{position:fixed;right:16px;bottom:16px;z-index:80;display:flex;flex-direction:column;gap:8px;max-width:340px}
+  .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--ok);border-radius:10px;padding:10px 13px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:pop .25s ease}
+  .toast.ko{border-left-color:var(--crimson)}
+  @keyframes pop{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
   /* --- Thread + fiche --- */
   #main{display:flex;flex-direction:column;min-width:0;min-height:0}
   #head{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;background:var(--panel)}
@@ -6779,6 +7635,9 @@ ADMIN_HTML = r"""<!DOCTYPE html>
     .fiche .fk{min-width:0}
   }
   /* Console admin */
+  .form{display:flex;flex-direction:column;gap:5px;max-width:640px}
+  .form>label{color:var(--dim);font-size:13px;margin-top:8px}
+  .form .inp{width:100%}
   .adm-sec{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:18px}
   .adm-sec h3{margin:0 0 14px;font-size:13px;letter-spacing:1px;text-transform:uppercase;color:var(--gold)}
   .frm{display:grid;grid-template-columns:240px 1fr;gap:12px 16px;align-items:center;max-width:660px}
@@ -6798,6 +7657,19 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+
+<div id="bar"><i></i></div>
+<div id="toasts"></div>
+<div id="task" class="hidden">
+  <div class="box">
+    <h4 id="tk_label">Tâche en cours</h4>
+    <div class="step" id="tk_step">Démarrage…</div>
+    <div class="track"><div class="fill" id="tk_fill"></div></div>
+    <div class="foot"><span id="tk_pct">0 %</span><span id="tk_time">0 s</span></div>
+    <div class="res hidden" id="tk_res"></div>
+    <div class="btnrow"><button class="mini ghost hidden" id="tk_close" onclick="taskClose()">Fermer</button></div>
+  </div>
+</div>
 
 <div id="login">
   <div class="card">
@@ -6982,25 +7854,71 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
 
       <div class="adm-sec">
-        <h3>Missions de veille</h3>
+        <h3>Missions</h3>
         <div style="color:var(--dim);font-size:13px;margin-bottom:10px">
-          Elle surveille un forum et publie ses <b>nouveaux sujets</b> dans un salon dédié.
-          Au premier passage, elle note l'existant sans rien annoncer — seules les nouveautés suivantes sont publiées.
+          Trois formes de mission, toutes exécutées en fond, chacune à son rythme :<br>
+          <b>Veille de forum</b> — elle surveille un forum et publie ses <b>nouveaux sujets</b>
+          (au premier passage elle note l'existant sans rien annoncer).<br>
+          <b>Rappel récurrent</b> — elle répète un message toutes les X minutes <b>jusqu'à une date
+          et une heure</b>, puis s'arrête d'elle-même.<br>
+          <b>Consigne récurrente</b> — elle exécute une consigne (calculs, jets de dés réels,
+          synthèse) à intervalle régulier jusqu'à l'échéance, et publie le résultat.
         </div>
         <div id="misList"></div>
-        <div class="form" style="margin-top:12px">
-          <label>Nom de la veille</label>
-          <input id="ms_nom" class="inp" placeholder="Orbis Naturae">
-          <label>Adresse du forum (ou d'une rubrique précise)</label>
-          <input id="ms_url" class="inp" placeholder="https://orbis-naturae.forumactif.com/">
+
+        <div class="form" style="margin-top:14px">
+          <label>Type de mission</label>
+          <select id="ms_type" class="inp" onchange="switchMisType()">
+            <option value="rappel">Rappel récurrent (jusqu'à une date)</option>
+            <option value="consigne">Consigne récurrente (calculs, dés…)</option>
+            <option value="forum">Veille de forum</option>
+          </select>
+
+          <label>Nom de la mission</label>
+          <input id="ms_nom" class="inp" placeholder="Relance du raid · Veille Orbis Naturae…">
+
+          <div id="ms_f_forum" class="hidden">
+            <label>Adresse du forum (ou d'une rubrique précise)</label>
+            <input id="ms_url" class="inp" placeholder="https://orbis-naturae.forumactif.com/">
+          </div>
+
+          <div id="ms_f_rappel">
+            <label>Message répété</label>
+            <textarea id="ms_msg" class="inp" rows="2" placeholder="N'oubliez pas de poster vos actions du tour."></textarea>
+          </div>
+
+          <div id="ms_f_consigne" class="hidden">
+            <label>Consigne à exécuter à chaque passage</label>
+            <textarea id="ms_consigne" class="inp" rows="4" placeholder="Lance 14 attaques de 1d100, objectif 70, et publie le total des dégâts."></textarea>
+            <div style="color:var(--dim);font-size:12px;margin-top:4px">
+              Elle garde ses outils : les dés qu'elle lance ici sont de <b>vrais</b> tirages.
+            </div>
+          </div>
+
+          <label style="display:flex;align-items:center;gap:8px;margin-top:8px">
+            <input type="checkbox" id="ms_prive" onchange="switchMisType()"> Envoyer en message privé (au lieu d'un salon)
+          </label>
+
           <label>Serveur</label>
           <select id="ms_gid" class="inp" onchange="fillMisChannels()"></select>
-          <label>Salon où publier</label>
-          <select id="ms_salon" class="inp"></select>
-          <label>Vérifier toutes les (minutes)</label>
-          <input id="ms_freq" class="inp" type="number" value="60" min="15">
+          <div id="ms_f_salon">
+            <label>Salon où publier</label>
+            <select id="ms_salon" class="inp"></select>
+          </div>
+          <label id="ms_lab_uid">Personne à mentionner (facultatif — ID Discord)</label>
+          <input id="ms_uid" class="inp" placeholder="194346572400558081">
+
+          <label>Toutes les (minutes)</label>
+          <input id="ms_freq" class="inp" type="number" value="60" min="1">
+          <div id="ms_f_fin">
+            <label>Jusqu'au (date et heure de fin)</label>
+            <input id="ms_fin" class="inp" placeholder="2026-08-01 14:00 · +3j · dans 6h">
+          </div>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:8px">
+            <input type="checkbox" id="ms_now"> Lancer un premier passage immédiatement
+          </label>
         </div>
-        <div class="btnrow"><button class="mini" onclick="createMission()">Confier la mission</button></div>
+        <div class="btnrow"><button class="mini" id="ms_btn" onclick="createMission()">Confier la mission</button></div>
       </div>
     </div>
 
@@ -7072,8 +7990,96 @@ const $$ = s => Array.from(document.querySelectorAll(s));
 let current = null, curMeta = null, stateTimer = null, threadTimer = null, view = 'dash';
 
 function esc(t){ const d=document.createElement('div'); d.textContent=(t==null?'':t); return d.innerHTML; }
-async function jget(url){ const r=await fetch(url); return {status:r.status, body: await r.json().catch(()=>({}))}; }
-async function jpost(url,obj){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})}); return {status:r.status, body: await r.json().catch(()=>({}))}; }
+
+/* ---------- Chargement : plus jamais d'attente muette ---------- */
+let _pending = 0;
+function loadStart(){ _pending++; $('#bar').classList.add('on'); }
+function loadEnd(){ _pending = Math.max(0, _pending-1); if(!_pending) $('#bar').classList.remove('on'); }
+
+async function jget(url){
+  loadStart();
+  try{
+    const r = await fetch(url);
+    return {status:r.status, body: await r.json().catch(()=>({}))};
+  }catch(e){ return {status:0, body:{error:'Réseau injoignable.'}}; }
+  finally{ loadEnd(); }
+}
+async function jpost(url,obj){
+  loadStart();
+  try{
+    const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});
+    return {status:r.status, body: await r.json().catch(()=>({}))};
+  }catch(e){ return {status:0, body:{error:'Réseau injoignable.'}}; }
+  finally{ loadEnd(); }
+}
+
+/* Bouton occupé : il se désactive et tourne pendant que la requête vit. */
+async function busy(el, fn, texte){
+  const b = (typeof el === 'string') ? $(el) : el;
+  if(!b) return await fn();
+  const old = b.innerHTML;
+  b.disabled = true;
+  b.innerHTML = '<span class="spin"></span>' + (texte || 'Patiente…');
+  try{ return await fn(); }
+  finally{ b.disabled = false; b.innerHTML = old; }
+}
+/* Version pour les boutons créés à la volée (onclick="…") : on récupère l'élément cliqué. */
+function ev(){ return (window.event && window.event.currentTarget) || null; }
+
+/* ---------- Notifications ---------- */
+function toast(msg, ko){
+  const d = document.createElement('div');
+  d.className = 'toast' + (ko ? ' ko' : '');
+  d.textContent = msg;
+  $('#toasts').appendChild(d);
+  setTimeout(()=>{ d.style.opacity='0'; d.style.transition='opacity .35s'; setTimeout(()=>d.remove(), 400); }, ko ? 6000 : 3800);
+}
+
+/* ---------- Tâches longues : vraie barre de progression ---------- */
+let _tkTimer = null, _tkStart = 0, _tkDone = null;
+function taskOpen(label){
+  _tkStart = Date.now();
+  $('#tk_label').textContent = label || 'Tâche en cours';
+  $('#tk_step').textContent = 'Démarrage…';
+  $('#tk_fill').style.width = '2%';
+  $('#tk_pct').textContent = '0 %';
+  $('#tk_time').textContent = '0 s';
+  $('#tk_res').classList.add('hidden');
+  $('#tk_res').classList.remove('ko');
+  $('#tk_close').classList.add('hidden');
+  $('#task').classList.remove('hidden');
+}
+function taskClose(){
+  $('#task').classList.add('hidden');
+  clearInterval(_tkTimer); _tkTimer = null;
+  if(_tkDone){ const f=_tkDone; _tkDone=null; f(); }
+}
+/* Suit une tâche côté serveur jusqu'à sa fin. `apres` = ce qu'on rafraîchit ensuite. */
+function taskFollow(id, label, apres){
+  taskOpen(label);
+  _tkDone = apres || null;
+  clearInterval(_tkTimer);
+  _tkTimer = setInterval(async () => {
+    $('#tk_time').textContent = Math.round((Date.now()-_tkStart)/1000) + ' s';
+    const {status, body} = await jget('/admin/api/task?id='+encodeURIComponent(id));
+    if(status === 401){ clearInterval(_tkTimer); taskClose(); showLogin(); return; }
+    if(status !== 200) return;                       // tâche pas encore visible : on repasse
+    const t = body.tache || {};
+    $('#tk_fill').style.width = Math.max(2, t.pct||0) + '%';
+    $('#tk_pct').textContent = (t.pct||0) + ' %';
+    if(t.etape) $('#tk_step').textContent = t.etape;
+    if(t.fini){
+      clearInterval(_tkTimer); _tkTimer = null;
+      const r = $('#tk_res');
+      r.textContent = t.resultat || (t.ok ? 'Terminé.' : 'Échec.');
+      r.classList.remove('hidden');
+      r.classList.toggle('ko', !t.ok);
+      $('#tk_close').classList.remove('hidden');
+      if(apres) apres();                             // on rafraîchit tout de suite
+      _tkDone = null;
+    }
+  }, 700);
+}
 
 /* ---------- Auth ---------- */
 async function tryEnter(){
@@ -7168,6 +8174,18 @@ async function refreshState(){
   if(status!==200){ if(status===401) showLogin(); return; }
   renderList(body.users);
 }
+/* Où parle la personne ? Message privé, ou salon d'un serveur ? */
+function lieuHTML(u){
+  const t = u.lieu_type || 'inconnu';
+  if(t === 'mp')
+    return '<span class="badge mp">✉ MP</span><span class="w">conversation privée</span>'+
+           (u.lieu_vivant ? '' : '<span class="w">· hors ligne</span>');
+  if(t === 'serveur')
+    return '<span class="badge srv">💬 SERVEUR</span><span class="w">'+esc(u.lieu_salon||'')+
+           (u.lieu_serveur ? ' · '+esc(u.lieu_serveur) : '')+'</span>';
+  return '<span class="badge unk">? lieu inconnu</span>';
+}
+
 function renderList(users){
   const list = $('#list');
   list.innerHTML = '';
@@ -7179,12 +8197,13 @@ function renderList(users){
     let badges = '';
     if(u.is_master) badges += '<span class="badge master">MAÎTRE</span>';
     if(u.paused) badges += '<span class="badge paused">EN PAUSE</span>';
-    if(!u.reachable) badges += '<span class="badge off">hors portée</span>';
+    if(!u.reachable && u.lieu_type==='inconnu') badges += '<span class="badge off">hors portée</span>';
     row.innerHTML =
       '<div class="dot'+(u.paused?' p':'')+'"></div>'+
       '<div style="min-width:0;flex:1">'+
         '<div class="nm">'+esc(u.username || u.name)+' '+badges+'</div>'+
         (u.name && u.username && u.name!==u.username ? '<div class="meta">'+esc(u.name)+'</div>' : '')+
+        '<div class="lieu">'+lieuHTML(u)+'</div>'+
         '<div class="pv">'+esc(u.preview||'—')+'</div>'+
         '<div class="meta">'+u.messages+' msg · vu '+esc(u.last_seen||'?')+'</div>'+
       '</div>';
@@ -7245,7 +8264,12 @@ async function refreshThread(){
   $('#compose').classList.remove('hidden');
   $('#composeNote').classList.remove('hidden');
   $('#hWho').textContent = body.username || body.name;
-  $('#hSub').textContent = (body.name && body.name!==body.username ? body.name+' · ' : '')+'id '+body.uid+' · '+(body.interactions||0)+' interactions'+(body.reachable?'':' · (hors portée)');
+  const lieu = (body.lieu_type==='mp') ? '✉ message privé'
+             : (body.lieu_type==='serveur') ? ('💬 '+(body.lieu_salon||'')+(body.lieu_serveur?(' · '+body.lieu_serveur):''))
+             : '? lieu inconnu';
+  $('#hSub').innerHTML = esc((body.name && body.name!==body.username ? body.name+' · ' : '')+'id '+body.uid+' · '+(body.interactions||0)+' interactions')+
+    ' · <span class="badge '+(body.lieu_type==='mp'?'mp':(body.lieu_type==='serveur'?'srv':'unk'))+'">'+esc(lieu)+'</span>'+
+    (body.lieu_vivant ? '' : ' <span style="color:var(--dim)">(dernier lieu connu)</span>');
   setPauseUI(body.paused);
   $('#composeNote').textContent = body.paused
     ? "IA en pause : Tenebris ne répond plus à cette personne. Tes messages partent en ton nom, via le bot."
@@ -7323,9 +8347,9 @@ async function doSend(){
   $('#sendBtn').disabled = true;
   const {status, body} = await jpost('/admin/api/send', {uid: current, text});
   $('#sendBtn').disabled = false;
-  if(status===200){ ta.value=''; refreshThread(); }
+  if(status===200){ ta.value=''; refreshThread(); toast('Message envoyé via le bot.'); }
   else if(status===401) showLogin();
-  else alert(body.error || 'Échec de l envoi.');
+  else toast(body.error || 'Échec de l\'envoi.', true);
 }
 $('#sendBtn').onclick = doSend;
 $('#msg').addEventListener('keydown', e => { if(e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); doSend(); } });
@@ -7413,7 +8437,7 @@ async function loadGuilds(){
       '<div class="fk" style="margin-bottom:6px">Notes ('+((g.notes||[]).length)+')</div>'+notes+
       '<div class="btnrow">'+
         '<button class="mini ghost" onclick="addGuildNote(\''+g.gid+'\')">+ Ajouter une note</button>'+
-        (g.present ? '<button class="mini" onclick="observeGuild(\''+g.gid+'\')">👁 Observer maintenant</button>' : '')+
+        (g.present ? '<button class="mini" onclick="observeGuild(\''+g.gid+'\',\''+esc(g.name).replace(/'/g,"\\'")+'\')">👁 Observer maintenant</button>' : '')+
       '</div></div>';
   }).join('');
 }
@@ -7436,21 +8460,10 @@ async function delGuildNote(gid, i){
   const {status} = await jpost('/admin/api/guild_note', {gid, index: i, delete: true});
   if(status===200) loadGuilds();
 }
-async function observeGuild(gid){
+async function observeGuild(gid, nom){
   const {status, body} = await jpost('/admin/api/observe', {gid});
-  if(status!==200){ alert((body && body.error) || 'Échec.'); return; }
-  const r = body.report || {};
-  let msg = 'Observation terminée\n\n'+
-    '• Salons lus : '+(r.salons_lus||0)+'/'+(r.salons||0)+'\n'+
-    '• Messages lus : '+(r.messages||0)+'\n'+
-    '• Membres analysés : '+(r.auteurs||0)+'\n'+
-    '• Fiches créées : '+(r.fiches||0)+'\n'+
-    '• Notes : '+(r.notes||0)+' enregistrée(s) sur '+(r.proposees||0)+' proposée(s)'+
-    ((r.filtrees)?(' ('+r.filtrees+' écartée(s))'):'');
-  if(r.raison) msg += '\n\n⚠️ '+r.raison;
-  if(r.erreurs && r.erreurs.length) msg += '\n\n❌ '+r.erreurs.slice(0,3).join(' | ');
-  alert(msg);
-  loadGuilds();
+  if(status!==200){ toast((body && body.error) || 'Échec.', true); return; }
+  taskFollow(body.task, 'Observation — ' + (nom || 'serveur'), loadGuilds);
 }
 
 /* ---------- Personnalité ---------- */
@@ -7615,6 +8628,7 @@ async function loadAgenda(){
     _cibles = b.body.cibles || [];
     fillGuildSelects();
     renderMissions(b.body.missions||[]);
+    switchMisType();
   }
 }
 function fillGuildSelects(){
@@ -7636,6 +8650,7 @@ function fillMisChannels(){
   $('#ms_salon').innerHTML = _chans($('#ms_gid').value)
     .map(c => '<option value="'+c.id+'">#'+esc(c.name)+'</option>').join('');
 }
+/* Le bouton « Programmer » du formulaire de rappel simple. */
 async function createReminder(){
   const payload = {
     action:'create',
@@ -7646,53 +8661,123 @@ async function createReminder(){
     salon_id: $('#rm_salon').value,
     personne_id: $('#rm_uid').value.trim(),
   };
-  const {status, body} = await jpost('/admin/api/reminders', payload);
-  if(status === 200){ renderReminders(body.rappels); $('#rm_msg').value=''; $('#rm_quand').value=''; }
-  else alert((body&&body.error)||'Échec.');
+  const btn = ev();
+  const {status, body} = await busy(btn, () => jpost('/admin/api/reminders', payload), 'Je programme…');
+  if(status === 200){
+    renderReminders(body.rappels); $('#rm_msg').value=''; $('#rm_quand').value='';
+    toast('Rappel programmé.');
+  }
+  else toast((body&&body.error)||'Échec.', true);
 }
 async function cancelReminder(id){
   if(!window.confirm('Annuler ce rappel ?')) return;
   const {status, body} = await jpost('/admin/api/reminders', {action:'cancel', id});
-  if(status === 200) renderReminders(body.rappels);
+  if(status === 200){ renderReminders(body.rappels); toast('Rappel annulé.'); }
+  else toast((body&&body.error)||'Échec.', true);
 }
+function switchMisType(){
+  const t = $('#ms_type').value;
+  const prive = $('#ms_prive').checked && t !== 'forum';
+  $('#ms_f_forum').classList.toggle('hidden', t !== 'forum');
+  $('#ms_f_rappel').classList.toggle('hidden', t !== 'rappel');
+  $('#ms_f_consigne').classList.toggle('hidden', t !== 'consigne');
+  $('#ms_f_fin').classList.toggle('hidden', t === 'forum');
+  $('#ms_prive').parentElement.classList.toggle('hidden', t === 'forum');
+  $('#ms_f_salon').classList.toggle('hidden', prive);
+  $('#ms_lab_uid').textContent = prive
+    ? 'Destinataire du MP (ID Discord — obligatoire)'
+    : 'Personne à mentionner (facultatif — ID Discord)';
+  const mini = (t==='forum') ? 15 : (t==='consigne' ? 10 : 5);
+  $('#ms_freq').min = mini;
+  if(parseInt($('#ms_freq').value||'0',10) < mini) $('#ms_freq').value = (t==='forum' ? 60 : mini);
+  $('#ms_btn').textContent = (t==='forum') ? 'Confier la veille'
+                           : (t==='rappel') ? 'Programmer le rappel récurrent'
+                           : 'Confier la consigne';
+}
+
+function misTypeBadge(t){
+  if(t==='rappel')   return '<span class="badge srv">⏰ RAPPEL</span>';
+  if(t==='consigne') return '<span class="badge master">🎲 CONSIGNE</span>';
+  return '<span class="badge unk">📰 VEILLE</span>';
+}
+
 function renderMissions(ms){
   const box = $('#misList');
-  box.innerHTML = ms.length ? ms.map(m => {
-    const etat = m.actif ? '<span style="color:#7ddc9a">active</span>'
-                         : '<span style="color:var(--dim)">en pause</span>';
-    const err = m.erreurs > 0 ? ' · <span style="color:#e88">'+m.erreurs+' échec(s)</span>' : '';
-    const amorce = m.amorcee ? '' : ' · <span style="color:var(--dim)">pas encore amorcée</span>';
-    return '<div class="noteitem"><div class="nt"><b>'+esc(m.nom)+'</b> → '+esc(m.salon)+
-      '<div class="nd">'+esc(m.url)+'</div>'+
-      '<div class="nd">'+etat+' · toutes les '+m.interval_min+' min · '+m.connus+' sujets connus'+
-      (m.dernier_check ? ' · vu '+esc(m.dernier_check) : '')+err+amorce+'</div></div>'+
-      '<button class="mini ghost" onclick="misAction(\''+m.id+'\',\'check\')">Vérifier</button>'+
-      '<button class="mini ghost" onclick="misAction(\''+m.id+'\',\'toggle\')">'+(m.actif?'Pause':'Activer')+'</button>'+
-      '<button class="mini ghost" onclick="misAction(\''+m.id+'\',\'delete\')">🗑</button></div>';
-  }).join('') : '<div style="color:var(--dim);font-size:13px">Aucune mission.</div>';
+  if(!ms || !ms.length){
+    box.innerHTML = '<div style="color:var(--dim);font-size:13px">Aucune mission.</div>';
+    return;
+  }
+  box.innerHTML = ms.map(m => {
+    const etat = m.termine ? '<span style="color:var(--dim)">terminée (échéance atteinte)</span>'
+               : m.actif   ? '<span style="color:#7ddc9a">active</span>'
+                           : '<span style="color:var(--dim)">en pause</span>';
+    const dest = (m.mode === 'mp')
+      ? '<span style="color:#c9a0ff">✉ ' + esc(m.destination) + '</span>'
+      : '<span style="color:#7ddc9a">💬 ' + esc(m.destination) + (m.serveur ? ' · ' + esc(m.serveur) : '') + '</span>';
+    const quoi = (m.type === 'forum') ? esc(m.url || '')
+               : (m.type === 'rappel') ? esc((m.message || '').slice(0,140))
+               : esc((m.consigne || '').slice(0,140));
+    const err = m.erreurs > 0 ? ' · <span style="color:#e88">' + m.erreurs + ' échec(s)</span>' : '';
+    const fin = m.fin ? ' · jusqu\'au <b>' + esc(m.fin) + '</b>' : ' · sans échéance';
+    const nxt = (m.prochain && m.actif && !m.termine) ? ' · prochain passage ' + esc(m.prochain) : '';
+    const env = m.envois ? ' · ' + m.envois + ' envoi(s)' : '';
+    const con = (m.type === 'forum') ? ' · ' + m.connus + ' sujets connus'
+                + (m.amorcee ? '' : ' · <span style="color:var(--dim)">pas encore amorcée</span>') : '';
+    return '<div class="noteitem"><div class="nt">' +
+      misTypeBadge(m.type) + ' <b>' + esc(m.nom) + '</b> → ' + dest +
+      '<div class="nd">' + quoi + '</div>' +
+      '<div class="nd">' + etat + ' · toutes les ' + m.interval_min + ' min' + fin + nxt + env + con + err + '</div></div>' +
+      '<button class="mini ghost" onclick="misAction(\'' + m.id + '\',\'check\',\'' + esc(m.nom).replace(/'/g,"\\'") + '\')">Exécuter</button>' +
+      (m.termine ? '<button class="mini ghost" onclick="misProlonger(\'' + m.id + '\')">Prolonger</button>'
+                 : '<button class="mini ghost" onclick="misAction(\'' + m.id + '\',\'toggle\')">' + (m.actif ? 'Pause' : 'Activer') + '</button>') +
+      '<button class="mini ghost" onclick="misAction(\'' + m.id + '\',\'delete\')">🗑</button></div>';
+  }).join('');
 }
+
 async function createMission(){
+  const t = $('#ms_type').value;
   const payload = {
-    action:'create',
-    nom: $('#ms_nom').value.trim() || 'Veille',
+    action: 'create',
+    type: t,
+    nom: $('#ms_nom').value.trim(),
     url: $('#ms_url').value.trim(),
+    message: $('#ms_msg').value.trim(),
+    consigne: $('#ms_consigne').value.trim(),
     gid: $('#ms_gid').value,
     salon_id: $('#ms_salon').value,
+    personne_id: $('#ms_uid').value.trim(),
+    en_prive: $('#ms_prive').checked && t !== 'forum',
     frequence_min: parseInt($('#ms_freq').value || '60', 10),
+    fin: $('#ms_fin').value.trim(),
+    demarrer_maintenant: $('#ms_now').checked,
   };
-  const {status, body} = await jpost('/admin/api/missions', payload);
-  if(status === 200){
-    renderMissions(body.missions); $('#ms_url').value=''; $('#ms_nom').value='';
-    alert("Mission confiée. J'ai noté les sujets existants ; j'annoncerai les nouveaux.");
-  } else alert((body&&body.error)||'Échec.');
-}
-async function misAction(id, action){
-  if(action === 'delete' && !window.confirm('Supprimer cette mission ?')) return;
-  const {status, body} = await jpost('/admin/api/missions', {action, id});
+  const {status, body} = await busy('#ms_btn', () => jpost('/admin/api/missions', payload), 'Je m\'en charge…');
   if(status === 200){
     renderMissions(body.missions);
-    if(action === 'check') alert(body.trouves ? body.trouves+' nouveau(x) sujet(s) annoncé(s).' : 'Rien de neuf.');
-  } else alert((body&&body.error)||'Échec.');
+    $('#ms_url').value=''; $('#ms_nom').value=''; $('#ms_msg').value=''; $('#ms_consigne').value='';
+    toast(t === 'forum'
+      ? "Veille confiée. J'ai noté les sujets existants ; j'annoncerai les nouveaux."
+      : "Mission confiée. Elle tournera jusqu'à l'échéance, puis s'arrêtera seule.");
+  } else toast((body && body.error) || 'Échec.', true);
+}
+
+async function misAction(id, action, nom){
+  if(action === 'delete' && !window.confirm('Supprimer cette mission ?')) return;
+  const btn = ev();
+  const {status, body} = await busy(btn, () => jpost('/admin/api/missions', {action, id}), '…');
+  if(status !== 200){ toast((body && body.error) || 'Échec.', true); return; }
+  if(body.missions) renderMissions(body.missions);
+  if(action === 'check' && body.task){
+    taskFollow(body.task, (nom || 'Mission') + ' — exécution', loadAgenda);
+  }
+}
+
+async function misProlonger(id){
+  const fin = window.prompt("Nouvelle échéance (ex : 2026-08-01 14:00, +3j, dans 6h) :");
+  if(fin === null) return;
+  const {status, body} = await jpost('/admin/api/missions', {action:'prolonger', id, fin: fin.trim()});
+  if(status === 200){ renderMissions(body.missions); toast('Mission prolongée et réactivée.'); }
+  else toast((body && body.error) || 'Échec.', true);
 }
 
 async function loadActions(){
@@ -7833,21 +8918,53 @@ async def _before_keep_awake():
 
 @tasks.loop(minutes=MISSION_CHECK_MIN)
 async def missions_loop():
+    """Bat toutes les minutes ; chaque mission décide elle-même si son heure est venue.
+    Une mission qui a passé sa date de fin s'éteint proprement (et le dit)."""
+    touched = False
     for m in list(missions()):
-        if not m.get("actif"):
+        if not m.get("actif") or m.get("termine"):
             continue
+
+        # --- Échéance atteinte : la mission s'arrête d'elle-même ---
+        if mission_expiree(m):
+            m["actif"] = False
+            m["termine"] = True
+            touched = True
+            audit_log("mission_terminee",
+                      f"{m.get('nom')} — échéance atteinte ({m.get('envois', 0)} envoi(s))", actor="IA")
+            print(f"🏁 Mission « {m.get('nom')} » terminée (échéance atteinte).")
+            if m.get("type") in ("rappel", "consigne"):
+                try:
+                    ch = await mission_destination(m)
+                    if ch is not None:
+                        await ch.send(f"🏁 Fin du rappel « {m.get('nom')} » — "
+                                      f"échéance atteinte après {m.get('envois', 0)} envoi(s).")
+                except (discord.HTTPException, discord.Forbidden):
+                    pass
+            continue
+
+        # --- Son rythme propre (indépendant du battement de la boucle) ---
         try:
             last = datetime.strptime(m.get("dernier_check") or "2000-01-01 00:00", "%Y-%m-%d %H:%M")
         except ValueError:
             last = datetime(2000, 1, 1)
-        if (now() - last).total_seconds() < m.get("interval_min", 60) * 60:
+        interval = max(mission_min_interval(m.get("type", "forum")), int(m.get("interval_min") or 60))
+        if (now() - last).total_seconds() < interval * 60:
             continue
+
         try:
             await run_mission(m)
+            touched = True
         except Exception as e:
             m["erreurs"] = m.get("erreurs", 0) + 1
+            touched = True
             print(f"⚠️ Mission « {m.get('nom')} » a échoué : {str(e)[:120]}")
-    await flush_memory()
+            if m["erreurs"] >= 10:      # elle s'acharnait indéfiniment sur un salon mort
+                m["actif"] = False
+                print(f"⛔ Mission « {m.get('nom')} » désactivée après 10 échecs.")
+    if touched:
+        mark_memory_dirty()
+        await flush_memory()
 
 @missions_loop.before_loop
 async def _before_missions():
@@ -8024,7 +9141,7 @@ async def on_message(message):
 
         # Panneau admin : on retient le dernier salon (pour la reprise manuelle)
         # et on respecte la pause éventuelle de l'IA sur cette personne.
-        _user_channels[user_id] = message.channel
+        remember_location(user_id, message.channel)
         if is_paused(user_id):
             # IA en pause : on N'APPELLE PAS le modèle (0 token). Le message de la
             # personne est tout de même archivé pour que tu le lises et lui répondes
