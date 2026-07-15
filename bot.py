@@ -364,6 +364,31 @@ def last_provider():
     return _last_provider
 
 
+def _retry_after_seconds(err, defaut=60):
+    """Extrait le délai de reprise réel d'une erreur 429 (Cerebras/Groq le donnent souvent).
+    Beaucoup de limites gratuites sont PAR MINUTE : inutile d'écarter une clé 5 min si son
+    quota revient dans 8 secondes. On lit le délai annoncé, borné entre 5 s et 5 min."""
+    # En-tête HTTP standard (SDK Cerebras / OpenAI-compat)
+    for attr in ("response", "headers"):
+        obj = getattr(err, attr, None)
+        headers = getattr(obj, "headers", None) if attr == "response" else obj
+        if headers:
+            try:
+                ra = headers.get("retry-after") or headers.get("Retry-After")
+                if ra:
+                    return max(5, min(300, int(float(ra))))
+            except (ValueError, TypeError, AttributeError):
+                pass
+    # Message texte : « try again in 8.5s », « try again in 1m2s »
+    s = str(err)
+    m = re.search(r"try again in\s+(?:(\d+)m)?\s*([\d.]+)s", s, re.IGNORECASE)
+    if m:
+        mins = int(m.group(1)) if m.group(1) else 0
+        secs = float(m.group(2))
+        return max(5, min(300, int(mins * 60 + secs) + 1))
+    return defaut
+
+
 # --- Appels bruts, un par fournisseur ---------------------------------------
 async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort="low"):
     params = {"model": model, "messages": messages, "temperature": temperature,
@@ -379,8 +404,8 @@ async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort
         return await cerebras_client.chat.completions.create(**params)
 
     # Pool : on essaie les clés disponibles à tour de rôle. Une clé en quota (429)
-    # est mise de côté et on passe à la suivante. On ne lève l'erreur (→ bascule vers
-    # Groq) que si TOUTES les clés du pool sont épuisées.
+    # est mise de côté (pour la durée RÉELLE annoncée) et on passe à la suivante.
+    # On ne lève l'erreur (→ bascule vers Groq) que si TOUTES les clés sont épuisées.
     derniere = None
     for _ in range(cerebras_pool.total):
         got = cerebras_pool.acquire()
@@ -392,10 +417,11 @@ async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort
         except Exception as e:
             derniere = e
             if _rate_limit_message(e):
-                cerebras_pool.penalize(idx, PROVIDER_COOLDOWN)
+                pause = _retry_after_seconds(e)
+                cerebras_pool.penalize(idx, pause)
                 restantes = cerebras_pool.available()
-                print(f"⛓️ Clé Cerebras #{idx + 1} à court de quota — "
-                      f"{restantes} clé(s) encore dispo.")
+                print(f"⛓️ Clé Cerebras #{idx + 1} rate-limitée {pause}s — "
+                      f"{restantes}/{cerebras_pool.total} clé(s) dispo, je tourne.")
                 continue                # on tente la clé suivante
             raise                        # autre erreur (réseau, 404…) → on ne masque pas
     raise derniere or LLMError("Toutes les clés Cerebras sont épuisées.")
@@ -906,6 +932,19 @@ def update_user_profile(user_id, prof):
         mark_memory_dirty()
     return changed
 
+def _note_text(note):
+    """Le texte d'une note, quel que soit son format. Renvoie '' si rien d'exploitable.
+    Tolère : {"text": "..."}, un dict avec une autre clé texte, ou une chaîne brute.
+    Un format inattendu ne doit JAMAIS faire planter une réponse."""
+    if isinstance(note, str):
+        return note.strip()
+    if isinstance(note, dict):
+        for k in ("text", "texte", "content", "note"):
+            v = note.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
 def profile_prompt_block(user_id):
     """Rend la fiche sous une forme compacte, injectable dans le prompt système,
     pour que Tenebris ADAPTE son ton (points 1 et 6) sans réciter la fiche."""
@@ -1129,7 +1168,9 @@ def get_user_context(user_id, member=None, guild=None):
     if notes:
         lines.append("Ce que tu sais d'elle (sers-t'en pour la reconnaître, sans le réciter) :")
         for n in notes[-MAX_USER_NOTES:]:
-            lines.append(f"- {n['text']}")
+            t = _note_text(n)
+            if t:
+                lines.append(f"- {t}")
     return "\n".join(lines)
 
 def member_notes_block(guild, members):
@@ -1151,8 +1192,13 @@ def member_notes_block(guild, members):
         nom = getattr(mb, "display_name", None) or rec.get("display_name") or rec.get("username") or uid
         titre = rec.get("titre")
         entete = nom + (f" (titre : {titre})" if titre else "")
-        if notes:
-            corps = " ; ".join(n["text"] for n in notes[-CROSS_USER_NOTES_EACH * 2:])
+        # Une note peut être un dict {"text": …} OU, sur d'anciennes données, une simple
+        # chaîne. On tolère les deux et on ignore ce qui est vide : une note malformée ne
+        # doit JAMAIS faire planter la réponse (sinon Tenebris se tait pour ce membre).
+        textes = [_note_text(n) for n in notes]
+        textes = [t for t in textes if t]
+        if textes:
+            corps = " ; ".join(textes[-CROSS_USER_NOTES_EACH * 2:])
             lignes.append(f"- {entete} : {corps}")
         else:
             lignes.append(f"- {entete} : aucune note pour l'instant — dis-le franchement, n'invente rien.")
@@ -1190,7 +1236,10 @@ def get_cross_user_context(guild, exclude_user_id=None):
 
     lines, total = [], 0
     for _, name, notes in candidates[:CROSS_USER_MAX_MEMBERS]:
-        block = f"{name} : " + " ; ".join(n["text"] for n in notes)
+        textes = [t for t in (_note_text(n) for n in notes) if t]
+        if not textes:
+            continue
+        block = f"{name} : " + " ; ".join(textes)
         if total + len(block) > CROSS_USER_MAX_CHARS:
             break
         lines.append(f"- {block}")
@@ -10998,7 +11047,10 @@ async def on_message(message):
         print(f"❌ Erreur Discord: {e}")
         await message.reply("⛓️ Un souci de connexion. Réessaie.")
     except Exception as e:
-        print(f"❌ ERREUR: {e}")
+        # Trace COMPLÈTE dans les logs : sans ça, impossible de savoir d'où vient le grincement.
+        import traceback
+        print(f"❌ ERREUR dans on_message ({type(e).__name__}): {e}")
+        traceback.print_exc()
         await message.reply("⛓️ Quelque chose a grincé dans mes rouages. Réessaie dans un instant.")
 
     await bot.process_commands(message)
