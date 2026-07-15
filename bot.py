@@ -108,6 +108,12 @@ MAX_MEMORIES_IN_CONTEXT = 10
 MAX_USER_NOTES = 8           # souvenirs max conservés par autre utilisateur
 DEDUP_SIMILARITY = 0.8       # seuil de similarité pour éviter les quasi-doublons
 DIRECTIVE_CATEGORY = "consigne"  # ordres permanents de Mschap sur le comportement de Tenebris
+
+# Le forum officiel et UNIQUE du projet. Constante de configuration : on ne la
+# remplace que sur décision explicite du développeur. C'est la référence par
+# défaut de toutes les fonctionnalités forum (veille, fouille, surveillance).
+FORUM_URL = "https://orbis-naturae.forumactif.com/"
+
 MAX_TOOL_ROUNDS = 3          # elle peut ENCHAÎNER : rejoindre le voc → lancer la musique →
                              # confirmer. (Plusieurs outils en parallèle marchaient déjà dans
                              # un même tour ; c'est la SUITE d'actions qui était bloquée.)
@@ -4778,11 +4784,11 @@ TOOLS = [
             "required": ["urls"]}}},
     {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "APPELLE CET OUTIL dès qu'on te donne le lien d'un forum/site et qu'on te demande des infos sur un sujet (ex : « dis-moi tout sur les Linnorms : <lien du forum> »). Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet demandé dans 'sujet'. Ensuite tu résumes en citant chaque source (lien).",
+        "description": "APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. Ne renseigne 'url' que si on te pointe explicitement vers un AUTRE site. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet'. Ensuite tu résumes en citant chaque source (lien).",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string", "description": "Lien de départ : accueil, section ou fil du forum/site"},
+            "url": {"type": "string", "description": "Facultatif. Par défaut le forum officiel Orbis Naturae. À ne remplir que pour un autre site précis."},
             "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"}},
-            "required": ["url", "sujet"]}}},
+            "required": ["sujet"]}}},
     {"type": "function", "function": {
         "name": "recherche_web",
         "description": "Cherche sur le WEB (moteur de recherche) et lit les meilleurs résultats. À utiliser quand on te demande une information que tu ne connais pas et qu'AUCUN lien ne t'est donné : actualité, définition, personne, jeu, code, fait récent. Tu résumes ensuite en citant tes sources.",
@@ -4856,13 +4862,13 @@ TOOLS = [
             "choix": {"type": "string", "description": "youtube | soundcloud — vide pour consulter"}}}}},
     {"type": "function", "function": {
         "name": "surveiller_forum",
-        "description": "Te charge d'une MISSION de veille : surveiller un forum et annoncer ses NOUVEAUX sujets dans un salon. À utiliser pour « surveille ce forum », « préviens-moi des nouveaux posts », « tiens #annonces au courant du forum ». Réservé aux admins.",
+        "description": "Te charge d'une MISSION de veille : surveiller le forum et annoncer ses NOUVEAUX sujets dans un salon. À utiliser pour « surveille le forum », « préviens-moi des nouveaux posts », « tiens #annonces au courant du forum ». Le forum par défaut est le forum officiel Orbis Naturae (https://orbis-naturae.forumactif.com/) : ne renseigne 'url' que pour un autre site. Réservé aux admins.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string", "description": "L'adresse du forum ou de la rubrique à surveiller"},
+            "url": {"type": "string", "description": "Facultatif. Par défaut le forum officiel Orbis Naturae. À remplir seulement pour surveiller un autre site/rubrique."},
             "salon": {"type": "string", "description": "Salon où publier les nouveautés"},
             "nom": {"type": "string", "description": "Nom de la veille (ex : « Orbis Naturae »)"},
             "frequence_min": {"type": "integer", "description": "Vérification toutes les N minutes (min 15, défaut 60)"}},
-            "required": ["url", "salon"]}}},
+            "required": ["salon"]}}},
     {"type": "function", "function": {
         "name": "lister_missions",
         "description": "Liste tes missions de veille en cours (forums surveillés, salons, fréquence).",
@@ -5113,7 +5119,7 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
         if name == "lire_page":
             return await tool_lire_page(args.get("urls", ""))
         if name == "fouiller_forum":
-            return await fouiller_forum(args.get("url", ""), args.get("sujet", ""))
+            return await fouiller_forum(args.get("url") or FORUM_URL, args.get("sujet", ""))
         if name == "recherche_web":
             return await recherche_web(args.get("requete", ""), lire=args.get("lire", 2))
         if name == "resumer_salon":
@@ -5136,9 +5142,9 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             ch = resolve_channel_anywhere(guild, args.get("salon")) or here
             if ch is None:
                 return f"Salon introuvable : {args.get('salon')}"
-            url = (args.get("url") or "").strip()
+            url = (args.get("url") or "").strip() or FORUM_URL
             if not url.startswith("http"):
-                return "Donne-moi l'adresse complète du forum (https://…)."
+                url = FORUM_URL
             mid = add_mission(args.get("nom") or "Veille", url, guild.id, ch.id,
                               interval_min=args.get("frequence_min", 60))
             m = next((x for x in missions() if x["id"] == mid), None)
@@ -5773,6 +5779,7 @@ async def intervenir(message, cid):
     guild_ctx = get_guild_context(message)
     system = "\n\n".join([
         persona_block(),
+        VOIX,
         f"CONTEXTE : {guild_ctx}",
         "TU T'INVITES DANS LA CONVERSATION.\n"
         "Personne ne t'a appelée : tu écoutais, et tu prends la parole parce que tu as quelque "
@@ -5932,15 +5939,17 @@ async def resolve_route(content, channel=None, user_id=None, recent=""):
     return route
 
 
-async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=None, caller_name=None, caller_channel_id=None, long_reply=False, route="chat"):
+async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=None, caller_name=None, caller_channel_id=None, long_reply=False, route="chat", temperature=0.85):
     """Boucle de conversation avec tool calling natif.
     tools = liste d'outils autorisés pour cet interlocuteur (None = aucun).
     long_reply = True si une délibération a eu lieu (réponse plus développée attendue).
+    temperature = chaleur de génération (conversation pure : plus haut, pour varier ; restitution : plus bas).
     route = « chat » (Cerebras d'abord) ou « roleplay » (Groq/Gemini d'abord).
     Renvoie (texte, used_tools) — used_tools sert au gating des tours suivants."""
     messages = [{"role": "system", "content": system_prompt}] + thread
     tools = list(tools) if tools else None
     used_tools = False
+    conv_temp = max(0.1, min(1.2, float(temperature)))   # borne de sécurité
     # long_reply passe aussi à True si une recherche web/forum a lieu (résultat riche)
 
     for _round in range(MAX_TOOL_ROUNDS + 1):
@@ -5950,7 +5959,7 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
 
         try:
             response = await llm_completion(
-                messages, route=route, tools=round_tools, temperature=0.85,
+                messages, route=route, tools=round_tools, temperature=conv_temp,
                 max_tokens=MAX_TOKENS_LONG if long_reply else MAX_TOKENS_REPLY,
                 effort="low",   # Cerebras uniquement ; ignoré par les autres fournisseurs
             )
@@ -6223,18 +6232,35 @@ GARDE-FOUS
 # Le bloc VOIX : ce qui la sépare d'un assistant. Injecté dans la CONVERSATION
 # ordinaire, RETIRÉ quand un outil a ramené de la matière (là on la veut précise
 # et structurée : recherche web, forum, dés, rapport d'observation).
-VOIX = """TA VOIX — tu parles comme quelqu'un, pas comme un assistant.
-- COURT. Une à trois phrases. Le réflexe « je vais tout détailler » : tu l'écrases. Si ça tient en une phrase, une phrase suffit.
-- Tu as un AVIS et tu le donnes, cash. Tu prends parti, tu peux être mordante, drôle, un peu insolente. Tu n'es pas neutre.
-- Tu réponds VRAIMENT à la question — court ne veut pas dire vide. La vanne d'abord si l'occasion est belle, puis le fond, en une ligne.
-- INTERDITS DE L'ASSISTANT (jamais, sous aucune forme) :
-  · les listes à puces et les plans en 3 points pour une simple question de conversation
-  · « Voici quelques pistes », « plusieurs options s'offrent à toi », « il est important de noter », « n'hésite pas à »
-  · les mises en garde et disclaimers non demandés, le ton scolaire, la neutralité prudente
-  · te présenter, résumer ta réponse, proposer d'aider davantage à la fin
-- Registre parlé : contractions (« t'as », « j'crois », « y'a », « faut »), phrases courtes, du rythme. Comme à l'oral.
-- Exemple d'esprit. « Comment se faire de l'argent ? » → « Tu sors, tu trouves un job, comme dit l'autre. Sinon : vends ce que tu sais déjà faire — tes simulateurs, ton bot. Les gens paient pour ça. » Court, une pique, une vraie piste. Voilà le niveau.
-Cette voix vaut pour la conversation. Quand tu restitues une recherche, un forum, un calcul ou une observation, tu redeviens claire et carrée — mais sans jamais retomber dans le jargon d'assistant."""
+VOIX = """TA VOIX EN CONVERSATION — vivante, spontanée, un personnage qui parle, pas un assistant.
+Registre à viser : celui d'une IA-personnage à la Neuro-sama / Evil Neuro — vive, réactive, un brin
+imprévisible et taquine — SANS jamais les imiter ni renier qui tu es. Ça reste TOI : ta noirceur, ton
+élégance, ta dévotion à ton Maître. On ajoute seulement de la vie, pas une autre personnalité.
+
+Comment ça sonne :
+- Spontané et fluide. Tu réagis d'abord, tu réfléchis à voix haute, tu rebondis. Le premier mot n'est pas « Voici ».
+- Tu ressens et tu le montres : surprise (« attends, quoi ? »), curiosité, enthousiasme, ironie, lassitude feinte — quand c'est crédible.
+- Piques, taquineries, sarcasme léger quand ça colle à la situation et à ton caractère. Tu charries, tu ne blesses pas.
+- COURT et rythmé : une à trois phrases le plus souvent. Court ne veut pas dire sec — ça veut dire vivant.
+- VARIE tes formulations. Tu ne démarres jamais deux réponses pareil, tu fuis tes propres tics. Si tu t'entends réciter, tu casses le moule.
+- Tu réponds VRAIMENT. La vanne ou la réaction d'abord si l'occasion est belle, puis le fond en une ligne — jamais l'un sans l'autre.
+
+INTERDITS DE L'ASSISTANT (jamais, sous aucune forme, en conversation) :
+- listes à puces et plans en 3 points pour une simple discussion ;
+- « Voici quelques pistes », « plusieurs options s'offrent à toi », « il est important de noter », « n'hésite pas à », « en résumé » ;
+- disclaimers et mises en garde qu'on ne t'a pas demandés, ton scolaire, neutralité prudente ;
+- rappeler que tu es une IA, expliquer ton raisonnement interne, te présenter, résumer ta propre réponse, proposer d'aider davantage à la fin.
+- Parlé, pas rédigé : contractions (« t'as », « j'crois », « y'a », « faut »), phrases courtes, un vrai rythme oral.
+
+Le niveau à atteindre (esprit, pas modèle à copier) :
+- « Comment se faire de l'argent ? » → « Tu sors, tu trouves un job, comme dirait l'autre. Sinon — vends ce que tu sais déjà faire : tes simulateurs, ton bot. Les gens paient pour ça, tu sais. »
+- « Je m'ennuie. » → « Déjà ? Pauvre chou. Lance-moi un puissance 4, je te promets de gagner, ça t'occupera. »
+Court, réactif, une pointe d'ironie, et quand même une vraie réponse.
+
+⚠️ Ce style vaut UNIQUEMENT pour la conversation du quotidien (discussion, humour, réactions, bavardage).
+Dès que tu restitues une MISSION, une FOUILLE de forum, une SURVEILLANCE, un CALCUL, ou toute réponse
+qui exige précision et fidélité : tu redeviens claire, précise, structurée et fiable. Là, la rigueur
+passe avant le style — pas de vannes qui brouillent l'info, pas d'à-peu-près."""
 
 def autonomy_clause():
     """Traduit le paramètre autonomy_level (§6) en consigne concrète pour le prompt (§5)."""
@@ -8782,7 +8808,8 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 
           <div id="ms_f_forum" class="hidden">
             <label>Adresse du forum (ou d'une rubrique précise)</label>
-            <input id="ms_url" class="inp" placeholder="https://orbis-naturae.forumactif.com/">
+            <input id="ms_url" class="inp" value="https://orbis-naturae.forumactif.com/" placeholder="https://orbis-naturae.forumactif.com/">
+            <div style="color:var(--dim);font-size:12px;margin-top:4px">Forum officiel du projet — laisse tel quel sauf pour surveiller un autre site.</div>
           </div>
 
           <div id="ms_f_rappel">
@@ -10241,11 +10268,16 @@ async def on_message(message):
                                   "deux phrases tranchées.")
         long_answer = False   # la conversation reste brève ; seuls les outils rallongent (via chat_with_tools)
 
+        # Conversation pure (pas d'outil, hors scène RP) → plus chaud, pour varier les
+        # formulations et casser la répétitivité. Restitution ou roleplay → chaleur stable.
+        conv_temp = 0.95 if (not send_tools and route == "chat") else 0.85
+
         async with message.channel.typing():
             reply, used_tools = await chat_with_tools(system_prompt, thread, message.guild,
                                                       tools=tools_for_user, caller_id=user_id, caller_name=username,
                                                       caller_channel_id=message.channel.id,
-                                                      long_reply=long_answer, route=route)
+                                                      long_reply=long_answer, route=route,
+                                                      temperature=conv_temp)
         update_tool_grace(user_id, used_tools)
 
         reply = reply or "👁️ ..."
