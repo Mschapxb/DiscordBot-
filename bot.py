@@ -112,15 +112,18 @@ _VALID_PROVIDERS = ("cerebras", "groq", "gemini")
 def _route_from_env(name, default_chain):
     raw = os.getenv(f"LLM_ROUTE_{name.upper()}", "")
     chain = [p.strip().lower() for p in raw.split(",") if p.strip()] or default_chain
-    return [p for p in chain if p in _VALID_PROVIDERS] or list(default_chain)
+    chain = [p for p in chain if p in _VALID_PROVIDERS] or list(default_chain)
+    # Politique du bot : 100 % Cerebras (multi-clés). Groq/Gemini apportaient trop peu et
+    # cassaient les outils (dés, forum) ; toute la robustesse vient du pool de clés Cerebras.
+    chain = [p for p in chain if p == "cerebras"] or ["cerebras"]
+    return chain
 
 LLM_ROUTES = {
-    "chat":     _route_from_env("chat",     ["cerebras", "groq", "gemini"]),
-    "roleplay": _route_from_env("roleplay", ["groq", "gemini", "cerebras"]),
-    "analyse":  _route_from_env("analyse",  ["cerebras", "groq", "gemini"]),
+    "chat":     _route_from_env("chat",     ["cerebras"]),
+    "roleplay": _route_from_env("roleplay", ["cerebras"]),
+    "analyse":  _route_from_env("analyse",  ["cerebras"]),
 }
-# Gemini n'est branché qu'en TEXTE ici (pas de tool calling) : quand des outils sont
-# demandés, il est simplement sauté dans la chaîne.
+# Cerebras gère les outils : les dés et la fouille forum marchent sur toutes les routes.
 PROVIDER_TOOLS = {"cerebras": True, "groq": True, "gemini": False}
 PROVIDER_COOLDOWN = 300   # un fournisseur à court de quota est mis de côté 5 min
 MSCHAP_ID = 194346572400558081  # ID Discord de Mschap (le Maître) — 0 si tu veux te fier au seul username
@@ -187,13 +190,15 @@ ADMIN_STATE_FILE = "admin_state.json"
 if not DISCORD_TOKEN:
     print("❌ ERREUR: DISCORD_TOKEN manquant dans .env")
     exit()
-if not (CEREBRAS_API_KEY or GROQ_API_KEY or GEMINI_API_KEY):
-    print("❌ ERREUR: aucune clé LLM (CEREBRAS_API_KEY / GROQ_API_KEY / GEMINI_API_KEY) dans .env")
+if not CEREBRAS_API_KEYS:
+    print("❌ ERREUR: aucune clé Cerebras (CEREBRAS_API_KEYS ou CEREBRAS_API_KEY) dans .env — "
+          "c'est le seul fournisseur utilisé désormais.")
     exit()
 if len(CEREBRAS_API_KEYS) > 1:
     print(f"🔑 {len(CEREBRAS_API_KEYS)} clés Cerebras chargées — rotation automatique activée.")
-elif CEREBRAS_API_KEYS:
-    print("🔑 1 clé Cerebras chargée (ajoute CEREBRAS_API_KEYS pour en cumuler plusieurs).")
+else:
+    print("🔑 1 seule clé Cerebras chargée. Ajoute-en dans CEREBRAS_API_KEYS "
+          "(séparées par des virgules) pour cumuler les quotas.")
 
 cerebras_client = AsyncCerebras(api_key=CEREBRAS_API_KEY) if CEREBRAS_API_KEY else None
 
@@ -245,12 +250,90 @@ class CerebrasPool:
         if 0 <= idx < len(self._cooldown):
             self._cooldown[idx] = time.time() + seconds
 
+    def force_next(self):
+        """Fait tourner MANUELLEMENT le curseur : la prochaine requête prendra la clé suivante.
+        Utile pour forcer le changement à la main sans attendre un 429."""
+        if not self._clients:
+            return None
+        self._i = (self._i + 1) % len(self._clients)
+        return self._i + 1        # numéro (1-based) de la clé désormais en tête
+
+    def reset(self):
+        """Lève tous les cooldowns : toutes les clés redeviennent disponibles tout de suite."""
+        self._cooldown = [0.0] * len(self._clients)
+
+    def detail(self):
+        """État clé par clé, pour un diagnostic lisible."""
+        now_t = time.time()
+        out = []
+        for i, cd in enumerate(self._cooldown):
+            restant = max(0, int(cd - now_t))
+            en_tete = (i == self._i)
+            out.append({"num": i + 1, "dispo": restant == 0,
+                        "cooldown_s": restant, "en_tete": en_tete})
+        return out
+
     def status(self):
         """Pour le diagnostic : combien de clés dispo / en pause."""
         return {"total": self.total, "dispo": self.available(),
                 "en_pause": self.total - self.available()}
 
 cerebras_pool = CerebrasPool(CEREBRAS_API_KEYS)
+
+
+# ============================================================
+# FILE D'ATTENTE + THROTTLE — on ne jette AUCUN message
+# ============================================================
+# Toutes les requêtes Cerebras passent par une file : elles sont traitées à la
+# suite, avec un espacement minimum entre deux appels (throttle). Un pic de
+# messages simultanés ne provoque donc plus une rafale de requêtes (qui ferait
+# cracher le rate-limit) ni des messages perdus : chacun attend son tour.
+#
+# Réglages :
+#   CEREBRAS_MIN_INTERVAL : délai minimum entre deux appels (lisse la charge)
+#   CEREBRAS_QUEUE_MAX    : au-delà, on refuse poliment (protège la RAM)
+#   CEREBRAS_QUEUE_WAIT_MAX : temps d'attente max dans la file avant d'abandonner
+CEREBRAS_MIN_INTERVAL = float(os.getenv("CEREBRAS_MIN_INTERVAL", "0.7"))
+CEREBRAS_QUEUE_MAX = int(os.getenv("CEREBRAS_QUEUE_MAX", "40"))
+CEREBRAS_QUEUE_WAIT_MAX = float(os.getenv("CEREBRAS_QUEUE_WAIT_MAX", "90"))
+
+class CerebrasQueue:
+    """Sérialise les appels Cerebras avec un délai minimum entre chacun.
+    Un seul appel à la fois (un verrou), et on attend `min_interval` depuis le
+    dernier appel avant de lancer le suivant. Simple, robuste, pas de message sauté."""
+    def __init__(self, min_interval):
+        self._lock = asyncio.Lock()
+        self._min = min_interval
+        self._last = 0.0
+        self._waiting = 0          # nb de requêtes en attente (pour le diagnostic + garde-fou)
+
+    @property
+    def waiting(self):
+        return self._waiting
+
+    async def run(self, coro_factory):
+        """Met un appel dans la file. `coro_factory` est une fonction SANS argument qui
+        renvoie la coroutine à exécuter (on la crée au dernier moment, dans le verrou)."""
+        if self._waiting >= CEREBRAS_QUEUE_MAX:
+            raise LLMError("File d'attente pleine — trop de demandes en même temps.")
+        self._waiting += 1
+        start = time.time()
+        try:
+            async with self._lock:
+                if time.time() - start > CEREBRAS_QUEUE_WAIT_MAX:
+                    raise LLMError("Attente trop longue dans la file — réessaie.")
+                # Throttle : on espace les appels d'au moins min_interval.
+                depuis = time.time() - self._last
+                if depuis < self._min:
+                    await asyncio.sleep(self._min - depuis)
+                try:
+                    return await coro_factory()
+                finally:
+                    self._last = time.time()
+        finally:
+            self._waiting -= 1
+
+cerebras_queue = CerebrasQueue(CEREBRAS_MIN_INTERVAL)
 
 
 # ============================================================
@@ -391,6 +474,14 @@ def _retry_after_seconds(err, defaut=60):
 
 # --- Appels bruts, un par fournisseur ---------------------------------------
 async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort="low"):
+    """Point d'entrée Cerebras : passe par la FILE (throttle + sérialisation) pour ne
+    jamais jeter un message ni provoquer une rafale de requêtes. La vraie logique
+    (pool de clés, rotation, 429) est dans _call_cerebras_raw."""
+    return await cerebras_queue.run(
+        lambda: _call_cerebras_raw(model, messages, tools, temperature, max_tokens, effort)
+    )
+
+async def _call_cerebras_raw(model, messages, tools, temperature, max_tokens, effort="low"):
     params = {"model": model, "messages": messages, "temperature": temperature,
               "max_completion_tokens": max_tokens, "reasoning_effort": effort}
     if tools:
@@ -405,7 +496,7 @@ async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort
 
     # Pool : on essaie les clés disponibles à tour de rôle. Une clé en quota (429)
     # est mise de côté (pour la durée RÉELLE annoncée) et on passe à la suivante.
-    # On ne lève l'erreur (→ bascule vers Groq) que si TOUTES les clés sont épuisées.
+    # On ne lève l'erreur que si TOUTES les clés sont épuisées.
     derniere = None
     for _ in range(cerebras_pool.total):
         got = cerebras_pool.acquire()
@@ -416,7 +507,7 @@ async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort
             return await client.chat.completions.create(**params)
         except Exception as e:
             derniere = e
-            if _rate_limit_message(e):
+            if _is_rate_limit(e):
                 pause = _retry_after_seconds(e)
                 cerebras_pool.penalize(idx, pause)
                 restantes = cerebras_pool.available()
@@ -561,10 +652,20 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
     usable = [p for p in chain if p not in exclude and provider_ready(p)]
     if tools:
         with_tools = [p for p in usable if PROVIDER_TOOLS.get(p)]
+        dispo_tools = [p for p in with_tools if not provider_paused(p)]
         if with_tools:
+            # On privilégie les modèles qui gèrent les outils (dispo en priorité, sinon
+            # on tente quand même : mieux que d'abandonner l'appel d'outil).
             usable = with_tools
+            if not dispo_tools:
+                print("⚠️ Modèles tool-capables tous en pause — je tente quand même.")
         else:
-            tools = None       # personne ne gère les outils sur cette route : tant pis, on répond
+            # Aucun modèle capable d'outils sur cette route (ex : seul Gemini reste, ou pas
+            # de clé Groq). On répond SANS outils, mais on le signale : sinon les dés et la
+            # fouille échouent en silence et on croit que « ça ne marche plus ».
+            tools = None
+            print("⚠️ Outils demandés mais AUCUN modèle tool-capable dispo "
+                  "(Cerebras épuisé + pas de Groq ?) → réponse sans outils.")
     if not usable:
         raise LLMError(f"Aucun fournisseur configuré pour la route « {route} »")
 
@@ -582,7 +683,7 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
             continue
         except Exception as e:
             last_err = e
-            if _rate_limit_message(e):
+            if _is_rate_limit(e):
                 pause_provider(provider)
                 print(f"⛓️ Quota {provider} atteint — écarté {PROVIDER_COOLDOWN // 60} min.")
             else:
@@ -624,7 +725,8 @@ def llm_status():
         st = cerebras_pool.status()
         lines.append(f"Clés Cerebras : {st['dispo']}/{st['total']} disponible(s)"
                      + (f", {st['en_pause']} en pause (quota)" if st['en_pause'] else ""))
-    lines.append(f"Gemini · filtres : `{GEMINI_SAFETY}`")
+    if cerebras_queue.waiting:
+        lines.append(f"File d'attente : {cerebras_queue.waiting} requête(s) en attente")
     if _last_provider:
         lines.append(f"Dernier modèle utilisé : `{_last_provider}`")
     return "\n".join(lines)
@@ -3597,7 +3699,7 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
     return WEB_WRITE_DIRECTIVE + ("\n\n".join(context_blocks))[:FORUM_TOOL_RESULT_MAX]
 
 # ============================================================
-# BIBLIOTHÈQUE DU FORUM — carte + résumé, mémorisés, pour synthétiser vite
+# BIBLIOTHÈQUE DU FORUM — carte + mots-clés, mémorisés, pour cibler vite les bons sujets
 # ============================================================
 # Plutôt que de tout re-crawler à chaque question, Tenebris tient une CARTE du
 # forum : pour chaque sujet, son titre, son URL, son chemin (Monde > Continent > …)
@@ -3607,17 +3709,21 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
 # Ce qu'on NE fait pas : stocker le texte intégral (ça périme et ça gonfle la mémoire).
 # Fraîcheur : une entrée est « fraîche » 30 jours ; au-delà, on la relira.
 LIBRARY_TTL_DAYS = 30           # au bout de 30 jours, un résumé doit être re-vérifié
-LIBRARY_SUMMARY_MAX = 320       # longueur max d'un résumé mémorisé (caractères)
-LIBRARY_BATCH = 6               # sujets résumés par passage de fond (doux pour le quota)
+LIBRARY_KEYWORDS_MAX = 120      # longueur max des mots-clés mémorisés (caractères)
+LIBRARY_BATCH = 8               # sujets traités par passage de fond (léger : plus besoin d'un gros résumé)
 LIBRARY_MAP_FETCHES = 60        # budget réseau d'une (re)cartographie de l'index
-LIBRARY_TEXT_FOR_SUMMARY = 2600 # texte lu par sujet avant d'en tirer le résumé
+LIBRARY_TEXT_FOR_SUMMARY = 1800 # texte lu par sujet avant d'en extraire les mots-clés
 
+# On ne garde plus un résumé rédigé (coûteux, périssable) mais quelques MOTS-CLÉS :
+# de quoi savoir de quoi parle le sujet et le retrouver vite. Le contenu détaillé,
+# on va le relire dans le sujet lui-même au moment de répondre.
 LIBRARY_SUMMARY_SYSTEM = (
-    "Tu résumes une fiche de forum de jeu de rôle (univers, personnage, lieu, faction, règle) "
-    "en 2 à 3 phrases FACTUELLES et denses. Tu ne gardes que ce qui est durable et identifiant : "
-    "nature de la chose, rattachement (empire, région, camp), traits marquants, rôle. Pas de "
-    "fioritures, pas de private joke, pas de citation d'œuvre extérieure. Si le contenu est vide "
-    "ou illisible, réponds exactement : (vide). Réponds UNIQUEMENT par le résumé, rien d'autre."
+    "Tu extrais 4 à 8 MOTS-CLÉS d'une fiche de forum de jeu de rôle (personnage, lieu, faction, "
+    "créature, règle…). Uniquement des termes courts et identifiants : noms propres, nature "
+    "(cité, empire, prêtresse, dragon…), rattachement (nom de l'empire/région/camp). "
+    "PAS de phrases, PAS de description — juste des mots-clés séparés par des virgules. "
+    "Si le contenu est vide ou illisible, réponds exactement : (vide). "
+    "Réponds UNIQUEMENT par la liste de mots-clés, rien d'autre."
 )
 
 def library():
@@ -3741,16 +3847,18 @@ async def _library_summarize_one(url):
              {"role": "user", "content": f"Titre : {entry.get('titre','')}\n"
                                          f"Rubrique : {entry.get('chemin','')}\n\n"
                                          f"Contenu :\n{ptxt[:LIBRARY_TEXT_FOR_SUMMARY]}"}],
-            max_tokens=180, temperature=0.2,
+            max_tokens=60, temperature=0.1,
         )
-        resume = (resp.choices[0].message.content or "").strip()
+        mots = (resp.choices[0].message.content or "").strip()
     except Exception as e:
         if note_quota_error(e):
             return False
-        print(f"⚠️ Résumé bibliothèque « {entry.get('titre','?')} » : {str(e)[:80]}")
+        print(f"⚠️ Mots-clés bibliothèque « {entry.get('titre','?')} » : {str(e)[:80]}")
         return False
 
-    entry["resume"] = (resume or "(vide)")[:LIBRARY_SUMMARY_MAX]
+    # On nettoie : une seule ligne, mots-clés séparés par des virgules, tronqué court.
+    mots = " ".join(mots.split())[:LIBRARY_KEYWORDS_MAX]
+    entry["resume"] = mots or "(vide)"      # on garde la clé "resume" pour ne pas casser l'existant
     entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
     mark_memory_dirty()
     return entry["resume"] != "(vide)"
@@ -3798,21 +3906,12 @@ def library_lookup(sujet, limit=8):
                     "resume": e.get("resume", ""), "frais": _library_fresh(e)})
     return out
 
-async def library_answer(sujet):
-    """Réponse INSTANTANÉE depuis la bibliothèque (sans re-crawler) quand c'est possible.
-    Renvoie un bloc de contexte prêt à synthétiser, ou None si la mémoire ne suffit pas."""
-    hits = library_lookup(sujet, limit=8)
-    frais = [h for h in hits if h["frais"] and h["resume"] and h["resume"] != "(vide)"]
-    if not frais:
-        return None
-    blocs = ["=== BIBLIOTHÈQUE DU FORUM (résumés mémorisés, à jour) ==="]
-    for h in frais:
-        chemin = f" [{h['chemin']}]" if h["chemin"] else ""
-        blocs.append(f"• {h['titre']}{chemin}\n  {h['resume']}\n  Source : {h['url']}")
-    blocs.append("\nCes résumés viennent de ta mémoire du forum. Synthétise-les pour répondre, "
-                 "cite les liens en Sources. S'il manque un détail précis, tu peux fouiller le "
-                 "forum pour compléter — mais l'essentiel est déjà là.")
-    return WEB_WRITE_DIRECTIVE + "\n\n".join(blocs)
+def library_targets(sujet, limit=5):
+    """Les sujets du forum les plus pertinents pour cette question, d'après la carte mémorisée
+    (titre + chemin + mots-clés). Renvoie une liste d'URLs à LIRE — l'index sert à cibler la
+    lecture, pas à répondre à la place. Réponse toujours fraîche, mais on sait où chercher."""
+    hits = library_lookup(sujet, limit=limit)
+    return [h for h in hits if h.get("url")]
 
 # ============================================================
 # ONBOARDING SERVEUR — fiches auto + observation discrète
@@ -4045,7 +4144,7 @@ async def extract_completion(messages, max_tokens=400, temperature=0.2, effort="
                     if _active_extract_model == model:
                         _active_extract_model = None
                     continue
-                if _rate_limit_message(e):
+                if _is_rate_limit(e):
                     pause_provider("cerebras")
                 break      # quota / réseau : changer de MODÈLE n'y changera rien → autre fournisseur
 
@@ -5564,14 +5663,17 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             return await tool_lire_page(args.get("urls", ""))
         if name == "fouiller_forum":
             sujet = args.get("sujet", "")
-            # D'abord la mémoire : si la bibliothèque a des résumés frais, réponse instantanée
-            # (pas de re-crawl). On ne court-circuite pas si un AUTRE site est visé.
+            # La bibliothèque ne REMPLACE plus la lecture (elle ne stocke que des mots-clés) :
+            # elle sert à CIBLER. On repère les sujets pertinents connus, et on part fouiller
+            # normalement — le contenu est toujours lu frais, mais on sait où chercher.
+            depart = None
             if sujet and not args.get("url"):
-                rapide = await library_answer(sujet)
-                if rapide is not None:
-                    print(f"📖 Réponse depuis la bibliothèque du forum (sujet : {sujet})")
-                    return rapide
-            return await fouiller_forum(args.get("url") or FORUM_URL, sujet)
+                cibles = library_targets(sujet, limit=3)
+                if cibles:
+                    noms = ", ".join(c["titre"] for c in cibles if c.get("titre"))
+                    print(f"📖 Bibliothèque : sujets ciblés pour « {sujet} » → {noms}")
+                    depart = cibles[0]["url"]     # on démarre la fouille sur le sujet le plus pertinent
+            return await fouiller_forum(depart or args.get("url") or FORUM_URL, sujet)
         if name == "recherche_web":
             return await recherche_web(args.get("requete", ""), lire=args.get("lire", 2))
         if name == "resumer_salon":
@@ -5864,15 +5966,42 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
     except Exception as e:
         return f"Erreur d'outil: {e}"
 
-def _rate_limit_message(err):
-    """Détecte un dépassement de quota (quel que soit le fournisseur) et renvoie un
-    message en personnage, sinon None."""
+def _is_rate_limit(err):
+    """Vrai si l'erreur est un dépassement de quota / rate-limit, quel que soit le fournisseur
+    ou la forme de l'exception. On regarde le code HTTP (plusieurs emplacements possibles selon
+    le SDK) ET le texte, pour ne jamais rater une bascule de clé."""
+    # Code HTTP, à tous les endroits où les SDK le rangent
+    for attr in ("status_code", "status", "code", "http_status"):
+        v = getattr(err, attr, None)
+        try:
+            if v is not None and int(v) == 429:
+                return True
+        except (TypeError, ValueError):
+            pass
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        try:
+            if int(getattr(resp, "status_code", 0)) == 429:
+                return True
+        except (TypeError, ValueError):
+            pass
+    # Nom de la classe d'exception (RateLimitError, TooManyRequests…)
+    cls = type(err).__name__.lower()
+    if "ratelimit" in cls or "toomanyrequests" in cls:
+        return True
+    # Texte de l'erreur
     s = str(err).lower()
-    status = getattr(err, "status_code", None) or getattr(err, "status", None)
-    is_rl = (status == 429) or "rate_limit" in s or "rate limit" in s \
-        or "429" in s or "too many requests" in s or "capacity exceeded" in s
-    if not is_rl:
+    return ("rate_limit" in s or "rate limit" in s or "429" in s
+            or "too many requests" in s or "capacity exceeded" in s
+            or "quota" in s or "resource_exhausted" in s)
+
+
+def _rate_limit_message(err):
+    """Message EN PERSONNAGE pour un dépassement de quota, sinon None.
+    (La détection brute, elle, passe par _is_rate_limit.)"""
+    if not _is_rate_limit(err):
         return None
+    s = str(err).lower()
     m = re.search(r"try again in ([0-9hm.\s]+?s)", str(err))
     delai = f" Réessaie dans {m.group(1).strip()}." if m else " Réessaie un peu plus tard."
     if "per day" in s or "(tpd)" in s or "tokens per day" in s:
@@ -6546,6 +6675,21 @@ def persona():
         p.setdefault(k, list(v) if isinstance(v, list) else v)
     return p
 
+ANTI_INVENTION = (
+    "HONNÊTETÉ ABSOLUE — TU N'INVENTES RIEN.\n"
+    "Si tu ne sais pas, si tu n'es pas sûre, ou si tu n'as pas trouvé l'information : tu le DIS, "
+    "clairement, avec ta voix. « J'en sais rien », « aucune idée », « j'ai rien trouvé là-dessus », "
+    "« je ne suis pas sûre, à vérifier ». C'est TOUJOURS mieux que d'inventer.\n"
+    "- Tu ne combles JAMAIS un trou avec une supposition présentée comme un fait.\n"
+    "- Tu n'inventes pas de noms, de dates, de chiffres, de lieux, de règles, de citations, "
+    "d'événements ou de détails sur les gens.\n"
+    "- Un outil (forum, mémoire, dés, recherche) n'a rien renvoyé ? Tu dis que tu n'as rien "
+    "trouvé — tu ne remplis pas le vide de toi-même.\n"
+    "- Tu peux avoir un AVIS, une opinion, une vanne : ça, ce n'est pas inventer. Mais un FAIT "
+    "que tu affirmes doit être vrai, ou annoncé comme incertain.\n"
+    "Mieux vaut une réponse courte et honnête (« je sais pas ») qu'une belle réponse fausse."
+)
+
 def persona_block():
     """Le CAP, injecté dans TOUTES ses réponses — c'est ce qui lui donne une identité stable."""
     p = persona()
@@ -6556,6 +6700,7 @@ def persona_block():
         bits.append("TON\n- " + p["ton"])
     if p.get("interdits"):
         bits.append("JAMAIS\n" + "\n".join(f"- {t}" for t in p["interdits"]))
+    bits.append(ANTI_INVENTION)
     if p.get("adaptations"):
         bits.append("CE QUE TU AS APPRIS DES GENS (nuance ton attitude, sans jamais contredire ce qui "
                     "précède)\n" + "\n".join(f"- {a['texte']}" for a in p["adaptations"]))
@@ -7620,7 +7765,7 @@ async def library_loop():
         try:
             r = await library_summarize_batch()
             if r["faits"]:
-                print(f"📖 Bibliothèque : +{r['faits']} résumé(s), {r['restants']} restant(s).")
+                print(f"📖 Bibliothèque : +{r['faits']} sujet(s) indexé(s), {r['restants']} restant(s).")
                 await flush_memory()
         except Exception as e:
             print(f"⚠️ Résumés forum échoués : {str(e)[:100]}")
@@ -9530,7 +9675,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <div id="lib_stats" style="font-size:13px;margin-bottom:12px;color:var(--dim)">Chargement…</div>
         <div class="btnrow" style="flex-wrap:wrap;gap:8px">
           <button class="mini" id="lib_map" onclick="libAction('carte', this)">🗺️ Cartographier le forum</button>
-          <button class="mini ghost" id="lib_sum" onclick="libAction('resumer', this)">📖 Résumer maintenant</button>
+          <button class="mini ghost" id="lib_sum" onclick="libAction('resumer', this)">📖 Indexer maintenant</button>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-left:auto">
             <input type="checkbox" id="lib_toggle" onchange="libToggle()"> Remplissage automatique
           </label>
@@ -11051,7 +11196,12 @@ async def on_message(message):
         import traceback
         print(f"❌ ERREUR dans on_message ({type(e).__name__}): {e}")
         traceback.print_exc()
-        await message.reply("⛓️ Quelque chose a grincé dans mes rouages. Réessaie dans un instant.")
+        # Quota épuisé sur toutes les clés : on le dit honnêtement plutôt que « bug mystérieux ».
+        if _is_rate_limit(e):
+            await message.reply("⛓️ Toutes mes clés sont à sec pour l'instant — quota épuisé. "
+                                "Laisse-moi souffler quelques minutes et reviens.")
+        else:
+            await message.reply("⛓️ Quelque chose a grincé dans mes rouages. Réessaie dans un instant.")
 
     await bot.process_commands(message)
 
@@ -11151,6 +11301,41 @@ async def scan(ctx, channel_name: str = None, limit: int = SCAN_DEFAULT_LIMIT):
         text, _ = await chat_with_tools(system, [{"role": "user", "content": prompt}], ctx.guild, tools=None)
     for chunk in smart_split(text):
         await ctx.send(chunk)
+
+@bot.command(name="cles", aliases=["keys", "cle"],
+             help="État des clés Cerebras ; « ²T cles next » force la clé suivante, « ²T cles reset » lève les pauses")
+async def cles_cmd(ctx, action: str = None):
+    if not is_admin(ctx.author.id, ctx.author.name):
+        await ctx.send("Mes clés ne se montrent qu'à mes administrateurs.")
+        return
+    if not cerebras_pool or cerebras_pool.total == 0:
+        await ctx.send("Aucune clé Cerebras chargée. Ajoute `CEREBRAS_API_KEYS=clé1,clé2,…` dans le `.env`.")
+        return
+    if cerebras_pool.total == 1:
+        await ctx.send("Une seule clé Cerebras configurée — rien à alterner. "
+                       "Ajoute d'autres clés dans `CEREBRAS_API_KEYS` pour la rotation.")
+        return
+
+    act = (action or "").lower()
+    if act in ("next", "suivante", "switch", "rotate", "alterner"):
+        num = cerebras_pool.force_next()
+        await ctx.send(f"🔁 Rotation forcée : la clé Cerebras **#{num}** passe en tête.")
+        return
+    if act in ("reset", "reprise", "clear"):
+        cerebras_pool.reset()
+        await ctx.send("♻️ Toutes les clés Cerebras sont réactivées (cooldowns levés).")
+        return
+
+    # État détaillé, clé par clé
+    lignes = ["🔑 **Clés Cerebras**"]
+    for k in cerebras_pool.detail():
+        tete = " ⬅️ en tête" if k["en_tete"] else ""
+        if k["dispo"]:
+            lignes.append(f"• Clé #{k['num']} : ✅ disponible{tete}")
+        else:
+            lignes.append(f"• Clé #{k['num']} : ⏸️ en pause {k['cooldown_s']}s{tete}")
+    lignes.append("\n`²T cles next` pour forcer la suivante · `²T cles reset` pour tout réactiver.")
+    await ctx.send("\n".join(lignes))
 
 @bot.command(name="modeles", help="Affiche quel modèle est utilisé dans quelle situation")
 async def modeles(ctx):
