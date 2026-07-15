@@ -126,6 +126,10 @@ LLM_ROUTES = {
 # Cerebras gère les outils : les dés et la fouille forum marchent sur toutes les routes.
 PROVIDER_TOOLS = {"cerebras": True, "groq": True, "gemini": False}
 PROVIDER_COOLDOWN = 300   # un fournisseur à court de quota est mis de côté 5 min
+# Nombre de tentatives par fournisseur avant d'abandonner. Avec Cerebras seul, c'est ce
+# qui évite le « grincé » au moindre hoquet : on retente 3 fois avec un délai croissant.
+LLM_RETRIES_PER_PROVIDER = int(os.getenv("LLM_RETRIES", "3"))
+LLM_RETRY_BACKOFF = float(os.getenv("LLM_RETRY_BACKOFF", "0.8"))   # secondes, multiplié à chaque essai
 MSCHAP_ID = 194346572400558081  # ID Discord de Mschap (le Maître) — 0 si tu veux te fier au seul username
 MSCHAP_USERNAME = "mschap"       # username Discord unique (@handle) — reconnaissance de secours, non usurpable
 
@@ -672,8 +676,16 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
     # On saute les fournisseurs en pause (quota), sauf s'il ne reste plus qu'eux.
     active = [p for p in usable if not provider_paused(p)] or usable[:1]
 
+    # On construit une SÉQUENCE DE TENTATIVES : chaque fournisseur peut être réessayé
+    # plusieurs fois avant qu'on abandonne. Avec Cerebras seul, ça évite de balancer
+    # « grincé » au moindre hoquet — on retente, avec un petit délai croissant.
+    attempts = []
+    for provider in active:
+        for _ in range(LLM_RETRIES_PER_PROVIDER):
+            attempts.append(provider)
+
     last_err = None
-    for i, provider in enumerate(active):
+    for i, provider in enumerate(attempts):
         try:
             resp, model = await _dispatch(provider, route, messages, tools,
                                           temperature, max_tokens, effort)
@@ -683,25 +695,40 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
             continue
         except Exception as e:
             last_err = e
+            reste = len(attempts) - i - 1
             if _is_rate_limit(e):
-                pause_provider(provider)
-                print(f"⛓️ Quota {provider} atteint — écarté {PROVIDER_COOLDOWN // 60} min.")
+                # Quota : on attend le délai réel annoncé (borné), puis on retente.
+                wait = min(_retry_after_seconds(e, defaut=3), 8)
+                if reste > 0:
+                    print(f"⛓️ {provider} rate-limité — je patiente {wait:.0f}s et je retente "
+                          f"({reste} essai(s) restant(s)).")
+                    await asyncio.sleep(wait)
+                else:
+                    pause_provider(provider)
+                    print(f"⛓️ Quota {provider} atteint après {LLM_RETRIES_PER_PROVIDER} essais — écarté.")
             else:
-                print(f"⚠️ {provider} a échoué : {str(e)[:200]}")
+                # Hoquet réseau / erreur transitoire : petit backoff puis on retente.
+                if reste > 0:
+                    wait = LLM_RETRY_BACKOFF * (i + 1)
+                    print(f"⚠️ {provider} a échoué ({str(e)[:120]}) — nouvel essai dans {wait:.1f}s "
+                          f"({reste} restant(s)).")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"⚠️ {provider} a échoué définitivement : {str(e)[:200]}")
             continue
 
         msg = resp.choices[0].message if resp.choices else None
         text = (getattr(msg, "content", "") or "") if msg else ""
         asked_tools = bool(getattr(msg, "tool_calls", None)) if msg else False
         # En ROLEPLAY seulement : un refus moralisateur ne compte pas comme une réponse.
-        if route == "roleplay" and not asked_tools and _looks_censored(text) and i < len(active) - 1:
+        if route == "roleplay" and not asked_tools and _looks_censored(text) and i < len(attempts) - 1:
             print(f"🚫 {provider}/{model} : réponse moralisatrice ou vide — je passe au suivant.")
             last_err = LLMRefusal(f"{provider} a refusé la scène")
             continue
 
         _last_provider = f"{provider}/{model}"
         if i > 0:
-            print(f"🔁 Repli sur {_last_provider} (route « {route} »).")
+            print(f"🔁 Réussite au bout de {i + 1} tentative(s) sur « {route} ».")
         return resp
 
     raise last_err or LLMError(f"Tous les fournisseurs de « {route} » ont échoué")
