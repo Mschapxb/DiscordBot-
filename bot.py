@@ -7395,7 +7395,6 @@ async def reminder_loop():
 async def _before_reminder_loop():
     await bot.wait_until_ready()
 
-@tasks.loop(minutes=10)
 async def tool_evenements(guild, quand="a_venir"):
     """Liste les événements planifiés (Événements Discord) d'un serveur.
     quand : 'a_venir' (défaut), 'en_cours', ou 'tous'. Lecture seule, tout public."""
@@ -7479,6 +7478,7 @@ async def tool_evenements(guild, quand="a_venir"):
               "tous": "Événements"}.get(quand, "Événements")
     return f"{entete} sur {guild.name} :\n" + "\n".join(lignes)
 
+@tasks.loop(minutes=10)
 async def events_sync_loop():
     """Crée automatiquement un rappel avant chaque événement planifié d'un serveur."""
     lead = timedelta(minutes=30)
