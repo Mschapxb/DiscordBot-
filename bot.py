@@ -2425,9 +2425,13 @@ async def tool_lire_page(urls):
     return WEB_WRITE_DIRECTIVE + body
 
 WEB_WRITE_DIRECTIVE = (
-    "CONSIGNE DE RÉPONSE — À partir UNIQUEMENT du contenu ci-dessous (n'invente rien), "
-    "rédige une synthèse DÉTAILLÉE, PRÉCISE et STRUCTURÉE : plusieurs paragraphes ou points, "
-    "avec les noms, chiffres et détails importants. Développe, ne te limite pas à deux phrases.\n"
+    "CONSIGNE DE RÉPONSE — MODE RESTITUTION (rigueur, pas bavardage).\n"
+    "Ceci est une FOUILLE : tu restitues des informations. Ici, ton style conversationnel ne "
+    "s'applique PAS — pas de vannes, pas de désinvolture, pas de « voilà, tu sais l'essentiel ». "
+    "Tu es claire, précise, structurée et fiable, exactement comme un rapport documenté.\n"
+    "À partir UNIQUEMENT du contenu ci-dessous (n'invente rien), rédige une synthèse DÉTAILLÉE, "
+    "PRÉCISE et STRUCTURÉE : plusieurs paragraphes ou points clairs, avec les noms, chiffres et "
+    "détails importants. Développe, ne te limite pas à deux phrases.\n"
     "FAIS LES LIENS : certaines sources sont les fiches d'entités citées dans le sujet principal "
     "(personnages, lieux, factions). Sers-t'en pour EXPLIQUER ces noms et les relier au sujet.\n"
     "INTERDICTION DE DEVINER — C'EST LA RÈGLE LA PLUS IMPORTANTE : pour chaque nom que tu cites, "
@@ -2438,8 +2442,13 @@ WEB_WRITE_DIRECTIVE = (
     "forum » — et reste vague plutôt que d'inventer.\n"
     "Attention aussi aux citations : un texte du forum peut reprendre une œuvre extérieure "
     "(film, roman) ; ne la confonds pas avec le lore du monde.\n"
-    "Termine TOUJOURS par une section « Sources : » qui liste les liens (les URLs après « SOURCE: ») "
-    "réellement utilisés. Garde ta voix, mais privilégie ici la richesse d'information.\n\n"
+    "FORMAT OBLIGATOIRE — tu TERMINES TOUJOURS par une section, sur sa propre ligne :\n"
+    "Sources :\n"
+    "puis la liste, une par ligne, des URLs (celles qui suivent « SOURCE: ») que tu as RÉELLEMENT "
+    "utilisées — chacune précédée d'un tiret. N'invente aucune URL, ne cite que celles présentes "
+    "ci-dessous. Une source par ligne, telle quelle.\n"
+    "Tu gardes une trace de ta personnalité dans le TON (sobre, un rien solennel), mais l'information "
+    "et sa structure passent AVANT tout. Richesse et exactitude d'abord.\n\n"
     "============================\n\n"
 )
 
