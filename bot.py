@@ -8160,6 +8160,86 @@ async def admin_logout(request):
     resp.del_cookie("tenebris_admin", path="/")
     return resp
 
+async def admin_user_detail(request):
+    """Fiche DÉTAILLÉE d'un utilisateur : infos, lieu, et TOUTES ses notes (mémoire liée à
+    cette personne), avec leur importance/âge. Permet aussi d'effacer une note précise."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+
+    if request.method == "POST":
+        data = await _read_json(request)
+        uid = str(data.get("uid") or "")
+        action = data.get("action")
+        rec = memory()["users"].get(uid)
+        if not rec:
+            return web.json_response({"error": "utilisateur inconnu"}, status=404)
+        if action == "delete_note":
+            idx = data.get("index")
+            notes = rec.get("notes", [])
+            if isinstance(idx, int) and 0 <= idx < len(notes):
+                enleve = notes.pop(idx)
+                mark_memory_dirty()
+                await flush_memory()
+                audit_log("note_suppr", f"{rec.get('display_name') or uid}: {_note_text(enleve)[:60]}")
+                return web.json_response({"ok": True})
+            return web.json_response({"error": "index invalide"}, status=400)
+        if action == "clear_notes":
+            n = len(rec.get("notes", []))
+            rec["notes"] = []
+            mark_memory_dirty()
+            await flush_memory()
+            audit_log("notes_vidées", f"{rec.get('display_name') or uid}: {n} note(s)")
+            return web.json_response({"ok": True, "supprimees": n})
+        if action == "add_note":
+            texte = (data.get("texte") or "").strip()
+            if not texte:
+                return web.json_response({"error": "note vide"}, status=400)
+            # note écrite à la main → author = admin, donc jamais oubliée automatiquement
+            add_user_note(uid, texte, importance=data.get("importance", "haute"), author="admin")
+            await flush_memory()
+            return web.json_response({"ok": True})
+        return web.json_response({"error": "action inconnue"}, status=400)
+
+    uid = str(request.rel_url.query.get("uid") or "")
+    rec = memory()["users"].get(uid)
+    if not rec:
+        return web.json_response({"error": "utilisateur inconnu"}, status=404)
+    thread = conversations.get(int(uid) if uid.isdigit() else uid, [])
+    lieu = known_location(int(uid)) if uid.isdigit() else {}
+    notes = []
+    for i, n in enumerate(rec.get("notes", [])):
+        notes.append({
+            "index": i,
+            "text": _note_text(n),
+            "importance": n.get("importance", "normale"),
+            "category": n.get("category", ""),
+            "date": n.get("date", ""),
+            "reviews": n.get("reviews", 0),
+            "author": n.get("author", "IA"),
+            "age_jours": _note_age_days(n),
+        })
+    # les plus importantes / récentes d'abord pour la lecture
+    notes.sort(key=lambda x: (IMPORTANCE_ORDER.get(x["importance"], 1), -x["age_jours"]), reverse=True)
+    return web.json_response({
+        "uid": uid,
+        "name": rec.get("display_name") or rec.get("username") or uid,
+        "username": rec.get("username", ""),
+        "interactions": rec.get("interactions", 0),
+        "last_seen": rec.get("last_seen", ""),
+        "first_seen": rec.get("first_seen", ""),
+        "messages": len(thread),
+        "paused": is_paused(uid),
+        "is_master": is_mschap(int(uid) if uid.isdigit() else 0, rec.get("username")),
+        "is_admin": is_admin(int(uid) if uid.isdigit() else 0, rec.get("username")),
+        "titre": rec.get("titre", ""),
+        "lieu_type": lieu.get("type", "inconnu"),
+        "lieu_salon": lieu.get("salon", ""),
+        "lieu_serveur": lieu.get("serveur", ""),
+        "notes": notes,
+        "notes_total": len(rec.get("notes", [])),
+    })
+
 async def admin_state(request):
     guard = _auth_guard(request)
     if guard:
@@ -9408,6 +9488,8 @@ def _register_admin_routes(app):
     app.router.add_post("/admin/api/login", admin_login)
     app.router.add_post("/admin/api/logout", admin_logout)
     app.router.add_get("/admin/api/state", admin_state)
+    app.router.add_get("/admin/api/user", admin_user_detail)
+    app.router.add_post("/admin/api/user", admin_user_detail)
     app.router.add_get("/admin/api/overview", admin_overview)
     app.router.add_get("/admin/api/graph", admin_graph)
     app.router.add_get("/admin/api/search", admin_search)
@@ -9920,7 +10002,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
 
       <div class="adm-sec">
-        <h3>Salons écoutés</h3>
+        <h3>Salons écoutés <button class="mini ghost" style="float:right;font-size:12px" onclick="loadListen()">🔄 Rafraîchir</button></h3>
         <div style="color:var(--dim);font-size:13px;margin-bottom:10px">
           Dans un salon écouté, Tenebris suit la discussion <b>sans être mentionnée</b> :
           elle apprend des gens (notes automatiques) et s'invite parfois dans la conversation,
@@ -9965,8 +10047,10 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
 
       <div class="adm-sec">
-        <h3>Joueurs &amp; administrateurs</h3>
+        <h3>Joueurs &amp; utilisateurs</h3>
+        <div style="color:var(--dim);font-size:13px;margin-bottom:8px">Clique un utilisateur pour voir sa fiche complète et la mémoire liée à lui.</div>
         <div id="admUsers"></div>
+        <div id="userDetail" style="display:none"></div>
       </div>
 
       <div class="adm-sec">
@@ -10006,7 +10090,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 <script>
 const $ = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
-let current = null, curMeta = null, stateTimer = null, threadTimer = null, view = 'dash';
+let current = null, curMeta = null, stateTimer = null, threadTimer = null, channelTimer = null, view = 'dash';
 
 function esc(t){ const d=document.createElement('div'); d.textContent=(t==null?'':t); return d.innerHTML; }
 
@@ -10940,20 +11024,97 @@ async function loadAdminUsers(){
   if(status!==200){ if(status===401) showLogin(); return; }
   const box = $('#admUsers');
   box.innerHTML = (body.users||[]).map(u => {
-    const dis = u.is_master ? 'disabled' : '';
-    const chk = (u.is_admin || u.is_master) ? 'checked' : '';
-    return '<div class="admuser"><div class="an">'+esc(u.username || u.name)+
-      (u.name && u.username && u.name!==u.username ? ' <span style="color:var(--dim);font-size:12px">('+esc(u.name)+')</span>' : '')+
-      (u.is_master?' <span class="badge master">MAÎTRE</span>':'')+'</div>'+
-      '<label style="color:var(--dim);font-size:13px">Admin</label>'+
-      '<input type="checkbox" class="chk" '+chk+' '+dis+' onchange="toggleAdmin(\''+u.uid+'\', this.checked)"></div>';
+    const badges = (u.is_master?'<span class="badge master">MAÎTRE</span>':'')
+      + (u.is_admin && !u.is_master?'<span class="badge">admin</span>':'')
+      + (u.paused?'<span class="badge" style="background:#7a3a3a">en pause</span>':'');
+    return '<div class="admuser" style="cursor:pointer" onclick="openUser(\''+u.uid+'\')">'+
+      '<div class="an">'+esc(u.username || u.name)+' '+badges+
+        '<div style="color:var(--dim);font-size:12px;margin-top:2px">'+
+        (u.messages||0)+' msg · vu '+(esc(u.last_seen)||'?')+'</div></div>'+
+      '<div style="color:var(--dim);font-size:18px">›</div></div>';
   }).join('') || '<div style="color:var(--dim)">Aucun joueur connu.</div>';
+}
+
+async function openUser(uid){
+  const {status, body} = await jget('/admin/api/user?uid='+encodeURIComponent(uid));
+  if(status!==200){ toast((body&&body.error)||'Introuvable.', true); return; }
+  const impColor = {faible:'#888', normale:'#c9a227', haute:'#c96a27'};
+  const notesHtml = (body.notes||[]).map(n =>
+    '<div style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:6px">'+
+      '<div style="display:flex;justify-content:space-between;gap:8px">'+
+        '<span>'+esc(n.text)+'</span>'+
+        '<button class="mini ghost" style="flex-shrink:0" onclick="delNote(\''+body.uid+'\','+n.index+')">✕</button>'+
+      '</div>'+
+      '<div style="color:var(--dim);font-size:11px;margin-top:4px">'+
+        '<span style="color:'+(impColor[n.importance]||'#888')+'">●</span> '+esc(n.importance)+
+        ' · '+n.age_jours+'j'+
+        (n.reviews?' · revue '+n.reviews+'×':'')+
+        (n.author && n.author!=='IA'?' · ✍ '+esc(n.author):'')+
+        (n.category?' · '+esc(n.category):'')+
+      '</div></div>').join('') || '<div style="color:var(--dim)">Aucune note sur cette personne.</div>';
+
+  const badges = (body.is_master?'<span class="badge master">MAÎTRE</span>':'')
+    + (body.is_admin && !body.is_master?'<span class="badge">admin</span>':'')
+    + (body.paused?'<span class="badge" style="background:#7a3a3a">en pause</span>':'');
+  const lieu = body.lieu_type==='mp' ? '✉ Messages privés'
+    : (body.lieu_salon ? '💬 #'+esc(body.lieu_salon)+(body.lieu_serveur?' ('+esc(body.lieu_serveur)+')':'') : 'inconnu');
+
+  $('#userDetail').innerHTML =
+    '<button class="mini ghost" onclick="closeUser()">‹ Retour à la liste</button>'+
+    '<h3 style="margin:10px 0 4px">'+esc(body.name)+' '+badges+'</h3>'+
+    '<div style="color:var(--dim);font-size:13px;margin-bottom:12px">'+
+      (body.username?'@'+esc(body.username)+' · ':'')+'id '+esc(body.uid)+'<br>'+
+      (body.interactions||0)+' interactions · '+(body.messages||0)+' messages · dernier lieu : '+lieu+'<br>'+
+      'vu '+(esc(body.last_seen)||'?')+
+      (body.titre?' · titre : '+esc(body.titre):'')+
+    '</div>'+
+    '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">'+
+      '<input id="newNote" class="inp" style="flex:1;min-width:180px" placeholder="Ajouter une note (permanente)…">'+
+      '<button class="mini" onclick="addNote(\''+body.uid+'\')">+ Note</button>'+
+      (body.notes_total?'<button class="mini ghost" onclick="clearNotes(\''+body.uid+'\')">🗑️ Tout effacer</button>':'')+
+    '</div>'+
+    '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">'+
+      (body.is_master?'':'<button class="mini ghost" onclick="toggleAdmin(\''+body.uid+'\','+(!body.is_admin)+')">'+
+        (body.is_admin?'Retirer admin':'Rendre admin')+'</button>')+
+      '<button class="mini ghost" onclick="togglePause(\''+body.uid+'\','+(!body.paused)+')">'+
+        (body.paused?'▶️ Réactiver l\\'IA':'⏸️ Mettre en pause')+'</button>'+
+    '</div>'+
+    '<div style="color:var(--dim);font-size:12px;margin-bottom:6px">'+body.notes_total+' note(s) — ce que Tenebris sait de cette personne :</div>'+
+    notesHtml;
+  $('#admUsers').style.display='none';
+  $('#userDetail').style.display='block';
+  window._curUser = body.uid;
+}
+function closeUser(){
+  $('#userDetail').style.display='none';
+  $('#admUsers').style.display='block';
+  loadAdminUsers();
+}
+async function delNote(uid, index){
+  const {status} = await jpost('/admin/api/user', {uid, action:'delete_note', index});
+  if(status===200){ openUser(uid); toast('Note effacée.'); }
+}
+async function clearNotes(uid){
+  if(!window.confirm('Effacer TOUTES les notes de cette personne ?')) return;
+  const {status, body} = await jpost('/admin/api/user', {uid, action:'clear_notes'});
+  if(status===200){ openUser(uid); toast((body.supprimees||0)+' note(s) effacée(s).'); }
+}
+async function addNote(uid){
+  const t = $('#newNote').value.trim();
+  if(!t) return;
+  const {status} = await jpost('/admin/api/user', {uid, action:'add_note', texte:t, importance:'haute'});
+  if(status===200){ openUser(uid); toast('Note ajoutée (permanente).'); }
 }
 async function toggleAdmin(uid, val){
   const {status, body} = await jpost('/admin/api/set_admin', {uid, is_admin: val});
   if(status===401){ showLogin(); return; }
-  if(status!==200) alert(body.error||'Refusé.');
-  loadAdminUsers();
+  if(status!==200){ toast(body.error||'Refusé.', true); return; }
+  openUser(uid); toast(val?'Admin accordé.':'Admin retiré.');
+}
+async function togglePause(uid, val){
+  const {status, body} = await jpost('/admin/api/pause', {uid, paused: val});
+  if(status!==200){ toast((body&&body.error)||'Refusé.', true); return; }
+  openUser(uid); toast(val?'IA mise en pause pour cette personne.':'IA réactivée.');
 }
 
 async function loadAudit(){
@@ -10998,8 +11159,11 @@ function startTimers(){
   stopTimers();
   stateTimer = setInterval(() => { if(view==='conv') refreshState(); }, 5000);
   threadTimer = setInterval(() => { if(view==='conv' && current) refreshThread(); }, 3500);
+  // Onglet admin : on rafraîchit la liste des salons écoutés pour voir arriver les
+  // nouveaux salons sans recharger la page (toutes les 15 s, seulement si visible).
+  channelTimer = setInterval(() => { if(view==='admin') loadListen(); }, 15000);
 }
-function stopTimers(){ clearInterval(stateTimer); clearInterval(threadTimer); }
+function stopTimers(){ clearInterval(stateTimer); clearInterval(threadTimer); clearInterval(channelTimer); }
 
 tryEnter();
 </script>
