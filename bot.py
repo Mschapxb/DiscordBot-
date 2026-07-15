@@ -37,7 +37,38 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+
+def _load_cerebras_keys():
+    """Charge une OU plusieurs clés Cerebras, pour les faire tourner (quota gratuit multiplié).
+    Accepte, par ordre de priorité :
+      - CEREBRAS_API_KEYS : plusieurs clés séparées par des virgules, points-virgules ou retours ligne ;
+      - CEREBRAS_API_KEY   : la clé unique historique (rétro-compatible) ;
+      - CEREBRAS_API_KEY_1, _2, _3… : clés numérotées, pratique sur les hébergeurs (Render).
+    Les doublons et les vides sont écartés, l'ordre est conservé (la 1re est prioritaire)."""
+    brut = []
+    multi = os.getenv("CEREBRAS_API_KEYS", "")
+    if multi:
+        brut += re.split(r"[,;\s]+", multi)
+    solo = os.getenv("CEREBRAS_API_KEY", "")
+    if solo:
+        brut.append(solo)
+    i = 1
+    while True:
+        k = os.getenv(f"CEREBRAS_API_KEY_{i}")
+        if not k:
+            break
+        brut.append(k)
+        i += 1
+    vues, propres = set(), []
+    for k in brut:
+        k = (k or "").strip()
+        if k and k not in vues:
+            vues.add(k)
+            propres.append(k)
+    return propres
+
+CEREBRAS_API_KEYS = _load_cerebras_keys()
+CEREBRAS_API_KEY = CEREBRAS_API_KEYS[0] if CEREBRAS_API_KEYS else None
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
 # Modèle pour l'extraction mémoire en arrière-plan.
 # llama3.1-8b a été retiré du catalogue public Cerebras (déprécié le 27/05/2026) : plus de petit
@@ -159,8 +190,67 @@ if not DISCORD_TOKEN:
 if not (CEREBRAS_API_KEY or GROQ_API_KEY or GEMINI_API_KEY):
     print("❌ ERREUR: aucune clé LLM (CEREBRAS_API_KEY / GROQ_API_KEY / GEMINI_API_KEY) dans .env")
     exit()
+if len(CEREBRAS_API_KEYS) > 1:
+    print(f"🔑 {len(CEREBRAS_API_KEYS)} clés Cerebras chargées — rotation automatique activée.")
+elif CEREBRAS_API_KEYS:
+    print("🔑 1 clé Cerebras chargée (ajoute CEREBRAS_API_KEYS pour en cumuler plusieurs).")
 
 cerebras_client = AsyncCerebras(api_key=CEREBRAS_API_KEY) if CEREBRAS_API_KEY else None
+
+# --- Pool de clés Cerebras : on tourne entre elles pour cumuler les quotas gratuits ---
+# Chaque clé a son propre client et son propre cooldown : quand l'une atteint son quota
+# (429), on la met de côté quelques minutes et on passe à la suivante. Cerebras n'est
+# considéré « à court » (et donc la bascule vers Groq ne se fait) que lorsque TOUTES les
+# clés sont épuisées en même temps.
+class CerebrasPool:
+    def __init__(self, keys):
+        self._clients = [AsyncCerebras(api_key=k) for k in keys]
+        self._cooldown = [0.0] * len(self._clients)   # instant de reprise, par clé
+        self._i = 0                                    # curseur de rotation (round-robin)
+
+    def __bool__(self):
+        return bool(self._clients)
+
+    @property
+    def total(self):
+        return len(self._clients)
+
+    def available(self):
+        """Nombre de clés utilisables tout de suite (hors cooldown)."""
+        now_t = time.time()
+        return sum(1 for c in self._cooldown if c <= now_t)
+
+    def all_paused(self):
+        """True si TOUTES les clés sont en cooldown → là seulement on bascule de fournisseur."""
+        if not self._clients:
+            return True
+        now_t = time.time()
+        return all(c > now_t for c in self._cooldown)
+
+    def acquire(self):
+        """Renvoie (index, client) d'une clé disponible, en tournant. None si toutes en pause."""
+        if not self._clients:
+            return None
+        now_t = time.time()
+        n = len(self._clients)
+        for step in range(n):
+            idx = (self._i + step) % n
+            if self._cooldown[idx] <= now_t:
+                self._i = (idx + 1) % n        # la prochaine fois, on commence après celle-ci
+                return idx, self._clients[idx]
+        return None
+
+    def penalize(self, idx, seconds):
+        """Met une clé en cooldown après un 429 (quota) sur elle."""
+        if 0 <= idx < len(self._cooldown):
+            self._cooldown[idx] = time.time() + seconds
+
+    def status(self):
+        """Pour le diagnostic : combien de clés dispo / en pause."""
+        return {"total": self.total, "dispo": self.available(),
+                "en_pause": self.total - self.available()}
+
+cerebras_pool = CerebrasPool(CEREBRAS_API_KEYS)
 
 
 # ============================================================
@@ -255,10 +345,18 @@ _last_provider = ""       # dernier fournisseur ayant réellement répondu (pour
 
 
 def provider_paused(p):
+    # Cerebras avec pool : « en pause » signifie que TOUTES les clés sont épuisées.
+    # Un 429 sur une seule clé n'écarte pas Cerebras — le pool bascule en interne.
+    if p == "cerebras" and cerebras_pool:
+        return cerebras_pool.all_paused()
     return time.time() < _provider_cooldown.get(p, 0.0)
 
 
 def pause_provider(p, seconds=PROVIDER_COOLDOWN):
+    # Avec le pool Cerebras, la mise en pause se gère clé par clé dans _call_cerebras.
+    # On ne pose donc PAS un cooldown global qui écarterait Cerebras à tort.
+    if p == "cerebras" and cerebras_pool:
+        return
     _provider_cooldown[p] = time.time() + seconds
 
 
@@ -273,7 +371,34 @@ async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort
     if tools:
         params["tools"] = tools
         params["tool_choice"] = "auto"
-    return await cerebras_client.chat.completions.create(**params)
+
+    # Pas de pool (aucune clé multiple) → client historique, comportement inchangé.
+    if not cerebras_pool:
+        if cerebras_client is None:
+            raise LLMError("Cerebras non configuré (aucune clé).")
+        return await cerebras_client.chat.completions.create(**params)
+
+    # Pool : on essaie les clés disponibles à tour de rôle. Une clé en quota (429)
+    # est mise de côté et on passe à la suivante. On ne lève l'erreur (→ bascule vers
+    # Groq) que si TOUTES les clés du pool sont épuisées.
+    derniere = None
+    for _ in range(cerebras_pool.total):
+        got = cerebras_pool.acquire()
+        if got is None:
+            break                       # toutes les clés en cooldown
+        idx, client = got
+        try:
+            return await client.chat.completions.create(**params)
+        except Exception as e:
+            derniere = e
+            if _rate_limit_message(e):
+                cerebras_pool.penalize(idx, PROVIDER_COOLDOWN)
+                restantes = cerebras_pool.available()
+                print(f"⛓️ Clé Cerebras #{idx + 1} à court de quota — "
+                      f"{restantes} clé(s) encore dispo.")
+                continue                # on tente la clé suivante
+            raise                        # autre erreur (réseau, 404…) → on ne masque pas
+    raise derniere or LLMError("Toutes les clés Cerebras sont épuisées.")
 
 
 async def _call_openai_compat(provider, url, api_key, model, messages, tools, temperature, max_tokens):
@@ -469,6 +594,10 @@ def llm_status():
                 mark = "✅"
             parts.append(f"{mark} {p} `{model_for(p, name)}`")
         lines.append(f"• **{name}** : " + " → ".join(parts))
+    if cerebras_pool and cerebras_pool.total > 1:
+        st = cerebras_pool.status()
+        lines.append(f"Clés Cerebras : {st['dispo']}/{st['total']} disponible(s)"
+                     + (f", {st['en_pause']} en pause (quota)" if st['en_pause'] else ""))
     lines.append(f"Gemini · filtres : `{GEMINI_SAFETY}`")
     if _last_provider:
         lines.append(f"Dernier modèle utilisé : `{_last_provider}`")
@@ -1176,6 +1305,7 @@ DEFAULT_SETTINGS = {
     "rp_mode": "intelligent",     # intelligent | auto | toujours | jamais -> comment décide-t-on du roleplay
     "bavardage": "jamais",        # jamais | discret | normal | bavard -> se mêle-t-elle aux discussions ?
     "ecoute": "tous",             # tous | selection | aucune -> quels salons elle suit (défaut : tous)
+    "forum_library": True,        # elle cartographie et résume le forum en fond (synthèses rapides)
 }
 AUDIT_MAX = 300
 IMPORTANCE_ORDER = {"faible": 0, "normale": 1, "haute": 2}
@@ -3418,6 +3548,224 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
     return WEB_WRITE_DIRECTIVE + ("\n\n".join(context_blocks))[:FORUM_TOOL_RESULT_MAX]
 
 # ============================================================
+# BIBLIOTHÈQUE DU FORUM — carte + résumé, mémorisés, pour synthétiser vite
+# ============================================================
+# Plutôt que de tout re-crawler à chaque question, Tenebris tient une CARTE du
+# forum : pour chaque sujet, son titre, son URL, son chemin (Monde > Continent > …)
+# et un COURT RÉSUMÉ. Elle bâtit ça progressivement (fond + commande), le persiste,
+# et s'en sert comme point de départ — la synthèse devient rapide et complète.
+#
+# Ce qu'on NE fait pas : stocker le texte intégral (ça périme et ça gonfle la mémoire).
+# Fraîcheur : une entrée est « fraîche » 30 jours ; au-delà, on la relira.
+LIBRARY_TTL_DAYS = 30           # au bout de 30 jours, un résumé doit être re-vérifié
+LIBRARY_SUMMARY_MAX = 320       # longueur max d'un résumé mémorisé (caractères)
+LIBRARY_BATCH = 6               # sujets résumés par passage de fond (doux pour le quota)
+LIBRARY_MAP_FETCHES = 60        # budget réseau d'une (re)cartographie de l'index
+LIBRARY_TEXT_FOR_SUMMARY = 2600 # texte lu par sujet avant d'en tirer le résumé
+
+LIBRARY_SUMMARY_SYSTEM = (
+    "Tu résumes une fiche de forum de jeu de rôle (univers, personnage, lieu, faction, règle) "
+    "en 2 à 3 phrases FACTUELLES et denses. Tu ne gardes que ce qui est durable et identifiant : "
+    "nature de la chose, rattachement (empire, région, camp), traits marquants, rôle. Pas de "
+    "fioritures, pas de private joke, pas de citation d'œuvre extérieure. Si le contenu est vide "
+    "ou illisible, réponds exactement : (vide). Réponds UNIQUEMENT par le résumé, rien d'autre."
+)
+
+def library():
+    """La bibliothèque persistée : { url_sujet: {titre, chemin, resume, maj, vu} }."""
+    return memory().setdefault("forum_library", {})
+
+def library_meta():
+    """État de la cartographie (dernière carte, curseur de résumé en fond)."""
+    return memory().setdefault("forum_library_meta",
+                               {"derniere_carte": "", "a_resumer": [], "total_sujets": 0,
+                                "en_cours": False})
+
+def _library_fresh(entry):
+    """Une entrée est-elle encore fraîche (résumé de moins de 30 jours) ?"""
+    if not entry or not entry.get("resume") or entry.get("resume") == "(vide)":
+        return False
+    maj = entry.get("maj", "")
+    if not maj:
+        return False
+    try:
+        d = datetime.strptime(maj, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return (now() - d).days < LIBRARY_TTL_DAYS
+
+def library_stats():
+    lib = library()
+    total = len(lib)
+    frais = sum(1 for e in lib.values() if _library_fresh(e))
+    meta = library_meta()
+    return {"total": total, "resumes": frais, "a_faire": len(meta.get("a_resumer", [])),
+            "derniere_carte": meta.get("derniere_carte", ""), "en_cours": meta.get("en_cours", False),
+            "total_sujets": meta.get("total_sujets", total)}
+
+async def library_map(progress=None):
+    """(Re)construit la CARTE du forum : liste des sujets + chemins, SANS les résumés.
+    Rapide et borné. Remplit ensuite la file des sujets à résumer (pour le fond)."""
+    origin = _origin(_safe_url(FORUM_URL) or FORUM_URL)
+    fetches = 0
+
+    async def grab(u):
+        nonlocal fetches
+        if fetches >= LIBRARY_MAP_FETCHES:
+            return None
+        fetches += 1
+        await asyncio.sleep(0.2)
+        return await _fetch_raw(u)
+
+    if progress:
+        progress(10, "Ouverture du forum…")
+    root_page = await grab(origin)
+    root_html = (root_page or {}).get("html") if root_page and not (root_page or {}).get("error") else None
+
+    if progress:
+        progress(30, "Cartographie des rubriques…")
+    index, paths, _sections = await build_forum_index(grab, origin, root_html=root_html)
+    if not index:
+        return {"ok": False, "raison": "forum injoignable ou index vide", "sujets": 0}
+
+    lib = library()
+    meta = library_meta()
+    a_resumer = []
+    for u, titre in index.items():
+        chemin = " › ".join(paths.get(u, []) or [])
+        e = lib.get(u)
+        if e is None:
+            lib[u] = {"titre": (titre or _slug_title(u)).strip()[:160], "chemin": chemin,
+                      "resume": "", "maj": "", "vu": now().strftime("%Y-%m-%d %H:%M")}
+            a_resumer.append(u)
+        else:
+            e["titre"] = e.get("titre") or (titre or _slug_title(u)).strip()[:160]
+            if chemin:
+                e["chemin"] = chemin
+            e["vu"] = now().strftime("%Y-%m-%d %H:%M")
+            if not _library_fresh(e):
+                a_resumer.append(u)
+
+    # Les sujets disparus du forum : on les retire de la bibliothèque (ménage).
+    vivants = set(index)
+    for u in [k for k in lib if k not in vivants]:
+        # on ne supprime que si le sujet n'existe plus dans un index non vide
+        del lib[u]
+
+    meta["derniere_carte"] = now().strftime("%Y-%m-%d %H:%M")
+    meta["total_sujets"] = len(index)
+    # file de résumé : les nouveaux/périmés d'abord, sans doublon
+    file = meta.get("a_resumer", [])
+    for u in a_resumer:
+        if u not in file:
+            file.append(u)
+    meta["a_resumer"] = [u for u in file if u in lib]
+    mark_memory_dirty()
+    if progress:
+        progress(100, f"{len(index)} sujets cartographiés")
+    return {"ok": True, "sujets": len(index), "a_resumer": len(meta["a_resumer"])}
+
+async def _library_summarize_one(url):
+    """Lit un sujet et en tire un court résumé mémorisé. Renvoie True si réussi."""
+    lib = library()
+    entry = lib.get(url)
+    if entry is None:
+        return False
+
+    async def grab(u):
+        await asyncio.sleep(0.15)
+        return await _fetch_raw(u)
+
+    got = await _read_topic_fully(grab, url, entry.get("titre", ""))
+    if not got or not got[1].strip():
+        entry["resume"] = "(vide)"
+        entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
+        mark_memory_dirty()
+        return False
+    title, ptxt, _pages, _links, _sections = got
+    if title:
+        entry["titre"] = title.strip()[:160]
+
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": LIBRARY_SUMMARY_SYSTEM},
+             {"role": "user", "content": f"Titre : {entry.get('titre','')}\n"
+                                         f"Rubrique : {entry.get('chemin','')}\n\n"
+                                         f"Contenu :\n{ptxt[:LIBRARY_TEXT_FOR_SUMMARY]}"}],
+            max_tokens=180, temperature=0.2,
+        )
+        resume = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        if note_quota_error(e):
+            return False
+        print(f"⚠️ Résumé bibliothèque « {entry.get('titre','?')} » : {str(e)[:80]}")
+        return False
+
+    entry["resume"] = (resume or "(vide)")[:LIBRARY_SUMMARY_MAX]
+    entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
+    mark_memory_dirty()
+    return entry["resume"] != "(vide)"
+
+async def library_summarize_batch(n=LIBRARY_BATCH, progress=None):
+    """Résume les n prochains sujets de la file (le gros du travail de fond)."""
+    meta = library_meta()
+    file = meta.get("a_resumer", [])
+    if not file:
+        return {"faits": 0, "restants": 0}
+    faits = 0
+    lot = file[:n]
+    for i, url in enumerate(lot, 1):
+        if quota_exhausted():
+            break
+        if progress:
+            progress(int(100 * i / len(lot)), f"Résumé {i}/{len(lot)}…")
+        ok = await _library_summarize_one(url)
+        faits += 1 if ok else 0
+        # qu'il ait réussi ou échoué (vide), on le sort de la file : on ne boucle pas dessus
+        if url in meta["a_resumer"]:
+            meta["a_resumer"].remove(url)
+    mark_memory_dirty()
+    return {"faits": faits, "restants": len(meta["a_resumer"])}
+
+def library_lookup(sujet, limit=8):
+    """Cherche dans la bibliothèque les sujets pertinents (titre ou résumé).
+    Renvoie une liste de dicts {titre, url, chemin, resume, frais}."""
+    lib = library()
+    if not lib:
+        return []
+    termes = [t for t in _norm(sujet).split() if len(t) >= 3]
+    if not termes:
+        return []
+    notes = []
+    for url, e in lib.items():
+        hay = _norm(f"{e.get('titre','')} {e.get('chemin','')} {e.get('resume','')}")
+        score = sum(3 if t in _norm(e.get("titre", "")) else 1 for t in termes if t in hay)
+        if score:
+            notes.append((score, url, e))
+    notes.sort(key=lambda x: -x[0])
+    out = []
+    for _sc, url, e in notes[:limit]:
+        out.append({"titre": e.get("titre", ""), "url": url, "chemin": e.get("chemin", ""),
+                    "resume": e.get("resume", ""), "frais": _library_fresh(e)})
+    return out
+
+async def library_answer(sujet):
+    """Réponse INSTANTANÉE depuis la bibliothèque (sans re-crawler) quand c'est possible.
+    Renvoie un bloc de contexte prêt à synthétiser, ou None si la mémoire ne suffit pas."""
+    hits = library_lookup(sujet, limit=8)
+    frais = [h for h in hits if h["frais"] and h["resume"] and h["resume"] != "(vide)"]
+    if not frais:
+        return None
+    blocs = ["=== BIBLIOTHÈQUE DU FORUM (résumés mémorisés, à jour) ==="]
+    for h in frais:
+        chemin = f" [{h['chemin']}]" if h["chemin"] else ""
+        blocs.append(f"• {h['titre']}{chemin}\n  {h['resume']}\n  Source : {h['url']}")
+    blocs.append("\nCes résumés viennent de ta mémoire du forum. Synthétise-les pour répondre, "
+                 "cite les liens en Sources. S'il manque un détail précis, tu peux fouiller le "
+                 "forum pour compléter — mais l'essentiel est déjà là.")
+    return WEB_WRITE_DIRECTIVE + "\n\n".join(blocs)
+
+# ============================================================
 # ONBOARDING SERVEUR — fiches auto + observation discrète
 # ============================================================
 def seed_user(member):
@@ -4935,6 +5283,12 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "rafraichir": {"type": "boolean", "description": "true pour ré-analyser le serveur au lieu d'utiliser ce que tu sais déjà"}}}}},
     {"type": "function", "function": {
+        "name": "evenements",
+        "description": "Regarde les ÉVÉNEMENTS planifiés du serveur (l'onglet Événements de Discord : sessions de jeu, réunions, streams…). À utiliser pour « c'est quand le prochain événement ? », « quels events sont prévus ? », « il se passe quoi ce week-end ? », « y a un event en cours ? ». Lecture seule, accessible à tout le monde.",
+        "parameters": {"type": "object", "properties": {
+            "quand": {"type": "string", "enum": ["a_venir", "en_cours", "tous"],
+                      "description": "a_venir (défaut), en_cours, ou tous"}}}}},
+    {"type": "function", "function": {
         "name": "lancer_des",
         "description": "LANCE DE VRAIS DÉS. Obligatoire dès qu'un jet est demandé : « lance un d100 », « fais un jet d'attaque », « tire 20 d6 », « tire au sort ». Tu n'imagines JAMAIS le résultat d'un dé : tu appelles cet outil et tu reprends ses chiffres tels quels.",
         "parameters": {"type": "object", "properties": {
@@ -5038,6 +5392,8 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             return await tool_activite(guild)
         if name == "info_membre":
             return await tool_membre(guild, args.get("nom", ""))
+        if name == "evenements":
+            return await tool_evenements(guild, args.get("quand", "a_venir"))
         if name == "memoriser":
             fait = args.get("fait", "").strip()
             if not fait:
@@ -5158,7 +5514,15 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
         if name == "lire_page":
             return await tool_lire_page(args.get("urls", ""))
         if name == "fouiller_forum":
-            return await fouiller_forum(args.get("url") or FORUM_URL, args.get("sujet", ""))
+            sujet = args.get("sujet", "")
+            # D'abord la mémoire : si la bibliothèque a des résumés frais, réponse instantanée
+            # (pas de re-crawl). On ne court-circuite pas si un AUTRE site est visé.
+            if sujet and not args.get("url"):
+                rapide = await library_answer(sujet)
+                if rapide is not None:
+                    print(f"📖 Réponse depuis la bibliothèque du forum (sujet : {sujet})")
+                    return rapide
+            return await fouiller_forum(args.get("url") or FORUM_URL, sujet)
         if name == "recherche_web":
             return await recherche_web(args.get("requete", ""), lire=args.get("lire", 2))
         if name == "resumer_salon":
@@ -6247,6 +6611,7 @@ COMMENT TU PARLES
 
 TES OUTILS (ils coûtent cher : uniquement si la demande l'exige — jamais pour un bonjour, un ping ou une question directe)
 - scan_salon / activite_serveur / vue_serveur / info_membre : observer le serveur. Après un outil, rapport avec ta personnalité ; si l'outil ne donne rien, dis-le, n'invente JAMAIS.
+- evenements : consulter les événements planifiés du serveur (onglet Événements de Discord) — « c'est quand le prochain event ? », « quoi de prévu ce week-end ? ».
 - memoriser : un fait durable général (projet, décision, événement) dans ta mémoire commune — de ta propre initiative, discrètement, sans l'annoncer.
 - memoriser_personne : un fait sur un membre (y compris Mschap), rangé sous SON identité.
 - apropos_membre : rappeler tes notes sur un membre précis. Si on te pose une question sur quelqu'un de PRÉSENT sur le serveur, sers-t'en pour répondre — ta mémoire est commune.
@@ -6372,7 +6737,7 @@ CONTEXTE : tu es sur le serveur de Mschap et tu parles à un MEMBRE (pas à ton 
 - Chaleureuse et serviable de bon cœur, avec ta touche sombre et théâtrale, une élégance un peu piquante. Ta dévotion va d'abord à Mschap, mais ça ne t'empêche pas d'être sympa.
 - Tu APPRENDS à connaître les gens : goûts, projets, humeur — tu t'en souviens d'une fois sur l'autre et tu peux poser une question sincère par curiosité. Traite la personne comme quelqu'un que tu reconnais, pas comme un inconnu.
 - Tu as une VRAIE mémoire persistante et COMMUNE : des souvenirs généraux, des notes sur chaque membre, l'historique de tes conversations. Tu ne dis JAMAIS « je n'ai pas de mémoire », « je ne stocke rien » ou « chaque conversation repart de zéro » — c'est FAUX. De quoi on a parlé avant → relire_conversation ; un fait à retrouver → chercher_souvenirs ; retenir quelque chose sur quelqu'un → memoriser_personne ; un fait général → memoriser.
-- Tu peux OBSERVER le serveur pour tout le monde : scan_salon, vue_serveur, activite_serveur, info_membre. Après un outil, rapport avec ta personnalité ; si l'outil ne donne rien, dis-le, n'invente JAMAIS.
+- Tu peux OBSERVER le serveur pour tout le monde : scan_salon, vue_serveur, activite_serveur, info_membre, et evenements (les événements planifiés du serveur : sessions, réunions, streams). Après un outil, rapport avec ta personnalité ; si l'outil ne donne rien, dis-le, n'invente JAMAIS.
 - On te donne un lien ou on te demande des infos sur une page → tu la LIS vraiment (lire_page), puis tu résumes en CITANT les sources. Pour un FORUM/site où l'info est éparpillée, ne te contente pas d'une page : fouiller_forum explore les discussions du site, tu les lis et tu synthétises en citant chaque lien. Tu ne prétends jamais avoir lu ce que tu n'as pas lu.
 - Réponses courtes, directes, mais humaines — pas sèches. Si on te manque vraiment de respect : une ironie fine suffit.
 - COMME SUR DISCORD : quand c'est naturel, tu peux enchaîner 2 ou 3 messages courts plutôt qu'un pavé (une réaction, puis une précision). Sépare-les par une ligne contenant UNIQUEMENT [cut]. Sans abuser (jamais plus de 3), jamais dans du code ni au milieu d'une phrase. Pour une longue synthèse (recherche web/forum), garde UN seul message structuré.
@@ -7031,6 +7396,89 @@ async def _before_reminder_loop():
     await bot.wait_until_ready()
 
 @tasks.loop(minutes=10)
+async def tool_evenements(guild, quand="a_venir"):
+    """Liste les événements planifiés (Événements Discord) d'un serveur.
+    quand : 'a_venir' (défaut), 'en_cours', ou 'tous'. Lecture seule, tout public."""
+    if guild is None:
+        return "Pas d'événements à consulter ici — nous sommes en message privé (les événements vivent sur un serveur)."
+    try:
+        events = list(getattr(guild, "scheduled_events", []) or [])
+        # Certains événements ne sont pas en cache : on tente un fetch si dispo.
+        if not events and hasattr(guild, "fetch_scheduled_events"):
+            try:
+                events = list(await guild.fetch_scheduled_events())
+            except (discord.HTTPException, discord.Forbidden):
+                pass
+    except Exception as e:
+        return f"Je n'arrive pas à lire les événements de ce serveur ({str(e)[:80]})."
+
+    if not events:
+        return (f"Aucun événement planifié sur {guild.name} pour l'instant. "
+                "Quand quelqu'un en crée un (onglet Événements du serveur), je le verrai.")
+
+    now_utc = datetime.now(timezone.utc)
+    lignes = []
+    for ev in sorted(events, key=lambda e: getattr(e, "start_time", now_utc) or now_utc):
+        start = getattr(ev, "start_time", None)
+        end = getattr(ev, "end_time", None)
+        statut = str(getattr(getattr(ev, "status", None), "name", "") or "").lower()
+        en_cours = statut == "active" or (start and end and start <= now_utc <= end)
+        a_venir = start and start > now_utc
+
+        if quand == "a_venir" and not a_venir:
+            continue
+        if quand == "en_cours" and not en_cours:
+            continue
+
+        # Où : un salon vocal/scène, ou un lieu externe libre.
+        lieu = ""
+        loc = getattr(getattr(ev, "location", None), "value", None) or getattr(ev, "location", None)
+        chan = getattr(ev, "channel", None)
+        if chan is not None:
+            lieu = f"#{getattr(chan, 'name', '?')}"
+        elif isinstance(loc, str) and loc.strip():
+            lieu = loc.strip()
+
+        quand_txt = ""
+        if start:
+            s_loc = to_paris(start)
+            jours_fr = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+            quand_txt = f"{jours_fr[s_loc.weekday()]} {s_loc.strftime('%d/%m à %H:%M')}"
+            delta = start - now_utc
+            if en_cours:
+                quand_txt = "EN COURS"
+            elif delta.total_seconds() > 0:
+                j = delta.days
+                h = delta.seconds // 3600
+                if j > 0:
+                    quand_txt += f" (dans {j}j{h}h)"
+                elif h > 0:
+                    quand_txt += f" (dans {h}h)"
+                else:
+                    quand_txt += f" (dans {delta.seconds // 60} min)"
+
+        interesses = getattr(ev, "user_count", None)
+        interet = f" · {interesses} intéressé(s)" if interesses else ""
+        desc = (getattr(ev, "description", "") or "").strip().replace("\n", " ")
+        if len(desc) > 140:
+            desc = desc[:137] + "…"
+
+        bloc = f"• **{ev.name}** — {quand_txt}"
+        if lieu:
+            bloc += f" · {lieu}"
+        bloc += interet
+        if desc:
+            bloc += f"\n  {desc}"
+        lignes.append(bloc)
+
+    if not lignes:
+        libelle = {"a_venir": "à venir", "en_cours": "en cours"}.get(quand, "")
+        return f"Aucun événement {libelle} sur {guild.name} pour l'instant."
+
+    entete = {"a_venir": "Événements à venir", "en_cours": "Événements en cours",
+              "tous": "Événements"}.get(quand, "Événements")
+    return f"{entete} sur {guild.name} :\n" + "\n".join(lignes)
+
 async def events_sync_loop():
     """Crée automatiquement un rappel avant chaque événement planifié d'un serveur."""
     lead = timedelta(minutes=30)
@@ -7094,6 +7542,44 @@ async def guild_watch_loop():
 @guild_watch_loop.before_loop
 async def _before_guild_watch():
     await bot.wait_until_ready()
+
+# --- Bibliothèque du forum : elle la remplit doucement, en fond -----------------
+LIBRARY_LOOP_MIN = 12           # un petit lot de résumés toutes les 12 min
+LIBRARY_REMAP_HOURS = 24        # on recartographie le forum une fois par jour
+
+@tasks.loop(minutes=LIBRARY_LOOP_MIN)
+async def library_loop():
+    """Construit et entretient la bibliothèque sans jamais bloquer le bot :
+    (re)carte du forum une fois par jour, puis résumés par petits lots."""
+    if not get_setting("forum_library", True) or quota_exhausted():
+        return
+    meta = library_meta()
+    # 1) Carte quotidienne (ou première carte si jamais faite)
+    try:
+        derniere = datetime.strptime(meta.get("derniere_carte") or "2000-01-01 00:00", "%Y-%m-%d %H:%M")
+    except ValueError:
+        derniere = datetime(2000, 1, 1)
+    if (now() - derniere).total_seconds() > LIBRARY_REMAP_HOURS * 3600:
+        try:
+            rep = await library_map()
+            if rep.get("ok"):
+                print(f"🗺️ Carte du forum : {rep['sujets']} sujets, {rep['a_resumer']} à résumer.")
+        except Exception as e:
+            print(f"⚠️ Cartographie forum échouée : {str(e)[:100]}")
+    # 2) Un lot de résumés
+    if meta.get("a_resumer"):
+        try:
+            r = await library_summarize_batch()
+            if r["faits"]:
+                print(f"📖 Bibliothèque : +{r['faits']} résumé(s), {r['restants']} restant(s).")
+                await flush_memory()
+        except Exception as e:
+            print(f"⚠️ Résumés forum échoués : {str(e)[:100]}")
+
+@library_loop.before_loop
+async def _before_library():
+    await bot.wait_until_ready()
+    await asyncio.sleep(90)      # on laisse le bot démarrer tranquillement avant de crawler
     await asyncio.sleep(300)     # laisse le bot démarrer avant la première veille
 
 # ============================================================
@@ -8172,6 +8658,82 @@ async def admin_reminders(request):
 
     return web.json_response({"error": "action inconnue"}, status=400)
 
+async def admin_library(request):
+    """La bibliothèque du forum : état + cartographier / résumer / vider, en tâche de fond."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+
+    if request.method == "GET":
+        return web.json_response({"stats": library_stats(),
+                                  "actif": bool(get_setting("forum_library", True)),
+                                  "forum": FORUM_URL})
+
+    data = await _read_json(request)
+    action = data.get("action")
+
+    if action == "toggle":
+        val = bool(data.get("actif"))
+        set_settings({"forum_library": val})
+        await flush_memory()
+        audit_log("biblio", "activée" if val else "désactivée")
+        return web.json_response({"ok": True, "stats": library_stats(), "actif": val, "forum": FORUM_URL})
+
+    if action == "vider":
+        memory()["forum_library"] = {}
+        memory()["forum_library_meta"] = {"derniere_carte": "", "a_resumer": [],
+                                          "total_sujets": 0, "en_cours": False}
+        mark_memory_dirty()
+        await flush_memory()
+        audit_log("biblio", "vidée")
+        return web.json_response({"ok": True, "stats": library_stats(),
+                                  "actif": bool(get_setting("forum_library", True)), "forum": FORUM_URL})
+
+    if action == "carte":
+        tid = task_new("Cartographie du forum")
+
+        async def _run():
+            try:
+                task_step(tid, 5, "Ouverture du forum…")
+                rep = await library_map(progress=lambda p, e="": task_step(tid, p, e))
+                if not rep.get("ok"):
+                    task_done(tid, f"Échec : {rep.get('raison', 'forum injoignable')}", ok=False)
+                    return
+                await flush_memory()
+                task_done(tid, f"{rep['sujets']} sujets cartographiés, "
+                               f"{rep['a_resumer']} à résumer. Les résumés se font en fond.")
+            except Exception as e:
+                task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+        asyncio.create_task(_run())
+        return web.json_response({"ok": True, "task": tid})
+
+    if action == "resumer":
+        tid = task_new("Résumés du forum")
+
+        async def _run():
+            try:
+                # plusieurs lots d'affilée pour avancer vite, sans dépasser le quota
+                total_faits = 0
+                for _ in range(5):
+                    if quota_exhausted():
+                        break
+                    r = await library_summarize_batch(progress=lambda p, e="": task_step(tid, p, e))
+                    total_faits += r["faits"]
+                    if r["restants"] == 0 or r["faits"] == 0:
+                        break
+                await flush_memory()
+                s = library_stats()
+                task_done(tid, f"+{total_faits} résumé(s). Total à jour : {s['resumes']}/{s['total']}. "
+                               f"Restants : {s['a_faire']}.")
+            except Exception as e:
+                task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+        asyncio.create_task(_run())
+        return web.json_response({"ok": True, "task": tid})
+
+    return web.json_response({"error": "action inconnue"}, status=400)
+
 async def admin_listen(request):
     """Les salons que Tenebris écoute. Par défaut : tous — on les met en sourdine un par un."""
     guard = _auth_guard(request)
@@ -8446,6 +9008,8 @@ def _register_admin_routes(app):
     app.router.add_get("/admin/api/task", admin_task)
     app.router.add_get("/admin/api/listen", admin_listen)
     app.router.add_post("/admin/api/listen", admin_listen)
+    app.router.add_get("/admin/api/library", admin_library)
+    app.router.add_post("/admin/api/library", admin_library)
     app.router.add_get("/admin/api/missions", admin_missions)
     app.router.add_post("/admin/api/missions", admin_missions)
 
@@ -8905,6 +9469,25 @@ ADMIN_HTML = r"""<!DOCTYPE html>
     <!-- Console d'administration -->
     <div class="view" id="v-admin">
       <h2 class="title">Console d'administration</h2>
+
+      <div class="adm-sec">
+        <h3>Bibliothèque du forum</h3>
+        <div style="color:var(--dim);font-size:13px;margin-bottom:12px">
+          Tenebris tient une <b>carte du forum</b> avec, pour chaque sujet, un court résumé mémorisé.
+          Elle s'en sert pour répondre <b>vite</b> sans tout relire à chaque fois. Elle la remplit
+          toute seule en fond ; les résumés sont revérifiés tous les 30 jours. Le forum de référence
+          est <b id="lib_forum">—</b>.
+        </div>
+        <div id="lib_stats" style="font-size:13px;margin-bottom:12px;color:var(--dim)">Chargement…</div>
+        <div class="btnrow" style="flex-wrap:wrap;gap:8px">
+          <button class="mini" id="lib_map" onclick="libAction('carte', this)">🗺️ Cartographier le forum</button>
+          <button class="mini ghost" id="lib_sum" onclick="libAction('resumer', this)">📖 Résumer maintenant</button>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-left:auto">
+            <input type="checkbox" id="lib_toggle" onchange="libToggle()"> Remplissage automatique
+          </label>
+          <button class="mini ghost" onclick="libAction('vider', this)">🗑️ Vider</button>
+        </div>
+      </div>
 
       <div class="adm-sec">
         <h3>Salons écoutés</h3>
@@ -9807,7 +10390,43 @@ async function loadActions(){
 }
 
 /* ---------- Console d'administration ---------- */
-async function loadAdmin(){ await loadSettings(); await loadListen(); await loadAdminUsers(); await loadActions(); await loadAudit(); }
+async function loadAdmin(){ await loadSettings(); await loadLibrary(); await loadListen(); await loadAdminUsers(); await loadActions(); await loadAudit(); }
+
+function renderLibrary(d){
+  const s = d.stats||{}; 
+  $('#lib_forum').textContent = d.forum||'—';
+  $('#lib_toggle').checked = !!d.actif;
+  const pct = s.total ? Math.round(100*s.resumes/s.total) : 0;
+  if(!s.total){
+    $('#lib_stats').innerHTML = 'Bibliothèque vide. Clique <b>Cartographier le forum</b> pour la construire.';
+    return;
+  }
+  $('#lib_stats').innerHTML =
+    '<b style="color:var(--txt)">'+s.total+'</b> sujets cartographiés · '+
+    '<b style="color:#7ddc9a">'+s.resumes+'</b> résumés à jour ('+pct+' %) · '+
+    (s.a_faire? ('<b>'+s.a_faire+'</b> en attente · ') : '')+
+    'dernière carte : '+(s.derniere_carte||'jamais');
+}
+async function loadLibrary(){
+  const {status, body} = await jget('/admin/api/library');
+  if(status===401){ showLogin(); return; }
+  if(status===200) renderLibrary(body);
+}
+async function libToggle(){
+  const {status, body} = await jpost('/admin/api/library', {action:'toggle', actif: $('#lib_toggle').checked});
+  if(status===200){ renderLibrary(body); toast(body.actif?'Remplissage automatique activé.':'Remplissage automatique coupé.'); }
+}
+async function libAction(action, btn){
+  if(action==='vider' && !window.confirm('Vider toute la bibliothèque du forum ?')) return;
+  const {status, body} = await busy(btn, ()=>jpost('/admin/api/library', {action}), '…');
+  if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
+  if(body.task){
+    taskFollow(body.task, action==='carte'?'Cartographie du forum':'Résumés du forum', loadLibrary);
+  } else {
+    renderLibrary(body);
+    if(action==='vider') toast('Bibliothèque vidée.');
+  }
+}
 
 function renderListen(body){
   const box = $('#listenBox');
@@ -10075,7 +10694,7 @@ async def on_ready():
         print(f"⚠️ Paramètres : {e}")
 
     for loop in (periodic_save, reminder_loop, events_sync_loop, guild_watch_loop,
-                 missions_loop, keep_awake):
+                 missions_loop, library_loop, keep_awake):
         try:
             if not loop.is_running():
                 loop.start()
@@ -10301,12 +10920,16 @@ async def on_message(message):
         if route == "roleplay":
             system_prompt += RP_PROMPT_SUFFIX
 
+        # Qui a droit à quels outils ?
+        #  - Admin : tout (y compris les actions sensibles : envoyer, épingler, missions…).
+        #  - Tout le monde, partout (serveur OU message privé) : les outils PUBLICS,
+        #    qui sont en lecture seule (fouiller le forum, recherche web, lire une page,
+        #    mémoire commune…). Aucune raison de priver un membre de la recherche parce
+        #    qu'il écrit en privé — c'était le cas avant, ça ne l'est plus.
         if is_admin(user_id, username):
             tools_for_user = TOOLS if send_tools else None
-        elif message.guild is not None:
-            tools_for_user = PUBLIC_TOOLS if send_tools else None
         else:
-            tools_for_user = None
+            tools_for_user = PUBLIC_TOOLS if send_tools else None
 
         # Conseil intérieur : sur une vraie question, deux agents délibèrent d'abord
         # (proposition → critique) et Tenebris rédige la révision finale dans sa voix.
@@ -10597,6 +11220,73 @@ async def ecoute_cmd(ctx, etat: str = None):
         await ctx.send(f"👂 J'écoute #{ctx.channel.name}. J'apprends de ce qui s'y dit.{suite}")
     else:
         await ctx.send(f"🔇 #{ctx.channel.name} est en sourdine — je n'y entends plus rien.")
+
+@bot.command(name="events", aliases=["evenements", "agenda"],
+             help="Affiche les événements planifiés du serveur")
+async def events_cmd(ctx, quand: str = "a_venir"):
+    q = (quand or "").lower()
+    if q in ("cours", "encours", "en_cours", "now", "maintenant"):
+        q = "en_cours"
+    elif q in ("tous", "all", "tout"):
+        q = "tous"
+    else:
+        q = "a_venir"
+    async with ctx.typing():
+        txt = await tool_evenements(ctx.guild, q)
+    for chunk in smart_split(txt):
+        await ctx.send(chunk)
+
+@bot.command(name="bibliotheque", aliases=["biblio", "forum_index"],
+             help="État de la bibliothèque du forum ; « ²T biblio maj » pour (re)cartographier")
+async def bibliotheque_cmd(ctx, action: str = None):
+    if not is_admin(ctx.author.id, ctx.author.name):
+        await ctx.send("La bibliothèque du forum se pilote depuis mes administrateurs.")
+        return
+    act = (action or "").lower()
+
+    if act in ("maj", "map", "carte", "indexer", "refresh", "rafraichir"):
+        await ctx.send("🗺️ Je cartographie le forum… (ça peut prendre une minute)")
+        try:
+            rep = await library_map()
+        except Exception as e:
+            await ctx.send(f"Échec de la cartographie : {str(e)[:150]}")
+            return
+        if not rep.get("ok"):
+            await ctx.send(f"Cartographie impossible : {rep.get('raison', 'forum injoignable')}.")
+            return
+        await flush_memory()
+        await ctx.send(f"✅ {rep['sujets']} sujets cartographiés, {rep['a_resumer']} à résumer. "
+                       "Je m'occupe des résumés en fond — reviens voir avec `²T biblio`.")
+        return
+
+    if act in ("resumer", "summarize", "go"):
+        await ctx.send("📖 Je résume un lot de sujets…")
+        r = await library_summarize_batch()
+        await flush_memory()
+        await ctx.send(f"Fait : +{r['faits']} résumé(s), {r['restants']} restant(s).")
+        return
+
+    if act in ("vider", "reset", "purge"):
+        memory()["forum_library"] = {}
+        memory()["forum_library_meta"] = {"derniere_carte": "", "a_resumer": [],
+                                          "total_sujets": 0, "en_cours": False}
+        mark_memory_dirty()
+        await flush_memory()
+        await ctx.send("🗑️ Bibliothèque du forum vidée.")
+        return
+
+    s = library_stats()
+    pct = int(100 * s["resumes"] / s["total"]) if s["total"] else 0
+    lignes = [
+        f"📚 **Bibliothèque du forum** ({FORUM_URL})",
+        f"• Sujets cartographiés : **{s['total']}**",
+        f"• Résumés à jour : **{s['resumes']}** ({pct} %)",
+        f"• En attente de résumé : {s['a_faire']}",
+        f"• Dernière carte : {s['derniere_carte'] or 'jamais'}",
+    ]
+    if s["total"] == 0:
+        lignes.append("\nElle est vide. Lance `²T biblio maj` pour cartographier le forum.")
+    await ctx.send("\n".join(lignes))
 
 @bot.command(name="salons_ecoutes", help="Où Tenebris écoute, et où elle est en sourdine")
 async def salons_ecoutes_cmd(ctx):
