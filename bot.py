@@ -7510,14 +7510,28 @@ def get_guild_context(message):
         bits.append(emo)
     return "\n".join(bits)
 
-async def send_reply(message, text):
+_URL_IN_TEXT = re.compile(r"https?://", re.IGNORECASE)
+
+async def send_reply(message, text, no_embeds=False):
+    """Envoie la réponse. no_embeds=True (après une recherche web/forum) supprime les
+    aperçus déployés de Discord : on veut juste les liens en clair, pas les grosses cartes."""
     parts = split_messages(text)
     for i, chunk in enumerate(parts):
         await human_typing(message.channel, chunk)
-        if i == 0:
-            await message.reply(chunk)
-        else:
-            await message.channel.send(chunk)
+        # On ne coupe les embeds que sur les morceaux qui contiennent réellement un lien
+        # (inutile de flaguer un chunk sans URL).
+        suppress = no_embeds and bool(_URL_IN_TEXT.search(chunk))
+        try:
+            if i == 0:
+                await message.reply(chunk, suppress_embeds=suppress)
+            else:
+                await message.channel.send(chunk, suppress_embeds=suppress)
+        except TypeError:
+            # Vieille version de discord.py sans le paramètre : on envoie normalement.
+            if i == 0:
+                await message.reply(chunk)
+            else:
+                await message.channel.send(chunk)
 
 @tasks.loop(seconds=SAVE_INTERVAL_SECONDS)
 async def periodic_save():
@@ -11177,7 +11191,9 @@ async def on_message(message):
             except discord.errors.HTTPException:
                 pass
 
-        await send_reply(message, reply)
+        # Après une recherche web/forum (used_tools), on montre les liens en clair,
+        # sans les intégrations Discord qui se déploient : juste l'URL.
+        await send_reply(message, reply, no_embeds=used_tools)
 
         # Extraction mémoire, cadencée par utilisateur (jamais mélangée entre personnes)
         threshold = MEMORY_EXTRACT_EVERY if mschap_user else get_setting("extract_every", USER_EXTRACT_EVERY)
