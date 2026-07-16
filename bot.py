@@ -212,6 +212,10 @@ CROSS_USER_MAX_CHARS = 600    # plafond global du bloc partagé (économie de to
 # toutes les 5 min. RENDER_EXTERNAL_URL est fourni automatiquement par Render ;
 # en local tu peux définir KEEPALIVE_URL toi-même (sinon le self-ping est inactif).
 KEEPALIVE_PORT = int(os.getenv("PORT", "10000"))
+# Adresse d'écoute du serveur HTTP (panneau admin). Sur un VPS public, mets KEEPALIVE_HOST=127.0.0.1
+# pour ne l'exposer QU'en local (tu y accèdes alors par un tunnel SSH) — sinon le panneau est
+# joignable par quiconque scanne l'IP:port. Défaut 0.0.0.0 (comme avant, pour ne rien casser).
+KEEPALIVE_HOST = os.getenv("KEEPALIVE_HOST", "0.0.0.0")
 KEEPALIVE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("KEEPALIVE_URL", "")
 KEEPALIVE_INTERVAL_MIN = 5
 
@@ -8101,6 +8105,78 @@ def channel_thread_block(channel_id, exclude_last_user=None):
             "l'inverse de ce que tu as dit à l'autre, et tu peux répondre à plusieurs à la fois. "
             "Voici les derniers échanges de ce salon :\n" + "\n".join(lignes))
 
+# --- MÉMOIRE RÉCENTE DU SALON : fenêtre glissante brute + résumé roulant ------
+# Le fil injecté (channel_thread_block) ne montre que les 12 derniers tours. Pour suivre une
+# discussion de GROUPE qui dure (comme un chat Twitch suivi dans le temps), on tient une fenêtre
+# brute plus large de TOUS les messages vus (actifs ET passifs) et, tous les N messages, on la
+# condense en un résumé court réinjecté en contexte. C'est la « mémoire récente » de l'archi.
+_channel_raw = {}              # cid -> [(who, content)] fenêtre glissante brute (non injectée telle quelle)
+_channel_recaps = {}           # cid -> {"text": str, "ts": float}
+_channel_since_recap = {}      # cid -> nb de messages depuis le dernier résumé
+CHANNEL_RAW_MAX = 60           # taille de la fenêtre brute résumée
+CHANNEL_RECAP_EVERY = 25       # messages entre deux résumés (throttle quota)
+CHANNEL_RECAP_MAXLEN = 700     # taille max du résumé injecté
+
+async def _update_channel_recap(cid):
+    """Condense la fenêtre brute d'un salon en un fil court (de quoi on parle, qui fait quoi,
+    l'ambiance, les running gags). Fusionne avec le résumé précédent pour garder la continuité."""
+    if quota_exhausted():
+        return
+    buf = _channel_raw.get(cid, [])
+    if len(buf) < 6:
+        return
+    convo = "\n".join(f"{who}: {txt}" for who, txt in buf[-CHANNEL_RAW_MAX:])
+    ancien = _channel_recaps.get(cid, {}).get("text", "")
+    prompt = ((f"Fil précédent de ce salon : {ancien}\n\n" if ancien else "")
+              + "Derniers messages du salon :\n" + convo
+              + "\n\nMets à jour en 3-4 phrases MAX le fil de ce salon : de quoi on parle en ce "
+                "moment, qui fait quoi, l'ambiance, les running gags ou tensions. Style notes, "
+                "factuel, pas de puces, pas de blabla.")
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": "Tu résumes l'état d'une conversation de groupe Discord : court et factuel."},
+             {"role": "user", "content": prompt}],
+            max_tokens=220, temperature=0.3,
+        )
+        txt = (resp.choices[0].message.content or "").strip()[:CHANNEL_RECAP_MAXLEN]
+        if txt:
+            _channel_recaps[cid] = {"text": txt, "ts": time.time()}
+            if len(_channel_recaps) > 40:        # borne le nb de salons suivis (garde les récents)
+                for k, _ in sorted(_channel_recaps.items(), key=lambda kv: kv[1]["ts"])[:len(_channel_recaps) - 40]:
+                    _channel_recaps.pop(k, None)
+                    _channel_raw.pop(k, None)
+    except Exception as e:
+        print(f"⚠️ Résumé de salon : {str(e)[:80]}")
+
+def note_channel_message(cid, who, content):
+    """Alimente la fenêtre brute d'un salon avec CHAQUE message vu (actif ou passif) et déclenche
+    un résumé roulant tous les CHANNEL_RECAP_EVERY messages, en arrière-plan (jamais bloquant)."""
+    if cid is None or not content:
+        return
+    cid = int(cid)
+    buf = _channel_raw.setdefault(cid, [])
+    buf.append((who, content[:HISTORY_MSG_MAX_CHARS]))
+    if len(buf) > CHANNEL_RAW_MAX:
+        del buf[:-CHANNEL_RAW_MAX]
+    _channel_since_recap[cid] = _channel_since_recap.get(cid, 0) + 1
+    if _channel_since_recap[cid] >= CHANNEL_RECAP_EVERY and not quota_exhausted():
+        _channel_since_recap[cid] = 0
+        try:
+            asyncio.create_task(_update_channel_recap(cid))
+        except RuntimeError:
+            pass   # pas de boucle asyncio active
+
+def channel_recap_block(cid):
+    """La « mémoire récente » du salon à injecter : le fil de la discussion de groupe qui dure,
+    au-delà des quelques derniers messages bruts."""
+    if cid is None:
+        return ""
+    r = _channel_recaps.get(int(cid))
+    if not r or not r.get("text"):
+        return ""
+    return ("MÉMOIRE RÉCENTE DE CE SALON (le fil de fond de la discussion de groupe, au-delà des "
+            "derniers messages — sers-t'en pour suivre ce qui se trame, pas à réciter) :\n" + r["text"])
+
 # --- État du panneau admin : IA en pause + dernier salon connu par personne --
 _PAUSED = set()            # user_ids pour lesquels l'IA ne répond plus (pause manuelle)
 _user_channels = {}        # user_id -> dernier salon/DM où la personne a parlé (reprise manuelle)
@@ -8855,10 +8931,10 @@ async def start_keepalive_server():
     _register_admin_routes(app)   # panneau privé /admin (protégé par mot de passe)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", KEEPALIVE_PORT)
+    site = web.TCPSite(runner, KEEPALIVE_HOST, KEEPALIVE_PORT)
     await site.start()
     _keepalive_runner = runner
-    print(f"🌐 Serveur keep-alive à l'écoute sur le port {KEEPALIVE_PORT}")
+    print(f"🌐 Serveur HTTP à l'écoute sur {KEEPALIVE_HOST}:{KEEPALIVE_PORT}")
     if ADMIN_PASSWORD:
         print("🔐 Panneau admin ACTIF → <URL_PUBLIQUE>/admin (protégé par mot de passe)")
     else:
@@ -12306,6 +12382,12 @@ async def on_message(message):
     directly_addressed = bot.user.mentioned_in(message) or is_dm or is_reply_to_bot
     called_by_name = (message.guild is not None) and bool(_APPELEE.search(message.content or ""))
 
+    # Fenêtre glissante brute du salon : on note CHAQUE message (qu'on lui réponde ou non) pour
+    # nourrir le résumé roulant de groupe — même les messages passifs comptent dans le fil.
+    if message.guild is not None:
+        note_channel_message(message.channel.id, getattr(message.author, "display_name", "?"),
+                             message.content or "")
+
     if not (directly_addressed or called_by_name):
         # --- Salon écouté : elle suit la discussion, apprend, et s'invite parfois ---
         if message.guild is not None and is_listening(message.channel):
@@ -12417,6 +12499,9 @@ async def on_message(message):
             salon_commun = channel_thread_block(message.channel.id)
             if salon_commun:
                 system_prompt += "\n\n" + salon_commun
+            recap = channel_recap_block(message.channel.id)
+            if recap:
+                system_prompt += "\n\n" + recap
 
         thread = list(conversations[user_id]) + [{"role": "user", "content": content}]
 
@@ -12487,6 +12572,7 @@ async def on_message(message):
         if not is_dm:
             record_channel_turn(message.channel.id, display_name or username, "user", content)
             record_channel_turn(message.channel.id, "Tenebris", "assistant", reply_clean)
+            note_channel_message(message.channel.id, "Tenebris", reply_clean)
 
         if len(conversations[user_id]) > MAX_HISTORY and user_id not in _summarizing:
             _summarizing.add(user_id)
