@@ -100,6 +100,16 @@ GEMINI_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash"]  # si le modè
 # continue de s'appliquer : ce réglage desserre, il ne supprime pas tout.
 GEMINI_SAFETY = os.getenv("GEMINI_SAFETY", "BLOCK_NONE").strip().upper()
 
+# --- Mistral : FILET DE SECOURS quand Cerebras est à sec ---------------------
+# API compatible OpenAI (même endpoint que Groq) → aucun package en plus, on réutilise
+# _call_openai_compat. Le tier gratuit « Experiment » de La Plateforme couvre tous les
+# modèles (~1 milliard de tokens/mois). Mistral n'a PAS de modèle « 1B » : le plus léger
+# est Ministral 3B → on prend « ministral-3b-latest » par défaut (surchargeable via env).
+# Mistral ne sert QUE lorsque Cerebras est épuisé (voir _route_from_env : mis en queue).
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "ministral-3b-latest")
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+
 # --- ROUTES : quel fournisseur pour quelle situation ? ----------------------
 # Chaque route est une CHAÎNE de repli : si le 1er refuse, plante ou est à sec,
 # on passe au suivant SANS que l'utilisateur ne voie rien.
@@ -107,16 +117,18 @@ GEMINI_SAFETY = os.getenv("GEMINI_SAFETY", "BLOCK_NONE").strip().upper()
 #   • "roleplay" : fiction, scène, immersion            → Groq puis Gemini (peu censurés)
 #   • "analyse"  : extraction mémoire, conseil intérieur → Cerebras (économe)
 # Surchargeable sans toucher au code : LLM_ROUTE_ROLEPLAY="gemini,groq,cerebras"
-_VALID_PROVIDERS = ("cerebras", "groq", "gemini")
+_VALID_PROVIDERS = ("cerebras", "groq", "gemini", "mistral")
 
 def _route_from_env(name, default_chain):
     raw = os.getenv(f"LLM_ROUTE_{name.upper()}", "")
     chain = [p.strip().lower() for p in raw.split(",") if p.strip()] or default_chain
     chain = [p for p in chain if p in _VALID_PROVIDERS] or list(default_chain)
-    # Politique du bot : 100 % Cerebras (multi-clés). Groq/Gemini apportaient trop peu et
+    # Politique du bot : 100 % Cerebras (multi-clés) en tête. Groq/Gemini apportaient trop peu et
     # cassaient les outils (dés, forum) ; toute la robustesse vient du pool de clés Cerebras.
-    chain = [p for p in chain if p == "cerebras"] or ["cerebras"]
-    return chain
+    ceres = [p for p in chain if p == "cerebras"] or ["cerebras"]
+    # FILET DE SECOURS : si une clé Mistral est fournie, on l'ajoute EN QUEUE. Le loop de
+    # llm_completion ne bascule dessus que si Cerebras est « en pause » (toutes les clés épuisées).
+    return ceres + (["mistral"] if MISTRAL_API_KEY else [])
 
 LLM_ROUTES = {
     "chat":     _route_from_env("chat",     ["cerebras"]),
@@ -124,7 +136,9 @@ LLM_ROUTES = {
     "analyse":  _route_from_env("analyse",  ["cerebras"]),
 }
 # Cerebras gère les outils : les dés et la fouille forum marchent sur toutes les routes.
-PROVIDER_TOOLS = {"cerebras": True, "groq": True, "gemini": False}
+# Mistral (secours) gère aussi le function calling ; si son petit modèle bute dessus,
+# le repli « sans outils » de chat_with_tools prend le relais.
+PROVIDER_TOOLS = {"cerebras": True, "groq": True, "gemini": False, "mistral": True}
 PROVIDER_COOLDOWN = 300   # un fournisseur à court de quota est mis de côté 5 min
 # Nombre de tentatives par fournisseur avant d'abandonner. Avec Cerebras seul, c'est ce
 # qui évite le « grincé » au moindre hoquet : on retente 3 fois avec un délai croissant.
@@ -216,6 +230,8 @@ if len(CEREBRAS_API_KEYS) > 1:
 else:
     print("🔑 1 seule clé Cerebras chargée. Ajoute-en dans CEREBRAS_API_KEYS "
           "(séparées par des virgules) pour cumuler les quotas.")
+if MISTRAL_API_KEY:
+    print(f"🛟 Filet de secours Mistral actif ({MISTRAL_MODEL}) — utilisé uniquement si Cerebras est à sec.")
 
 cerebras_client = AsyncCerebras(api_key=CEREBRAS_API_KEY) if CEREBRAS_API_KEY else None
 
@@ -442,7 +458,8 @@ async def _llm_http():
 
 
 def provider_ready(p):
-    return bool({"cerebras": CEREBRAS_API_KEY, "groq": GROQ_API_KEY, "gemini": GEMINI_API_KEY}.get(p))
+    return bool({"cerebras": CEREBRAS_API_KEY, "groq": GROQ_API_KEY,
+                 "gemini": GEMINI_API_KEY, "mistral": MISTRAL_API_KEY}.get(p))
 
 
 def model_for(provider, route="chat"):
@@ -452,6 +469,8 @@ def model_for(provider, route="chat"):
         return GROQ_RP_MODEL if route == "roleplay" else GROQ_MODEL
     if provider == "gemini":
         return GEMINI_MODEL
+    if provider == "mistral":
+        return MISTRAL_MODEL
     return "?"
 
 
@@ -644,6 +663,9 @@ async def _dispatch(provider, route, messages, tools, temperature, max_tokens, e
         return await _call_cerebras(model, messages, tools, temperature, max_tokens, effort), model
     if provider == "groq":
         return await _call_openai_compat("groq", GROQ_URL, GROQ_API_KEY, model,
+                                         messages, tools, temperature, max_tokens), model
+    if provider == "mistral":
+        return await _call_openai_compat("mistral", MISTRAL_URL, MISTRAL_API_KEY, model,
                                          messages, tools, temperature, max_tokens), model
     if provider == "gemini":
         return await _call_gemini(model, messages, temperature, max_tokens), model
