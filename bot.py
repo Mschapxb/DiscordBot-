@@ -7243,6 +7243,9 @@ def _peut_parler(cid, niveau):
     return random.random() < LISTEN_CHANCE.get(niveau, 0.0)
 
 _APPELEE = re.compile(r"\bt[eé]n[eè]bris\b|\bteneb\b", re.IGNORECASE)
+_name_call_last = {}          # cid -> dernier instant où elle a répondu à un APPEL PAR NOM (anti-doublon)
+NAME_CALL_MIN_GAP = 8         # s : évite le double-tir sur deux messages nommant son nom coup sur coup.
+                              # Ne s'applique JAMAIS à une vraie @mention, un DM ou une réponse à elle.
 
 async def learn_from_chatter(cid, guild):
     """Tire des notes durables sur les gens à partir de ce qu'elle a entendu.
@@ -12263,7 +12266,20 @@ async def on_message(message):
             print(f"⚠️ Échecs : {str(e)[:90]}")
         return
 
-    if not (bot.user.mentioned_in(message) or is_dm):
+    # --- À QUI RÉPOND-ELLE ? Elle répond TOUJOURS si on s'adresse à elle :
+    #     vraie @mention, message privé, RÉPONSE Discord à un de ses messages (même sans ping),
+    #     ou simple appel PAR SON NOM (« Tenebris ? », un @Tenebris tapé sans sélectionner la
+    #     mention…). Avant, seul le vrai ping comptait → elle « ghostait » tous les autres cas.
+    is_reply_to_bot = False
+    ref = getattr(message, "reference", None)
+    if ref is not None:
+        ref_msg = getattr(ref, "resolved", None) or getattr(ref, "cached_message", None)
+        if ref_msg is not None and getattr(ref_msg, "author", None) == bot.user:
+            is_reply_to_bot = True
+    directly_addressed = bot.user.mentioned_in(message) or is_dm or is_reply_to_bot
+    called_by_name = (message.guild is not None) and bool(_APPELEE.search(message.content or ""))
+
+    if not (directly_addressed or called_by_name):
         # --- Salon écouté : elle suit la discussion, apprend, et s'invite parfois ---
         if message.guild is not None and is_listening(message.channel):
             try:
@@ -12272,6 +12288,15 @@ async def on_message(message):
                 print(f"⚠️ Écoute : {str(e)[:90]}")
         await bot.process_commands(message)
         return
+
+    # Appel PAR NOM seul (ni ping, ni DM, ni réponse) : anti-doublon léger pour ne pas répondre
+    # deux fois à deux messages qui la nomment coup sur coup. Une vraie interpellation passe outre.
+    if called_by_name and not directly_addressed:
+        if time.time() - _name_call_last.get(cid, 0) < NAME_CALL_MIN_GAP:
+            await bot.process_commands(message)
+            return
+        _name_call_last[cid] = time.time()
+
     if message.content.startswith("²T "):
         await bot.process_commands(message)
         return
