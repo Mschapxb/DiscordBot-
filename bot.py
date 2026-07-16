@@ -1490,6 +1490,24 @@ async def consolidate_directives():
     mark_memory_dirty()
     return max(0, retires)
 
+def schedule_directive_reconcile(reason=""):
+    """Ménage AUTOMATIQUE des consignes : dès qu'une nouvelle consigne est gravée, on réconcilie
+    en arrière-plan celles qui se superposent (fusion des redondantes, retrait des périmées).
+    Fire-and-forget → ne ralentit jamais la réponse en cours. consolidate_directives ne fait rien
+    s'il y a moins de 2 consignes ou si le quota est à sec."""
+    async def _run():
+        try:
+            n = await consolidate_directives()
+            if n:
+                await flush_memory()
+                print(f"🧭 Consignes réconciliées automatiquement ({reason}) : {n} rangée(s).")
+        except Exception as e:
+            print(f"⚠️ Réconciliation auto des consignes : {str(e)[:90]}")
+    try:
+        asyncio.create_task(_run())
+    except RuntimeError:
+        pass   # pas de boucle asyncio active → le bouton du panneau s'en chargera
+
 async def clean_all_memory(use_llm=True, merge=False):
     """Nettoyage GLOBAL depuis le panneau.
       1) Mémoire commune : dédoublonnage local (toujours) + mise en ordre des consignes qui se
@@ -6209,6 +6227,7 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             if not consigne:
                 return "Consigne vide."
             if add_memory(consigne, DIRECTIVE_CATEGORY):
+                schedule_directive_reconcile("noter_consigne")
                 return f"✅ Consigne gravée, je m'y tiendrai: {consigne}"
             return "Cette consigne est déjà gravée."
         if name == "envoyer_salon":
@@ -7689,12 +7708,15 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
             facts, prof = parsed.get("facts", []), parsed.get("profile")
 
         added = 0
+        dir_added = False
         for f in facts or []:
             if not (isinstance(f, dict) and f.get("text")):
                 continue
             if is_mschap_target and f.get("category") == DIRECTIVE_CATEGORY:
                 # Consigne du Maître → mémoire commune (comportement de Tenebris)
-                added += 1 if add_memory(f["text"], DIRECTIVE_CATEGORY) else 0
+                if add_memory(f["text"], DIRECTIVE_CATEGORY):
+                    added += 1
+                    dir_added = True
             else:
                 # Fait personnel → notes sous l'identité de la personne (égalité)
                 added += 1 if add_user_note(
@@ -7706,6 +7728,8 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
                     confidence=f.get("confidence", "normale"),
                 ) else 0
 
+        if dir_added:
+            schedule_directive_reconcile("extraction auto")   # consignes qui se superposent → ménage auto
         prof_changed = update_user_profile(user_id, prof) if prof else False
         if added or prof_changed:
             extra = " + fiche enrichie" if prof_changed else ""
@@ -12594,6 +12618,7 @@ async def consigne(ctx, *, text: str = None):
         return
     if add_memory(text, DIRECTIVE_CATEGORY):
         await flush_memory()
+        schedule_directive_reconcile("commande consigne")
         await ctx.send(f"📜 Gravé, Maître. Je m'y tiendrai : *{text}*")
     else:
         await ctx.send("👁️ C'est déjà gravé.")
