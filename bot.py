@@ -2333,12 +2333,31 @@ WEB_FETCH_MAX_BYTES = 400_000
 BROWSER_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Upgrade-Insecure-Requests": "1",
+    # Signaux « vrai navigateur » que Cloudflare/forumactif inspectent pour trier les robots.
+    # Sans eux, une IP de datacenter (Render) se fait renvoyer un 403 « anti-bot ».
+    "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "DNT": "1",
+    "Connection": "keep-alive",
 }
 WEB_TEXT_MAX_CHARS = 5000       # par page (lire_page)
 WEB_TOOL_RESULT_MAX = 9000      # plafond du résultat d'outil réinjecté (dérogation au cap standard)
+# --- Filet de secours quand l'IP du bot est bloquée (403 Cloudflare / datacenter) -----------
+# Beaucoup d'hébergeurs (Render) se font refouler par forumactif/Cloudflare. Dernier recours :
+# on relit la page via un « reader-proxy » qui, lui, la charge depuis SA propre IP et nous rend
+# le HTML nettoyé. Jina Reader est gratuit et sans clé (limité en débit). Désactivable via env
+# (FORUM_READER_FALLBACK=0) ou remplaçable par un autre proxy (FORUM_READER_PROXY=...).
+FORUM_READER_FALLBACK = os.getenv("FORUM_READER_FALLBACK", "1") not in ("0", "false", "no", "")
+FORUM_READER_PROXY = os.getenv("FORUM_READER_PROXY", "https://r.jina.ai/").rstrip("/") + "/"
 _STYLE_RE = re.compile(r"(?is)<(script|style|noscript|template)[^>]*>.*?</\1>")
 _BR_RE = re.compile(r"(?i)<(br|/p|/div|/li|/h[1-6]|/tr)\s*/?>")
 _ANGLE_RE = re.compile(r"(?s)<[^>]+>")
@@ -3550,6 +3569,30 @@ def _www_variant(url):
     alt = host[4:] if host.startswith("www.") else "www." + host
     return urlunparse(p._replace(netloc=alt))
 
+async def _fetch_via_reader(url, sess):
+    """DERNIER RECOURS quand l'IP du bot est bloquée : on relit la page via un reader-proxy
+    (Jina par défaut) qui la charge depuis sa propre IP. On demande le HTML pour garder les
+    liens (indispensable au crawler du forum). Renvoie {url, html} ou None."""
+    if not FORUM_READER_FALLBACK:
+        return None
+    proxied = FORUM_READER_PROXY + url
+    try:
+        # X-Return-Format: html → on récupère le HTML nettoyé (avec ses <a href>), pas du markdown.
+        async with sess.get(proxied, timeout=aiohttp.ClientTimeout(total=30),
+                            headers={"X-Return-Format": "html"}, allow_redirects=True) as r:
+            if r.status != 200:
+                return None
+            raw = await r.content.read(WEB_FETCH_MAX_BYTES)
+        html = raw.decode("utf-8", errors="replace")
+        if len(html) < 200:            # réponse vide/inutile
+            return None
+        print(f"🛟 Forum relu via reader-proxy : {url}")
+        return {"url": url, "html": html}
+    except Exception as e:
+        print(f"⚠️ Reader-proxy échoué ({str(e)[:70]})")
+        return None
+
+
 async def _fetch_raw(url, session=None):
     """Récupère le HTML brut. Se présente comme un VRAI navigateur (les forums renvoient 403
     aux robots, surtout depuis une IP de datacenter) et RÉESSAIE jusqu'à 3 fois en cas d'échec
@@ -3604,6 +3647,11 @@ async def _fetch_raw(url, session=None):
                 print(f"🔁 Échec ({last_error}) — nouvelle tentative dans {delai:.1f}s "
                       f"[{attempt}/{FETCH_ATTEMPTS}]")
                 await asyncio.sleep(delai)
+        # Toutes les tentatives directes ont échoué (souvent 403 anti-bot depuis l'IP datacenter) :
+        # dernier recours via le reader-proxy, qui charge la page depuis SA propre IP.
+        via = await _fetch_via_reader(safe, sess)
+        if via:
+            return via
         return {"url": target, "error": f"{last_error} — après {FETCH_ATTEMPTS} tentatives"}
     finally:
         if own:
@@ -6079,9 +6127,9 @@ TOOLS = [
             "required": ["urls"]}}},
     {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. Ne renseigne 'url' que si on te pointe explicitement vers un AUTRE site. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet'. Ensuite tu résumes en citant chaque source (lien).",
+        "description": "APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement au lieu de partir de l'accueil. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien).",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string", "description": "Facultatif. Par défaut le forum officiel Orbis Naturae. À ne remplir que pour un autre site précis."},
+            "url": {"type": "string", "description": "À remplir dès qu'un lien précis est donné : section (/f2-...), sujet (/t45-...) ou autre site. Laisse vide seulement pour une recherche générale sur tout le forum officiel."},
             "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"}},
             "required": ["sujet"]}}},
     {"type": "function", "function": {
