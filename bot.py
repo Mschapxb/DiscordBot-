@@ -1203,6 +1203,103 @@ def _trim_notes(notes, cap):
     garde_set = {id(n) for n in garde}
     return [n for n in notes if id(n) in garde_set]
 
+def _note_recency_key(note):
+    """Pour choisir la note à GARDER entre deux similaires : la plus fraîche, puis la plus
+    reconfirmée, puis la plus importante. Une note humaine bat toujours une note IA."""
+    humaine = 1 if note.get("author", "IA") != "IA" else 0
+    return (humaine, -_note_age_days(note), note.get("reviews", 0),
+            IMPORTANCE_ORDER.get(note.get("importance", "normale"), 1))
+
+def dedupe_notes(notes):
+    """Retire les DOUBLONS d'une liste de notes (même info répétée). On garde, pour chaque
+    groupe de notes semblables, la meilleure (plus récente/reconfirmée/humaine) et on lui
+    transfère le total de reconfirmations. Rapide, sans LLM. Renvoie (notes_nettoyées, nb_retirés)."""
+    if len(notes) < 2:
+        return notes, 0
+    garde = []
+    supprimes = 0
+    for n in notes:
+        doublon_de = None
+        for g in garde:
+            if _similarity(g.get("text", ""), n.get("text", "")) >= DEDUP_SIMILARITY:
+                doublon_de = g
+                break
+        if doublon_de is None:
+            garde.append(n)
+        else:
+            # On garde la meilleure des deux, en cumulant les reconfirmations.
+            reviews = doublon_de.get("reviews", 0) + n.get("reviews", 0) + 1
+            meilleure = max(doublon_de, n, key=_note_recency_key)
+            autre = n if meilleure is doublon_de else doublon_de
+            meilleure["reviews"] = reviews
+            # on hérite d'un contexte s'il manquait
+            if not meilleure.get("context") and autre.get("context"):
+                meilleure["context"] = autre["context"]
+            if meilleure is not doublon_de:
+                garde[garde.index(doublon_de)] = meilleure
+            supprimes += 1
+    return garde, supprimes
+
+CLEAN_CONTRADICTION_SYSTEM = (
+    "Tu es un module de nettoyage de mémoire. On te donne une liste NUMÉROTÉE de notes sur une "
+    "même personne (ou un serveur). Tu repères UNIQUEMENT les CONTRADICTIONS FRANCHES : deux notes "
+    "qui ne peuvent pas être vraies en même temps (ex : « habite à Paris » vs « habite à Lyon », "
+    "« aime X » vs « déteste X »). Pour chaque contradiction, on garde la note la PLUS RÉCENTE et on "
+    "supprime l'ancienne. Tu NE supprimes PAS des notes juste parce qu'elles se ressemblent ou se "
+    "complètent. En cas de doute, tu ne touches à rien. Réponds UNIQUEMENT en JSON : "
+    '{"supprimer": [numéros des notes périmées à retirer]}. Liste vide si aucune contradiction.'
+)
+
+async def clean_contradictions(notes):
+    """Utilise le LLM pour repérer les CONTRADICTIONS (ce que le code seul ne sait pas juger)
+    et retirer la version périmée. Conservateur : en cas de doute, ne touche à rien.
+    Renvoie (notes_nettoyées, nb_retirés). Ne fait rien si quota épuisé."""
+    if len(notes) < 2 or quota_exhausted():
+        return notes, 0
+    # On numérote avec la date, pour que le modèle sache laquelle est la plus récente.
+    lignes = []
+    for i, n in enumerate(notes):
+        d = n.get("date", "?")[:10]
+        proteg = " [ADMIN]" if n.get("author", "IA") != "IA" else ""
+        lignes.append(f"{i}. ({d}){proteg} {_note_text(n)}")
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": CLEAN_CONTRADICTION_SYSTEM},
+             {"role": "user", "content": "Notes :\n" + "\n".join(lignes)}],
+            max_tokens=200, temperature=0.1,
+        )
+        raw = re.sub(r"^```(json)?|```$", "", (resp.choices[0].message.content or "").strip(), flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        a_retirer = set(int(x) for x in data.get("supprimer", []) if isinstance(x, (int, str)) and str(x).isdigit())
+    except Exception as e:
+        print(f"⚠️ Nettoyage contradictions : {str(e)[:90]}")
+        return notes, 0
+    # Sécurité : on ne retire jamais une note écrite à la main par un admin.
+    garde = [n for i, n in enumerate(notes)
+             if i not in a_retirer or n.get("author", "IA") != "IA"]
+    return garde, len(notes) - len(garde)
+
+async def clean_all_memory(use_llm=True):
+    """Nettoyage GLOBAL demandé depuis le panneau : dédoublonnage (toujours) + contradictions
+    (si use_llm et quota dispo), sur toutes les fiches membres et serveurs. Renvoie un bilan."""
+    dbl, contr, fiches = 0, 0, 0
+    for rec in list(memory().get("users", {}).values()) + list(memory().get("guilds", {}).values()):
+        notes = rec.get("notes", [])
+        if len(notes) < 2:
+            continue
+        fiches += 1
+        notes, d = dedupe_notes(notes)
+        dbl += d
+        if use_llm and len(notes) >= 2 and not quota_exhausted():
+            notes, c = await clean_contradictions(notes)
+            contr += c
+        rec["notes"] = notes
+    if dbl or contr:
+        mark_memory_dirty()
+        await flush_memory()
+    print(f"🧹 Nettoyage mémoire : {dbl} doublon(s), {contr} contradiction(s) retiré(s) sur {fiches} fiche(s).")
+    return {"doublons": dbl, "contradictions": contr, "fiches": fiches}
+
 def forget_stale_notes():
     """Passe sur toutes les fiches (membres et serveurs) et efface les notes de l'IA
     devenues vieilles et sans importance. Renvoie le nombre de notes oubliées.
@@ -1266,7 +1363,7 @@ def flag_note_obsolete(cible, texte_conteste, reporter_id, is_guild=False):
     print(f"⚠️ Note signalée caduque ({len(flaggers)}/{FLAG_THRESHOLD}) : {best.get('text','')[:60]}")
     return f"signalee:{manque}"       # combien de confirmations il manque encore
 
-def add_user_note(user_id, text, category="observation", importance="normale", author="IA"):
+def add_user_note(user_id, text, category="observation", importance="normale", author="IA", context="", confidence="normale"):
     """Mémorise un fait sur un utilisateur, avec métadonnées (§4).
     Une note = {date, modified, text, category, importance, author}.
     Le seuil d'importance (§6) ne s'applique qu'aux notes prises par l'IA."""
@@ -1297,6 +1394,8 @@ def add_user_note(user_id, text, category="observation", importance="normale", a
         "importance": importance,
         "author": author,
         "reviews": 0,
+        "context": context[:200] if context else "",   # d'où vient l'info (salon, sujet abordé…)
+        "confidence": confidence if confidence in ("faible", "normale", "haute") else "normale",
     })
     # Plus de troncature à 8 : on ne coupe qu'au plafond de SÉCURITÉ, et en enlevant
     # d'abord les notes les moins importantes / les plus vieilles (pas juste les premières).
@@ -7293,8 +7392,10 @@ Conversation :
 {convo}
 
 Réponds UNIQUEMENT avec un objet JSON de cette forme (chaque partie peut être vide) :
-{{"facts": [{{"category": "{cats}", "importance": "faible|normale|haute", "text": "fait concis (3e personne ; impératif pour une consigne)"}}],
-  "profile": {{"interests": [], "liked_topics": [], "sensitive_topics": [], "mood": "", "style": "", "summary": "", "tags": [], "relations": {{}}}}}}"""
+{{"facts": [{{"category": "{cats}", "importance": "faible|normale|haute", "confidence": "faible|normale|haute", "context": "d'où vient l'info (sujet/situation), très court", "text": "fait concis et DÉTAILLÉ (3e personne ; impératif pour une consigne)"}}],
+  "profile": {{"interests": [], "liked_topics": [], "sensitive_topics": [], "mood": "", "style": "", "summary": "", "tags": [], "relations": {{}}}}}}
+
+Pour chaque fait : rends le 'text' PRÉCIS et informatif (pas juste « aime les jeux » mais « aime les jeux de stratégie au tour par tour, surtout Age of Wonders »). 'confidence' = à quel point c'est sûr (une affirmation directe = haute ; une déduction = faible). 'context' = en quelques mots, la situation où l'info est apparue."""
 
 DIRECTIVE_CLAUSE = (
     " Capture AUSSI, avec la catégorie 'consigne', toute instruction que Mschap donne à Tenebris "
@@ -7363,6 +7464,8 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
                     category=f.get("category", "observation"),
                     importance=f.get("importance", "normale"),
                     author="IA",
+                    context=f.get("context", ""),
+                    confidence=f.get("confidence", "normale"),
                 ) else 0
 
         prof_changed = update_user_profile(user_id, prof) if prof else False
@@ -8349,6 +8452,8 @@ async def admin_user_detail(request):
             "reviews": n.get("reviews", 0),
             "author": n.get("author", "IA"),
             "age_jours": _note_age_days(n),
+            "context": n.get("context", ""),
+            "confidence": n.get("confidence", "normale"),
         })
     # les plus importantes / récentes d'abord pour la lecture
     notes.sort(key=lambda x: (IMPORTANCE_ORDER.get(x["importance"], 1), -x["age_jours"]), reverse=True)
@@ -9299,6 +9404,29 @@ async def admin_reminders(request):
 
     return web.json_response({"error": "action inconnue"}, status=400)
 
+async def admin_clean_memory(request):
+    """Nettoie la mémoire : doublons (instantané) + contradictions (via LLM), en tâche de fond."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    data = await _read_json(request)
+    use_llm = data.get("contradictions", True)
+    tid = task_new("Nettoyage de la mémoire")
+
+    async def _run():
+        try:
+            task_step(tid, 15, "Recherche des doublons…")
+            if use_llm:
+                task_step(tid, 40, "Analyse des contradictions (peut prendre un moment)…")
+            bilan = await clean_all_memory(use_llm=use_llm)
+            task_done(tid, f"{bilan['doublons']} doublon(s) et {bilan['contradictions']} "
+                           f"contradiction(s) retiré(s) sur {bilan['fiches']} fiche(s).")
+        except Exception as e:
+            task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+    asyncio.create_task(_run())
+    return web.json_response({"ok": True, "task": tid})
+
 async def admin_library(request):
     """La bibliothèque du forum : état + cartographier / résumer / vider, en tâche de fond."""
     guard = _auth_guard(request)
@@ -9652,6 +9780,7 @@ def _register_admin_routes(app):
     app.router.add_get("/admin/api/listen", admin_listen)
     app.router.add_post("/admin/api/listen", admin_listen)
     app.router.add_get("/admin/api/library", admin_library)
+    app.router.add_post("/admin/api/clean_memory", admin_clean_memory)
     app.router.add_post("/admin/api/library", admin_library)
     app.router.add_get("/admin/api/missions", admin_missions)
     app.router.add_post("/admin/api/missions", admin_missions)
@@ -10112,6 +10241,21 @@ ADMIN_HTML = r"""<!DOCTYPE html>
     <!-- Console d'administration -->
     <div class="view" id="v-admin">
       <h2 class="title">Console d'administration</h2>
+
+      <div class="adm-sec">
+        <h3>Nettoyage de la mémoire</h3>
+        <div style="color:var(--dim);font-size:13px;margin-bottom:12px">
+          Fait le ménage dans les notes de tout le monde : supprime les <b>doublons</b> (même info
+          répétée, on garde la plus récente) et les <b>contradictions</b> (deux infos incompatibles,
+          on garde la plus récente et on retire l'ancienne). Les notes que tu as écrites à la main
+          ne sont jamais touchées.
+        </div>
+        <div class="btnrow" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="mini" id="clean_go" onclick="cleanMemory(true, this)">🧹 Nettoyer (doublons + contradictions)</button>
+          <button class="mini ghost" onclick="cleanMemory(false, this)">⚡ Doublons seulement (rapide)</button>
+        </div>
+        <div style="color:var(--dim);font-size:12px;margin-top:8px">La détection des contradictions utilise le modèle (Cerebras) : un peu plus lente, mais elle comprend le sens.</div>
+      </div>
 
       <div class="adm-sec">
         <h3>Bibliothèque du forum</h3>
@@ -11073,6 +11217,18 @@ async function libAction(action, btn){
   }
 }
 
+async function cleanMemory(withLlm, btn){
+  const msg = withLlm
+    ? 'Nettoyer la mémoire (doublons + contradictions) ? Les notes écrites à la main sont préservées.'
+    : 'Retirer les doublons de toutes les fiches ?';
+  if(!window.confirm(msg)) return;
+  const {status, body} = await busy(btn, ()=>jpost('/admin/api/clean_memory', {contradictions: withLlm}), '…');
+  if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
+  if(body.task){
+    taskFollow(body.task, 'Nettoyage de la mémoire', ()=>{ if(window._curUser) openUser(window._curUser); });
+  }
+}
+
 function renderListen(body){
   const box = $('#listenBox');
   $('#s_ecoute').value = body.mode || 'tous';
@@ -11179,10 +11335,13 @@ async function openUser(uid){
       '<div style="color:var(--dim);font-size:11px;margin-top:4px">'+
         '<span style="color:'+(impColor[n.importance]||'#888')+'">●</span> '+esc(n.importance)+
         ' · '+n.age_jours+'j'+
+        (n.confidence && n.confidence!=='normale'?' · fiabilité '+esc(n.confidence):'')+
         (n.reviews?' · revue '+n.reviews+'×':'')+
         (n.author && n.author!=='IA'?' · ✍ '+esc(n.author):'')+
         (n.category?' · '+esc(n.category):'')+
-      '</div></div>').join('') || '<div style="color:var(--dim)">Aucune note sur cette personne.</div>';
+      '</div>'+
+      (n.context?'<div style="color:var(--dim);font-size:11px;margin-top:2px;font-style:italic">↳ '+esc(n.context)+'</div>':'')+
+      '</div>').join('') || '<div style="color:var(--dim)">Aucune note sur cette personne.</div>';
 
   const badges = (body.is_master?'<span class="badge master">MAÎTRE</span>':'')
     + (body.is_admin && !body.is_master?'<span class="badge">admin</span>':'')
