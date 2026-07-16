@@ -4680,6 +4680,8 @@ async def _library_summarize_one(url):
     title, ptxt, _pages, _links, _sections = got
     if title:
         entry["titre"] = title.strip()[:160]
+    # On garde AUSSI le contenu complet dans la copie interne (page /forum).
+    set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt)
 
     try:
         resp = await extract_completion(
@@ -4721,6 +4723,7 @@ async def library_summarize_batch(n=LIBRARY_BATCH, progress=None):
         # qu'il ait réussi ou échoué (vide), on le sort de la file : on ne boucle pas dessus
         if url in meta["a_resumer"]:
             meta["a_resumer"].remove(url)
+    save_forum_content()
     mark_memory_dirty()
     return {"faits": faits, "restants": len(meta["a_resumer"])}
 
@@ -4752,6 +4755,162 @@ def library_targets(sujet, limit=5):
     lecture, pas à répondre à la place. Réponse toujours fraîche, mais on sait où chercher."""
     hits = library_lookup(sujet, limit=limit)
     return [h for h in hits if h.get("url")]
+
+# ============================================================
+# COPIE INTERNE DU FORUM — le CONTENU complet de chaque sujet
+# ============================================================
+# L'index (titre/chemin/mots-clés) reste dans memoire.json (léger, relu souvent). Le CONTENU
+# complet — potentiellement plusieurs Mo — vit dans un fichier À PART, écrit seulement lors d'une
+# copie/mise à jour. C'est la « vraie copie du forum » consultable dans la page /forum.
+FORUM_CONTENT_FILE = os.getenv("FORUM_CONTENT_FILE", "forum_content.json")
+FORUM_CONTENT_MAX_CHARS = 14000       # copie bornée par sujet (évite les fiches interminables)
+_forum_content = None
+_forum_content_dirty = False
+
+def forum_content():
+    """Charge (paresseusement) la copie du forum : { url: {titre, chemin, contenu, maj} }."""
+    global _forum_content
+    if _forum_content is None:
+        try:
+            with open(FORUM_CONTENT_FILE, encoding="utf-8") as f:
+                _forum_content = json.load(f)
+        except Exception:
+            _forum_content = {}
+    return _forum_content
+
+def set_forum_content(url, titre, chemin, texte):
+    global _forum_content_dirty
+    fc = forum_content()
+    fc[url] = {"titre": (titre or "")[:200], "chemin": chemin or "",
+               "contenu": (texte or "").strip()[:FORUM_CONTENT_MAX_CHARS],
+               "maj": now().strftime("%Y-%m-%d %H:%M")}
+    _forum_content_dirty = True
+
+def save_forum_content(force=False):
+    global _forum_content_dirty
+    if _forum_content is None or (not _forum_content_dirty and not force):
+        return
+    try:
+        tmp = FORUM_CONTENT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_forum_content, f, ensure_ascii=False)
+        os.replace(tmp, FORUM_CONTENT_FILE)
+        _forum_content_dirty = False
+    except Exception as e:
+        print(f"⚠️ Sauvegarde de la copie forum : {str(e)[:80]}")
+
+def forum_content_stats():
+    fc = forum_content()
+    octets = 0
+    try:
+        octets = os.path.getsize(FORUM_CONTENT_FILE)
+    except OSError:
+        pass
+    avec = sum(1 for e in fc.values() if e.get("contenu"))
+    return {"sujets_copies": avec, "octets": octets}
+
+def forum_tree():
+    """Arborescence pour la page /forum : rubrique -> [ {url, titre, maj, copie} ], à partir de
+    l'index (library) enrichi de l'info « contenu présent » (forum_content)."""
+    lib = library()
+    fc = forum_content()
+    sections = {}
+    for url, e in lib.items():
+        chemin = e.get("chemin", "") or "(sans rubrique)"
+        rubrique = chemin.split("›")[0].strip() if chemin else "(sans rubrique)"
+        sections.setdefault(rubrique, []).append({
+            "url": url, "titre": e.get("titre", "") or _slug_title(url),
+            "chemin": chemin, "maj": e.get("maj", ""),
+            "copie": bool(fc.get(url, {}).get("contenu")),
+        })
+    for arr in sections.values():
+        arr.sort(key=lambda t: t["titre"].lower())
+    return dict(sorted(sections.items(), key=lambda kv: kv[0].lower()))
+
+def forum_search(q, limit=30):
+    """Recherche interne dans la copie du forum : titre, rubrique, mots-clés ET contenu complet.
+    Renvoie des résultats avec un court extrait autour du terme trouvé."""
+    termes = [t for t in _norm(q or "").split() if len(t) >= 3]
+    if not termes:
+        return []
+    lib = library()
+    fc = forum_content()
+    out = []
+    for url, e in lib.items():
+        titre = e.get("titre", "")
+        contenu = fc.get(url, {}).get("contenu", "")
+        hay = _norm(f"{titre} {e.get('chemin','')} {e.get('resume','')} {contenu}")
+        score = sum((5 if t in _norm(titre) else 1) for t in termes if t in hay)
+        if not score:
+            continue
+        extrait, cl = "", contenu.lower()
+        for t in termes:
+            i = cl.find(t)
+            if i >= 0:
+                a = max(0, i - 60)
+                extrait = ("…" if a > 0 else "") + contenu[a:i + 140].strip() + "…"
+                break
+        out.append((score, {"url": url, "titre": titre, "chemin": e.get("chemin", ""),
+                            "extrait": extrait, "copie": bool(contenu)}))
+    out.sort(key=lambda x: -x[0])
+    return [r for _s, r in out[:limit]]
+
+async def library_copy_all(progress=None, with_keywords=True):
+    """COPIE COMPLÈTE : (re)cartographie le forum puis LIT et STOCKE le contenu de chaque sujet
+    (et ses mots-clés si le quota le permet). C'est ce qui remplit la copie interne consultable."""
+    if progress:
+        progress(3, "Cartographie du forum…")
+    rep = await library_map(progress=lambda p, e="": progress and progress(min(25, 3 + p // 5), e))
+    if not rep.get("ok"):
+        return {"ok": False, "raison": rep.get("raison", "forum injoignable"), "copies": 0}
+
+    lib = library()
+    urls = list(lib.keys())
+    total = len(urls) or 1
+    copies = 0
+
+    async def grab(u):
+        await asyncio.sleep(0.15)
+        return await _fetch_raw(u)
+
+    for i, url in enumerate(urls, 1):
+        if progress:
+            progress(25 + int(70 * i / total), f"Copie {i}/{total}…")
+        entry = lib.get(url, {})
+        got = await _read_topic_fully(grab, url, entry.get("titre", ""))
+        if not got or not got[1].strip():
+            continue
+        title, ptxt, _pages, _links, _sections = got
+        if title:
+            entry["titre"] = title.strip()[:160]
+        set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt)
+        copies += 1
+        # Mots-clés (bonus, pour la recherche interne) — seulement si le quota tient.
+        if with_keywords and not quota_exhausted():
+            try:
+                resp = await extract_completion(
+                    [{"role": "system", "content": LIBRARY_SUMMARY_SYSTEM},
+                     {"role": "user", "content": f"Titre : {entry.get('titre','')}\n"
+                                                 f"Rubrique : {entry.get('chemin','')}\n\n"
+                                                 f"Contenu :\n{ptxt[:LIBRARY_TEXT_FOR_SUMMARY]}"}],
+                    max_tokens=60, temperature=0.1)
+                mots = " ".join((resp.choices[0].message.content or "").split())[:LIBRARY_KEYWORDS_MAX]
+                if mots:
+                    entry["resume"] = mots
+                    entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
+            except Exception as e:
+                note_quota_error(e)
+        if copies % 10 == 0:
+            save_forum_content()
+            mark_memory_dirty()
+
+    save_forum_content(force=True)
+    mark_memory_dirty()
+    # plus rien à résumer en fond : on a déjà tout lu
+    library_meta()["a_resumer"] = [u for u in library_meta().get("a_resumer", []) if not _library_fresh(lib.get(u, {}))]
+    if progress:
+        progress(100, f"{copies} sujet(s) copiés")
+    return {"ok": True, "copies": copies, "sujets": len(urls)}
 
 # ============================================================
 # ONBOARDING SERVEUR — fiches auto + observation discrète
@@ -10207,6 +10366,7 @@ async def admin_library(request):
 
     if request.method == "GET":
         return web.json_response({"stats": library_stats(),
+                                  "copie": forum_content_stats(),
                                   "actif": bool(get_setting("forum_library", True)),
                                   "forum": FORUM_URL})
 
@@ -10224,10 +10384,13 @@ async def admin_library(request):
         memory()["forum_library"] = {}
         memory()["forum_library_meta"] = {"derniere_carte": "", "a_resumer": [],
                                           "total_sujets": 0, "en_cours": False}
+        global _forum_content
+        _forum_content = {}
+        save_forum_content(force=True)      # vide aussi la copie de contenu sur disque
         mark_memory_dirty()
         await flush_memory()
-        audit_log("biblio", "vidée")
-        return web.json_response({"ok": True, "stats": library_stats(),
+        audit_log("biblio", "vidée (index + copie)")
+        return web.json_response({"ok": True, "stats": library_stats(), "copie": forum_content_stats(),
                                   "actif": bool(get_setting("forum_library", True)), "forum": FORUM_URL})
 
     if action == "carte":
@@ -10273,9 +10436,28 @@ async def admin_library(request):
         asyncio.create_task(_run())
         return web.json_response({"ok": True, "task": tid})
 
-    return web.json_response({"error": "action inconnue"}, status=400)
+    if action == "copie":
+        tid = task_new("Copie complète du forum")
 
-async def admin_listen(request):
+        async def _run():
+            try:
+                task_step(tid, 3, "Cartographie…")
+                rep = await library_copy_all(progress=lambda p, e="": task_step(tid, p, e))
+                if not rep.get("ok"):
+                    task_done(tid, f"Échec : {rep.get('raison', 'forum injoignable')}", ok=False)
+                    return
+                await flush_memory()
+                cs = forum_content_stats()
+                task_done(tid, f"{rep['copies']} sujet(s) copiés sur {rep['sujets']}. "
+                               f"Copie interne : {cs['sujets_copies']} fiches "
+                               f"({cs['octets'] // 1024} Ko). Consultable dans /forum.")
+            except Exception as e:
+                task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+        asyncio.create_task(_run())
+        return web.json_response({"ok": True, "task": tid})
+
+    return web.json_response({"error": "action inconnue"}, status=400)
     """Les salons que Tenebris écoute. Par défaut : tous — on les met en sourdine un par un."""
     guard = _auth_guard(request)
     if guard:
@@ -10513,7 +10695,150 @@ async def admin_missions(request):
 
     return web.json_response({"error": "action inconnue"}, status=400)
 
+FORUM_HTML = r"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forum — copie interne de Tenebris</title>
+<style>
+:root{--bg:#0e0d13;--panel:#17151f;--panel2:#1e1b28;--line:#2c2838;--txt:#e7e3f0;--dim:#9a93ad;--acc:#b57edc;--acc2:#7c5cbf}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);height:100vh;display:flex;flex-direction:column}
+header{padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+header h1{font-size:16px;margin:0;color:var(--acc)}
+header .stats{color:var(--dim);font-size:12px}
+header a{color:var(--acc);text-decoration:none;font-size:13px}
+#search{margin-left:auto;display:flex;gap:6px}
+#search input{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 10px;width:240px}
+#search button{background:var(--acc2);border:0;color:#fff;border-radius:8px;padding:7px 12px;cursor:pointer}
+main{flex:1;display:flex;min-height:0}
+#tree{width:340px;overflow:auto;border-right:1px solid var(--line);background:var(--panel)}
+#view{flex:1;overflow:auto;padding:22px 26px}
+.sec{border-bottom:1px solid var(--line)}
+.sec>.h{padding:10px 14px;cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:8px;color:var(--acc)}
+.sec>.h:hover{background:var(--panel2)}
+.sec .items{display:none}
+.sec.open .items{display:block}
+.topic{padding:7px 14px 7px 26px;cursor:pointer;font-size:13.5px;color:var(--txt);border-left:3px solid transparent;display:flex;gap:6px;align-items:center}
+.topic:hover{background:var(--panel2)}
+.topic.active{background:var(--panel2);border-left-color:var(--acc)}
+.dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.dot.ok{background:#5fd68a}.dot.no{background:#54506a}
+.count{color:var(--dim);font-weight:400;font-size:12px}
+#view h2{color:var(--acc);margin:0 0 4px}
+#view .path{color:var(--dim);font-size:13px;margin-bottom:2px}
+#view .maj{color:var(--dim);font-size:12px;margin-bottom:16px}
+#view .kw{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--dim);font-size:13px;margin-bottom:16px}
+#view pre{white-space:pre-wrap;word-wrap:break-word;line-height:1.55;font-family:inherit;font-size:14.5px;margin:0}
+#view a.src{color:var(--acc);font-size:12px;text-decoration:none}
+.empty{color:var(--dim);margin-top:40px;text-align:center}
+.res{padding:12px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+.res:hover{background:var(--panel2)}
+.res .t{color:var(--acc);font-weight:600}
+.res .x{color:var(--dim);font-size:12.5px;margin-top:3px}
+</style></head>
+<body>
+<header>
+  <h1>📚 Forum — copie interne</h1>
+  <span class="stats" id="stats">…</span>
+  <a href="/admin">← retour admin</a>
+  <div id="search"><input id="q" placeholder="Rechercher dans le forum…" />
+    <button onclick="doSearch()">Chercher</button></div>
+</header>
+<main>
+  <div id="tree"></div>
+  <div id="view"><div class="empty">Choisis un sujet à gauche, ou lance une recherche.</div></div>
+</main>
+<script>
+const esc = s => (s||"").replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function api(params){ const r = await fetch("/admin/api/forum?"+params); if(r.status===401){location.href="/admin";return null;} return r.json(); }
+async function load(){
+  const d = await api("action=tree"); if(!d) return;
+  const s = d.stats||{};
+  document.getElementById("stats").textContent =
+     `${s.total||0} sujets · ${s.sujets_copies||0} copiés (${Math.round((s.octets||0)/1024)} Ko) · ${d.forum||""}`;
+  const tree = d.tree||{}; const box = document.getElementById("tree"); box.innerHTML="";
+  for(const [sec, items] of Object.entries(tree)){
+    const div = document.createElement("div"); div.className="sec";
+    div.innerHTML = `<div class="h">${esc(sec)} <span class="count">${items.length}</span></div><div class="items"></div>`;
+    const it = div.querySelector(".items");
+    items.forEach(t=>{
+      const el=document.createElement("div"); el.className="topic";
+      el.innerHTML=`<span class="dot ${t.copie?'ok':'no'}"></span>${esc(t.titre)}`;
+      el.onclick=()=>openTopic(t.url, el);
+      it.appendChild(el);
+    });
+    div.querySelector(".h").onclick=()=>div.classList.toggle("open");
+    box.appendChild(div);
+  }
+}
+let cur=null;
+async function openTopic(url, el){
+  if(cur) cur.classList.remove("active"); if(el){el.classList.add("active");cur=el;}
+  const d = await api("action=topic&url="+encodeURIComponent(url)); if(!d) return;
+  const v=document.getElementById("view");
+  if(d.error){v.innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
+  v.innerHTML = `<h2>${esc(d.titre)}</h2>`
+    + (d.chemin?`<div class="path">${esc(d.chemin)}</div>`:``)
+    + `<div class="maj">Copié le ${esc(d.maj||"?")} · <a class="src" href="${esc(d.url)}" target="_blank">voir sur le forum ↗</a></div>`
+    + (d.resume?`<div class="kw">🔑 ${esc(d.resume)}</div>`:``)
+    + (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » dans l'admin.</div>`);
+  v.scrollTop=0;
+}
+async function doSearch(){
+  const q=document.getElementById("q").value.trim(); if(!q) return;
+  const d=await api("action=search&q="+encodeURIComponent(q)); if(!d) return;
+  const v=document.getElementById("view");
+  const rs=d.resultats||[];
+  if(!rs.length){v.innerHTML=`<div class="empty">Rien trouvé pour « ${esc(q)} ».</div>`;return;}
+  v.innerHTML=`<h2>${rs.length} résultat(s) pour « ${esc(q)} »</h2>`+rs.map(r=>
+    `<div class="res" onclick='openTopic(${JSON.stringify(r.url)})'>
+       <div class="t">${esc(r.titre)}</div>
+       <div class="x">${esc(r.chemin)}</div>
+       ${r.extrait?`<div class="x">${esc(r.extrait)}</div>`:``}
+     </div>`).join("");
+}
+document.getElementById("q").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();});
+load();
+</script>
+</body></html>"""
+
+async def admin_forum_api(request):
+    """Données de la page /forum : arborescence, contenu d'un sujet, recherche interne."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    action = request.query.get("action", "tree")
+    if action == "tree":
+        return web.json_response({"forum": FORUM_URL, "tree": forum_tree(),
+                                  "stats": {**library_stats(), **forum_content_stats()}})
+    if action == "topic":
+        url = request.query.get("url", "")
+        e = forum_content().get(url)
+        lib_e = library().get(url, {})
+        if not e and not lib_e:
+            return web.json_response({"error": "sujet inconnu"}, status=404)
+        return web.json_response({
+            "url": url,
+            "titre": (e or lib_e).get("titre", ""),
+            "chemin": lib_e.get("chemin", "") or (e or {}).get("chemin", ""),
+            "resume": lib_e.get("resume", ""),
+            "contenu": (e or {}).get("contenu", ""),
+            "maj": (e or {}).get("maj", "") or lib_e.get("maj", ""),
+        })
+    if action == "search":
+        return web.json_response({"resultats": forum_search(request.query.get("q", ""))})
+    return web.json_response({"error": "action inconnue"}, status=400)
+
+async def admin_forum_page(request):
+    if not _is_authed(request):
+        # pas connecté → on renvoie vers le panneau pour se logger (même session)
+        raise web.HTTPFound("/admin")
+    return web.Response(text=FORUM_HTML, content_type="text/html")
+
 def _register_admin_routes(app):
+    app.router.add_get("/forum", admin_forum_page)
+    app.router.add_get("/forum/", admin_forum_page)
+    app.router.add_get("/admin/api/forum", admin_forum_api)
     app.router.add_get("/admin", admin_index)
     app.router.add_get("/admin/", admin_index)
     app.router.add_post("/admin/api/login", admin_login)
@@ -11034,14 +11359,16 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <div class="adm-sec">
         <h3>Bibliothèque du forum</h3>
         <div style="color:var(--dim);font-size:13px;margin-bottom:12px">
-          Tenebris tient une <b>carte du forum</b> avec, pour chaque sujet, un court résumé mémorisé.
-          Elle s'en sert pour répondre <b>vite</b> sans tout relire à chaque fois. Elle la remplit
-          toute seule en fond ; les résumés sont revérifiés tous les 30 jours. Le forum de référence
-          est <b id="lib_forum">—</b>.
+          Tenebris tient une <b>copie interne du forum</b> : pour chaque sujet, le chemin, un court
+          résumé, et — depuis la <b>copie complète</b> — le <b>contenu intégral</b> du sujet, relisible
+          hors ligne. Elle remplit la carte toute seule en fond ; la copie complète, elle, se lance à
+          la demande. Le forum de référence est <b id="lib_forum">—</b>.
+          <a href="/forum" target="_blank" style="color:var(--acc);margin-left:6px">📚 Ouvrir /forum ↗</a>
         </div>
         <div id="lib_stats" style="font-size:13px;margin-bottom:12px;color:var(--dim)">Chargement…</div>
         <div class="btnrow" style="flex-wrap:wrap;gap:8px">
-          <button class="mini" id="lib_map" onclick="libAction('carte', this)">🗺️ Cartographier le forum</button>
+          <button class="mini" id="lib_copy" onclick="libAction('copie', this)">📚 Copie complète (contenu)</button>
+          <button class="mini ghost" id="lib_map" onclick="libAction('carte', this)">🗺️ Cartographier</button>
           <button class="mini ghost" id="lib_sum" onclick="libAction('resumer', this)">📖 Indexer maintenant</button>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-left:auto">
             <input type="checkbox" id="lib_toggle" onchange="libToggle()"> Remplissage automatique
@@ -11967,6 +12294,7 @@ function renderLibrary(d){
   $('#lib_stats').innerHTML =
     '<b style="color:var(--txt)">'+s.total+'</b> sujets cartographiés · '+
     '<b style="color:#7ddc9a">'+s.resumes+'</b> résumés à jour ('+pct+' %) · '+
+    ((d.copie&&d.copie.sujets_copies)? ('<b style="color:var(--acc)">'+d.copie.sujets_copies+'</b> copiés intégralement ('+Math.round((d.copie.octets||0)/1024)+' Ko) · ') : '')+
     (s.a_faire? ('<b>'+s.a_faire+'</b> en attente · ') : '')+
     'dernière carte : '+(s.derniere_carte||'jamais');
 }
@@ -11984,7 +12312,8 @@ async function libAction(action, btn){
   const {status, body} = await busy(btn, ()=>jpost('/admin/api/library', {action}), '…');
   if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
   if(body.task){
-    taskFollow(body.task, action==='carte'?'Cartographie du forum':'Résumés du forum', loadLibrary);
+    const lbl = action==='carte'?'Cartographie du forum':(action==='copie'?'Copie complète du forum':'Résumés du forum');
+    taskFollow(body.task, lbl, loadLibrary);
   } else {
     renderLibrary(body);
     if(action==='vider') toast('Bibliothèque vidée.');
