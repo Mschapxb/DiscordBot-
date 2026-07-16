@@ -10458,6 +10458,8 @@ async def admin_library(request):
         return web.json_response({"ok": True, "task": tid})
 
     return web.json_response({"error": "action inconnue"}, status=400)
+
+async def admin_listen(request):
     """Les salons que Tenebris écoute. Par défaut : tous — on les met en sourdine un par un."""
     guard = _auth_guard(request)
     if guard:
