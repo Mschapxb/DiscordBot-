@@ -6993,7 +6993,12 @@ _DELIB_SKIP = re.compile(
 
 def needs_deliberation(content):
     """Décide seule si la question mérite un conseil (évite de brûler des tokens pour rien)."""
-    if not get_setting("deliberation", True) or quota_exhausted():
+    if not get_setting("deliberation", True):
+        return False
+    # Le conseil tourne en priorité sur Mistral (moins bridé) ; on ne le coupe donc PAS quand
+    # seul le quota Cerebras est épuisé. On n'y renonce que si aucun modèle ne peut délibérer.
+    mistral_ok = bool(MISTRAL_API_KEY) and LLM_PREFER_MISTRAL and not provider_paused("mistral")
+    if not mistral_ok and quota_exhausted():
         return False
     text = (content or "").strip()
     if not text or _DELIB_SKIP.match(text):
@@ -7010,10 +7015,24 @@ def needs_deliberation(content):
     return False
 
 async def _agent(system, user, max_tokens=DELIB_MAX_TOKENS, temperature=0.4):
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    # « Plus de liberté » : le CONSEIL délibère sur Mistral (moins bridé) quand c'est possible —
+    # ainsi le fond ET la réponse finale (déjà routée Mistral) échappent à la censure de Cerebras.
+    # Repli propre sur l'analyse Cerebras si Mistral manque, est en pause ou échoue.
+    if MISTRAL_API_KEY and LLM_PREFER_MISTRAL and not provider_paused("mistral"):
+        try:
+            resp = await _call_openai_compat("mistral", MISTRAL_URL, MISTRAL_API_KEY,
+                                             MISTRAL_MODEL, messages, None, temperature, max_tokens)
+            txt = (resp.choices[0].message.content or "").strip()
+            if txt:
+                return txt
+        except Exception as e:
+            if _is_rate_limit(e):
+                pause_provider("mistral")
+            print(f"⚠️ Agent Mistral indispo, repli analyse : {str(e)[:70]}")
     resp = await extract_completion(
-        [{"role": "system", "content": system},
-         {"role": "user", "content": user}],
-        max_tokens=max_tokens, temperature=temperature, effort="medium",
+        messages, max_tokens=max_tokens, temperature=temperature, effort="medium",
     )
     return (resp.choices[0].message.content or "").strip()
 
