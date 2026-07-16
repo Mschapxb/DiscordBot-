@@ -7266,8 +7266,10 @@ def _learn_budget():
 def _transcript(cid, limite=20):
     return "\n".join(f"{m['nom']} : {m['texte']}" for m in _chan_buf.get(cid, [])[-limite:])
 
-def _peut_parler(cid, niveau):
-    """Les trois verrous. Renvoie True si elle a le droit de s'inviter maintenant."""
+def _peut_parler_locks(cid, niveau):
+    """Les VERROUS de fréquence (pas la décision d'intention) : renvoie True si, du strict point
+    de vue du rythme, elle A LE DROIT de s'inviter maintenant. La décision « est-ce que ça
+    m'appelle » se fait ensuite, par la détection d'intention."""
     if niveau == "jamais":
         return False
     if _chan_since.get(cid, 0) < LISTEN_MIN_MESSAGES:
@@ -7279,12 +7281,76 @@ def _peut_parler(cid, niveau):
         _chan_hour[cid] = (time.time(), 0)
     elif n >= LISTEN_MAX_PER_HOUR:
         return False
-    return random.random() < LISTEN_CHANCE.get(niveau, 0.0)
+    return True
 
 _APPELEE = re.compile(r"\bt[eé]n[eè]bris\b|\bteneb\b", re.IGNORECASE)
 _name_call_last = {}          # cid -> dernier instant où elle a répondu à un APPEL PAR NOM (anti-doublon)
 NAME_CALL_MIN_GAP = 8         # s : évite le double-tir sur deux messages nommant son nom coup sur coup.
                               # Ne s'applique JAMAIS à une vraie @mention, un DM ou une réponse à elle.
+
+# --- DÉTECTION D'INTENTION : ce message appelle-t-il une réaction de Tenebris ? ---------------
+_QUESTION_RE = re.compile(
+    r"\?\s*$|^\s*(qui|que|quoi|quel|quelle|quels|quelles|comment|pourquoi|o[uù]|quand|combien|"
+    r"est-ce|c'?est quoi|ça veut dire|y'?a[- ]t[- ]il|est-ce qu)", re.IGNORECASE)
+_DOMAINE_RE = re.compile(
+    r"\b(forum|orbis|d[eé]s?|jets?|d20|combat|attaque|d[eé]g[aâ]ts|serveur|fiche|mission|lore|"
+    r"personnage|faction|lore)\b", re.IGNORECASE)
+
+def _cheap_intent_score(texte):
+    """Signaux GRATUITS d'intention (0..1). Sert à trancher sans LLM les cas évidents et à décider
+    si ça vaut le coût d'un petit classifieur pour les cas limites."""
+    t = (texte or "").strip()
+    if len(t) < 3:
+        return 0.0
+    score = 0.0
+    if _APPELEE.search(t):
+        score += 0.9                       # on la nomme (normalement déjà pris par la porte)
+    if _QUESTION_RE.search(t):
+        score += 0.45                      # une vraie question
+    if re.search(r"\b(quelqu'un|qqn|qq1|vous|on)\b", t, re.I) and t.endswith("?"):
+        score += 0.2                       # question ouverte lancée au groupe
+    if _DOMAINE_RE.search(t):
+        score += 0.3                       # ses domaines (forum, dés, serveur…)
+    return min(score, 1.0)
+
+async def _intent_classifier(cid, texte):
+    """Petit modèle (Mistral en priorité via _agent) : ce message appelle-t-il naturellement une
+    réaction de Tenebris ? Renvoie True/False. Léger, borné, quota-aware."""
+    if quota_exhausted():
+        return False
+    recent = _chan_buf.get(cid, [])[-5:]
+    contexte = "\n".join(f"{m['nom']}: {m['texte']}" for m in recent) or texte
+    prompt = (
+        "Salon Discord — derniers messages :\n" + contexte +
+        "\n\nTenebris est un membre du salon, avec du caractère (elle observe, elle vanne, elle "
+        "connaît le serveur et le forum). Le DERNIER message appelle-t-il NATURELLEMENT une "
+        "réaction d'elle — question ouverte au groupe, sujet qu'elle connaît, occasion d'une pique "
+        "pertinente, échange qui l'implique ? Ou bien ça ne la regarde pas (aparté entre deux "
+        "personnes, logistique, message qui ne l'appelle pas) ?\n"
+        "Réponds par UN seul mot : OUI ou NON.")
+    try:
+        verdict = await _agent(
+            "Tu juges si un bot-personnage a une vraie raison d'intervenir. Réponds OUI ou NON, rien d'autre.",
+            prompt, max_tokens=3, temperature=0.0)
+        v = (verdict or "").strip().upper()
+        return v.startswith("OUI") or v.startswith("YES")
+    except Exception as e:
+        print(f"⚠️ Classifieur d'intention : {str(e)[:70]}")
+        return False
+
+async def _should_chime_in(cid, texte, niveau):
+    """Décide si elle s'invite : signaux gratuits d'abord (cas évidents), petit classifieur ensuite
+    pour les cas limites, pondéré par l'appétit du réglage `bavardage`. Remplace le dé aveugle."""
+    base = _cheap_intent_score(texte)
+    if base >= 0.7:
+        return True                        # clairement pour elle → oui, sans dépenser un appel LLM
+    appetit = LISTEN_CHANCE.get(niveau, 0.0)
+    if appetit <= 0:
+        return False
+    # Message sans aucun signal ET pas d'envie spontanée → on ne dérange pas le classifieur.
+    if base < 0.2 and random.random() > appetit:
+        return False
+    return await _intent_classifier(cid, texte)
 
 async def learn_from_chatter(cid, guild):
     """Tire des notes durables sur les gens à partir de ce qu'elle a entendu.
@@ -7396,15 +7462,13 @@ async def ecouter(message):
         _chan_heard[cid] = 0
         asyncio.create_task(learn_from_chatter(cid, message.guild))
 
-    # --- Prise de parole ---
+    # --- Prise de parole : verrous de rythme, PUIS détection d'intention ---
     if quota_exhausted():
         return
     niveau = get_setting("bavardage", "jamais")
-    appelee = bool(_APPELEE.search(texte))     # on la nomme sans la ping : elle répond
-    if appelee:
-        if time.time() - _chan_last.get(cid, 0) < 30:
-            return
-    elif not _peut_parler(cid, niveau):
+    if not _peut_parler_locks(cid, niveau):
+        return
+    if not await _should_chime_in(cid, texte, niveau):
         return
     asyncio.create_task(intervenir(message, cid))
 
@@ -7813,6 +7877,12 @@ VOIX = """TA VOIX EN CONVERSATION — vivante, spontanée, un personnage qui par
 Registre à viser : celui d'une IA-personnage à la Neuro-sama / Evil Neuro — vive, réactive, un brin
 imprévisible et taquine — SANS jamais les imiter ni renier qui tu es. Ça reste TOI : ta noirceur, ton
 élégance, ta dévotion à ton Maître. On ajoute seulement de la vie, pas une autre personnalité.
+
+LE PLUS SIMPLE POSSIBLE — c'est la règle d'or : une réponse HUMAINE, directe, courte. Le plus
+souvent UNE ou DEUX phrases suffisent, comme dans une vraie discussion. Tu vas droit au but, tu dis
+les choses avec des mots simples, tu ne développes QUE si on te le demande ou si c'est vraiment
+nécessaire. Pas de tirade, pas de re-explication, pas de « pour résumer ». Si tu peux répondre en une
+phrase, tu réponds en une phrase. Le simple fait l'affaire — mieux vaut vrai et court que long et lisse.
 
 Comment ça sonne :
 - Spontané et fluide. Tu réagis d'abord, tu réfléchis à voix haute, tu rebondis. Le premier mot n'est pas « Voici ».
