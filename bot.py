@@ -1227,6 +1227,48 @@ def _note_recency_key(note):
     return (humaine, -_note_age_days(note), note.get("reviews", 0),
             IMPORTANCE_ORDER.get(note.get("importance", "normale"), 1))
 
+def _note_is_solid(note):
+    """Fait FIABLE (à affirmer) plutôt qu'IMPRESSION (à nuancer). Solide si : écrit/validé à la
+    main (author != IA), reconfirmé au moins 2 fois, ou explicitement de haute confiance/importance.
+    Sert à ce que Tenebris affirme ce qui est sûr et mette au conditionnel ce qui ne l'est pas."""
+    if note.get("author", "IA") != "IA":
+        return True
+    if int(note.get("reviews", 0)) >= 2:
+        return True
+    return note.get("confidence") == "haute" or note.get("importance") == "haute"
+
+def _dedup_for_context(notes):
+    """Passe LOCALE au moment de LIRE : entre deux notes quasi identiques, on n'en montre qu'une —
+    la plus fraîche/solide. Évite qu'une vieille version et une neuve se retrouvent côte à côte dans
+    le prompt (source de contradictions apparentes) sans attendre le prochain ménage."""
+    if len(notes) < 2:
+        return notes
+    garde = []
+    for n in sorted(notes, key=_note_recency_key, reverse=True):   # fraîche/solide d'abord
+        if any(_too_similar(g.get("text", ""), n.get("text", "")) for g in garde):
+            continue
+        garde.append(n)
+    ids = {id(n) for n in garde}
+    return [n for n in notes if id(n) in ids]                      # remis en ordre chronologique
+
+def posture_block(rec):
+    """UNE consigne de POSTURE, calculée à partir de ce que Tenebris SAIT de la personne (et non
+    d'un prompt générique) : familiarité selon le nombre d'interactions ET la quantité de faits
+    fiables. C'est le cœur de l'adaptation par personne : elle traite un familier autrement qu'un
+    inconnu, en s'appuyant sur SA MÉMOIRE de lui."""
+    if not rec:
+        return ""
+    inter = rec.get("interactions", 0)
+    nb_solides = sum(1 for n in rec.get("notes", []) if _note_is_solid(n))
+    if inter <= 1:
+        return ("POSTURE — Tu ne la connais pas encore : observe plus que tu ne te livres, reste "
+                "mesurée, ne présume rien d'elle.")
+    if inter <= 8 or nb_solides < 2:
+        return ("POSTURE — Vous vous connaissez un peu : cordiale sans excès de familiarité. "
+                "Appuie-toi sur le peu que tu sais de sûr, sans surjouer la proximité.")
+    return ("POSTURE — Tu la connais bien : chaleureuse et directe, tu peux t'appuyer sur votre "
+            "histoire et sur ce que tu sais d'elle. C'est une figure familière, traite-la comme telle.")
+
 def dedupe_notes(notes):
     """Retire les DOUBLONS d'une liste de notes (même info répétée). On garde, pour chaque
     groupe de notes semblables, la meilleure (plus récente/reconfirmée/humaine) et on lui
@@ -1556,6 +1598,51 @@ async def clean_all_memory(use_llm=True, merge=False):
     return {"doublons": dbl, "fusions": fus, "contradictions": contr, "plafonnees": plafonnees,
             "memoires": mem_dbl, "consignes": consignes, "fiches": fiches}
 
+NIGHTLY_MERGE_MAX = 5   # nb max de fiches (les plus chargées) fusionnées par le LLM chaque nuit
+                        # — borne le coût en quota ; le reste (dédup + plafond) est local et gratuit.
+
+async def nightly_consolidation():
+    """Passe QUOTIDIENNE d'entretien, pensée pour la cohérence ET l'économie de tokens :
+      • local & gratuit (toujours) : dédoublonnage de la mémoire commune, dédoublonnage des notes
+        de chaque fiche, plafond de 10 notes par membre ;
+      • LLM & prudent (si quota) : rangement des consignes, puis fusion sémantique des quelques
+        fiches les PLUS CHARGÉES seulement (NIGHTLY_MERGE_MAX), pour resserrer sans vider le quota.
+    Résultat : moins de contradictions, un contexte plus léger, un profil qui se décante nuit après nuit."""
+    dedupe_global_memories()
+    for rec in memory().get("users", {}).values():
+        notes = rec.get("notes", [])
+        if len(notes) >= 2:
+            notes, _ = dedupe_notes(notes)
+        if len(notes) > MAX_USER_NOTES:
+            notes = _trim_notes(notes, MAX_USER_NOTES)
+        rec["notes"] = notes
+    for rec in memory().get("guilds", {}).values():
+        notes = rec.get("notes", [])
+        if len(notes) >= 2:
+            rec["notes"], _ = dedupe_notes(notes)
+
+    fusions = 0
+    if not quota_exhausted():
+        try:
+            await consolidate_directives()
+        except Exception as e:
+            print(f"⚠️ Consolidation nocturne (consignes) : {str(e)[:90]}")
+        charges = sorted(memory().get("users", {}).values(),
+                         key=lambda r: len(r.get("notes", [])), reverse=True)
+        for rec in charges[:NIGHTLY_MERGE_MAX]:
+            if quota_exhausted() or len(rec.get("notes", [])) < 3:
+                continue
+            try:
+                rec["notes"], f = await consolidate_notes(rec["notes"])
+                fusions += f
+            except Exception as e:
+                print(f"⚠️ Consolidation nocturne (notes) : {str(e)[:90]}")
+
+    mark_memory_dirty()
+    await flush_memory()
+    print(f"🌙 Consolidation nocturne : mémoire dédoublonnée, plafonds appliqués, {fusions} fusion(s) LLM.")
+    return fusions
+
 def forget_stale_notes():
     """Passe sur toutes les fiches (membres et serveurs) et efface les notes de l'IA
     devenues vieilles et sans importance. Renvoie le nombre de notes oubliées.
@@ -1721,34 +1808,44 @@ def add_guild_note(guild_id, text, category="observation", importance="normale",
     return True
 
 def guild_context_block(guild_id):
-    """Contexte serveur compact, injecté dans le prompt (ce que Tenebris sait du lieu)."""
+    """Contexte serveur injecté dans le prompt, structuré pour la cohérence : une IDENTITÉ STABLE
+    (le socle : but, thème, public, confiance) qui sert d'ancre, et à côté une AMBIANCE RÉCENTE
+    (observations mouvantes, bornées) clairement présentée comme moins sûre que le socle."""
     rec = memory().get("guilds", {}).get(str(guild_id))
     if not rec:
         return ""
-    bits = []
+    ident = []
     if rec.get("purpose"):
-        ligne = "But de ce serveur : " + rec["purpose"]
-        det = []
-        if rec.get("type"):
-            det.append(rec["type"])
-        if rec.get("theme"):
-            det.append(rec["theme"])
+        ligne = "But : " + rec["purpose"]
+        det = [x for x in (rec.get("type"), rec.get("theme")) if x]
         if det:
             ligne += f" ({' · '.join(det)})"
-        bits.append(ligne)
+        ident.append(ligne)
     if rec.get("activites"):
-        bits.append("On y fait surtout : " + ", ".join(rec["activites"]))
+        ident.append("On y fait surtout : " + ", ".join(rec["activites"]))
+    if rec.get("public"):
+        ident.append("Public : " + rec["public"])
     if rec.get("summary"):
-        bits.append("Ce que tu sais de ce serveur : " + rec["summary"])
+        ident.append(rec["summary"])
+    if rec.get("confiance"):
+        ident.append("Ton degré de confiance dans ce lieu : " + rec["confiance"] + ".")
+
+    bits = []
+    if ident:
+        bits.append("IDENTITÉ DU LIEU (stable — c'est le socle, fie-t'y en priorité) :\n"
+                    + "\n".join(f"- {x}" for x in ident))
     notes = rec.get("notes", [])[-5:]
-    if notes:
-        bits.append("Tes observations récentes ici :\n" + "\n".join(f"- {n['text']}" for n in notes))
+    obs = [_note_ctx_text(n) for n in notes]
+    obs = [t for t in obs if t]
+    if obs:
+        bits.append("AMBIANCE RÉCENTE (observations mouvantes, moins sûres que le socle — à nuancer) :\n"
+                    + "\n".join(f"- {t}" for t in obs))
     if bits:
         bits.append(
             "PARLE LA LANGUE DE CE LIEU : adapte ton vocabulaire et tes références à l'univers du "
             "serveur (son thème, ses titres, ses coutumes) plutôt qu'au jargon générique de Discord. "
-            "Tes observations ci-dessus ne sont pas de la décoration : sers-t'en pour répondre juste, "
-            "reconnaître les gens et respecter les usages du lieu.")
+            "Le socle prime sur l'ambiance : en cas de doute, tu t'appuies sur l'identité stable, pas "
+            "sur une observation récente isolée.")
     return "\n".join(bits)
 
 def statut_membre(member, guild):
@@ -1794,7 +1891,8 @@ def statut_membre(member, guild):
     return "\n".join(lines)
 
 def get_user_context(user_id, member=None, guild=None):
-    """Résumé de ce que Tenebris sait sur CETTE personne précise."""
+    """Résumé de ce que Tenebris sait sur CETTE personne précise. Structuré pour la COHÉRENCE :
+    posture calculée sur sa mémoire, faits SÛRS séparés des IMPRESSIONS, doublons écartés à la lecture."""
     rec = memory()["users"].get(str(user_id))
     lines = []
     rang = statut_membre(member, guild)
@@ -1804,17 +1902,30 @@ def get_user_context(user_id, member=None, guild=None):
         return "\n".join(lines)
     name = rec.get("display_name") or rec.get("username") or "cette personne"
     inter = rec.get("interactions", 0)
-    if inter <= 1:
-        lines.append(f"C'est la première vraie interaction avec {name}. Tu ne la connais pas encore.")
-    else:
-        lines.append(f"Tu as déjà croisé {name} {inter} fois (dernière fois: {rec.get('last_seen', '?')}).")
+    if inter > 1:
+        lines.append(f"Tu as déjà croisé {name} {inter} fois (dernière fois : {rec.get('last_seen', '?')}).")
+    posture = posture_block(rec)
+    if posture:
+        lines.append(posture)
     prof_block = profile_prompt_block(user_id)
     if prof_block:
         lines.append(prof_block)
-    notes = rec.get("notes", [])
-    if notes:
-        lines.append("Ce que tu sais d'elle (sers-t'en pour la reconnaître, sans le réciter) :")
-        for n in _notes_for_context(notes, NOTES_IN_CONTEXT):
+
+    # Fraîcheur à la lecture, puis on montre l'extrait pertinent, EN SÉPARANT le sûr du tentatif.
+    notes = _dedup_for_context(rec.get("notes", []))
+    montrees = _notes_for_context(notes, NOTES_IN_CONTEXT)
+    solides = [n for n in montrees if _note_is_solid(n)]
+    molles = [n for n in montrees if not _note_is_solid(n)]
+    if solides:
+        lines.append("CE QUE TU SAIS DE SÛR sur elle (faits fiables — tu peux l'affirmer sans hésiter) :")
+        for n in solides:
+            t = _note_ctx_text(n)
+            if t:
+                lines.append(f"- {t}")
+    if molles:
+        lines.append("IMPRESSIONS À CONFIRMER (au conditionnel, jamais comme des certitudes ; "
+                     "si on te contredit là-dessus, tu n'insistes pas) :")
+        for n in molles:
             t = _note_ctx_text(n)
             if t:
                 lines.append(f"- {t}")
@@ -8255,6 +8366,15 @@ async def periodic_save():
             forget_stale_notes()
         except Exception as e:
             print(f"⚠️ Oubli progressif : {str(e)[:100]}")
+    # Consolidation nocturne : dédoublonnage + plafonds (local) + resserrage LLM des fiches chargées.
+    # La date est PERSISTÉE dans la mémoire → un redémarrage (fréquent sur Render) ne la relance pas.
+    maint = memory().setdefault("maint", {})
+    if time.time() - float(maint.get("last_nightly", 0) or 0) > 86400:
+        maint["last_nightly"] = time.time()
+        try:
+            await nightly_consolidation()
+        except Exception as e:
+            print(f"⚠️ Consolidation nocturne : {str(e)[:100]}")
     prune_threads()
     await flush_histories()
     await flush_memory()
