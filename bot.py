@@ -143,11 +143,15 @@ HISTORY_KEEP_RAW = 8          # messages gardés intacts lors d'une condensation
 SUMMARY_MAX_TOKENS = 350      # taille max du résumé glissant (marge pour le raisonnement gpt-oss)
 TOOL_GRACE_TURNS = 2          # tours où les outils restent actifs après un usage (suivi de tâche)
 MAX_MEMORIES_IN_CONTEXT = 10
-MAX_USER_NOTES = 400         # plafond de SÉCURITÉ (anti-emballement), pas une vraie limite :
-                             # les notes s'accumulent librement et l'OUBLI progressif fait le tri
-                             # (voir forget_stale_notes) — une note peu importante et vieille
-                             # finit par disparaître, une note importante ou revue survit.
-DEDUP_SIMILARITY = 0.8       # seuil de similarité pour éviter les quasi-doublons
+MAX_USER_NOTES = 10          # LIMITE DURE : 10 notes personnelles max par personne.
+                             # Appliquée à l'écriture (add_user_note plafonne aussitôt) ET au
+                             # ménage (clean_all_memory). Au-delà, _trim_notes sacrifie d'abord
+                             # les moins précieuses (faibles + vieilles + jamais revues), en
+                             # protégeant les notes écrites à la main (author != IA).
+DEDUP_SIMILARITY = 0.8       # seuil de similarité pour éviter les quasi-doublons (dédoublonnage strict)
+CONSOLIDATE_SIMILARITY = 0.5 # seuil « proches mais pas identiques » : notes candidates à une FUSION
+                             # sémantique par le LLM (regrouper des infos qui se recoupent en une
+                             # seule note plus riche). Plus bas que DEDUP_SIMILARITY exprès.
 DIRECTIVE_CATEGORY = "consigne"  # ordres permanents de Mschap sur le comportement de Tenebris
 
 # Le forum officiel et UNIQUE du projet. Constante de configuration : on ne la
@@ -162,7 +166,9 @@ MAX_TOOL_ROUNDS = 3          # elle peut ENCHAÎNER : rejoindre le voc → lance
 SCAN_DEFAULT_LIMIT = 30
 SCAN_MAX_LIMIT = 150
 TOOL_RESULT_MAX_CHARS = 1500  # taille max d'un résultat d'outil réinjecté (gros économiseur de tokens)
-MAX_TOKENS_REPLY = 512
+MAX_TOKENS_REPLY = 2000       # plus de coupe brutale à 512 : c'est une BORNE DE SÉCURITÉ, pas un
+                              # format. La longueur reste tenue par la VOIX/persona (« court, tranché »),
+                              # pas par le plafond ; il n'est là que pour éviter un emballement.
 MAX_TOKENS_LONG = 3000        # réponses de recherche web/forum : synthèse longue, non tronquée
 SAVE_INTERVAL_SECONDS = 25   # cadence de sauvegarde en arrière-plan (non bloquante)
 
@@ -171,8 +177,10 @@ SAVE_INTERVAL_SECONDS = 25   # cadence de sauvegarde en arrière-plan (non bloqu
 SHARE_USER_MEMORY = True
 CROSS_USER_MAX_MEMBERS = 5    # nb max d'autres membres évoqués dans le contexte partagé
 CROSS_USER_NOTES_EACH = 2     # notes max par membre partagé
-NOTES_IN_CONTEXT = 15         # notes max injectées dans le prompt (affichage ≠ stockage) :
-                              # on peut EN GARDER des centaines, on n'en MONTRE qu'un extrait pertinent
+NOTES_IN_CONTEXT = 10         # notes max injectées dans le prompt (aligné sur la limite de stockage) :
+                              # on plafonne à 10 notes/personne, on les montre toutes mais bornées.
+NOTE_CTX_MAX_CHARS = 180      # chaque note est TRONQUÉE à cette longueur DANS LE PROMPT (pas en
+                              # stockage) : une note-paragraphe ne gonfle plus les tokens d'entrée.
 CROSS_USER_MAX_CHARS = 600    # plafond global du bloc partagé (économie de tokens)
 
 # --- Keep-alive (hébergement Render.com) -----------------------------------
@@ -1104,6 +1112,15 @@ def _note_text(note):
                 return v.strip()
     return ""
 
+def _note_ctx_text(note, limit=None):
+    """Texte d'une note BORNÉ pour l'injection dans le prompt (économise les tokens
+    d'entrée). Le stockage garde la note entière ; seul l'affichage au modèle est coupé."""
+    t = _note_text(note)
+    cap = limit or NOTE_CTX_MAX_CHARS
+    if len(t) > cap:
+        t = t[:cap].rstrip() + "…"
+    return t
+
 def profile_prompt_block(user_id):
     """Rend la fiche sous une forme compacte, injectable dans le prompt système,
     pour que Tenebris ADAPTE son ton (points 1 et 6) sans réciter la fiche."""
@@ -1279,26 +1296,247 @@ async def clean_contradictions(notes):
              if i not in a_retirer or n.get("author", "IA") != "IA"]
     return garde, len(notes) - len(garde)
 
-async def clean_all_memory(use_llm=True):
-    """Nettoyage GLOBAL demandé depuis le panneau : dédoublonnage (toujours) + contradictions
-    (si use_llm et quota dispo), sur toutes les fiches membres et serveurs. Renvoie un bilan."""
-    dbl, contr, fiches = 0, 0, 0
-    for rec in list(memory().get("users", {}).values()) + list(memory().get("guilds", {}).values()):
-        notes = rec.get("notes", [])
-        if len(notes) < 2:
+# --- Fusion sémantique (LLM) : regrouper les notes qui se recoupent ----------
+CONSOLIDATE_SYSTEM = (
+    "Tu es un module d'OPTIMISATION de mémoire. On te donne une liste NUMÉROTÉE de notes sur une "
+    "même personne. Ton travail : repérer les notes qui parlent de LA MÊME CHOSE ou se COMPLÈTENT "
+    "(infos qui se recoupent, redites, variantes d'un même fait) et les FUSIONNER en UNE seule note "
+    "plus claire et plus complète. Tu ne fusionnes JAMAIS des faits sans rapport, tu n'INVENTES rien, "
+    "et tu ne perds AUCUNE information utile : le texte fusionné doit tout contenir. En cas de doute, "
+    "tu laisses les notes séparées. Réponds UNIQUEMENT en JSON : "
+    '{"fusions": [{"remplace": [indices des notes fusionnées], "texte": "note fusionnée", '
+    '"importance": "faible|normale|haute"}]}. Liste vide si rien à fusionner.'
+)
+
+async def consolidate_notes(notes):
+    """Fusionne (via LLM) les notes qui se recoupent en notes plus riches. Conservateur.
+    Ne réécrit JAMAIS une note humaine (author != IA) : un groupe qui en contient une est laissé
+    intact. Renvoie (notes, nb_net_retiré). No-op si quota épuisé ou moins de 3 notes."""
+    if len(notes) < 3 or quota_exhausted():
+        return notes, 0
+    lignes = []
+    for i, n in enumerate(notes):
+        d = n.get("date", "?")[:10]
+        proteg = " [ADMIN]" if n.get("author", "IA") != "IA" else ""
+        lignes.append(f"{i}. ({d}){proteg} {_note_text(n)}")
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": CONSOLIDATE_SYSTEM},
+             {"role": "user", "content": "Notes :\n" + "\n".join(lignes)}],
+            max_tokens=500, temperature=0.1,
+        )
+        raw = re.sub(r"^```(json)?|```$", "", (resp.choices[0].message.content or "").strip(), flags=re.MULTILINE).strip()
+        fusions = json.loads(raw).get("fusions", [])
+    except Exception as e:
+        print(f"⚠️ Fusion des notes : {str(e)[:90]}")
+        return notes, 0
+
+    a_supprimer, ajouts = set(), []
+    for f in fusions:
+        idx = [int(x) for x in f.get("remplace", []) if str(x).isdigit()]
+        idx = [i for i in idx if 0 <= i < len(notes)]
+        texte = (f.get("texte") or "").strip()
+        if len(idx) < 2 or not texte:
             continue
-        fiches += 1
-        notes, d = dedupe_notes(notes)
-        dbl += d
-        if use_llm and len(notes) >= 2 and not quota_exhausted():
-            notes, c = await clean_contradictions(notes)
-            contr += c
-        rec["notes"] = notes
-    if dbl or contr:
+        groupe = [notes[i] for i in idx]
+        # On ne fusionne pas un groupe touchant une note humaine (on ne la réécrit pas).
+        if any(n.get("author", "IA") != "IA" for n in groupe):
+            continue
+        base = max(groupe, key=_note_recency_key)   # hérite de la meilleure (fraîcheur/reconfirmations)
+        importance = f.get("importance") if f.get("importance") in IMPORTANCE_ORDER else base.get("importance", "normale")
+        fusionnee = dict(base)
+        fusionnee["text"] = texte
+        fusionnee["importance"] = importance
+        fusionnee["reviews"] = sum(int(n.get("reviews", 0)) for n in groupe) + 1
+        fusionnee["date"] = max((n.get("date", "") for n in groupe), default=base.get("date", ""))
+        fusionnee["modified"] = now().strftime("%Y-%m-%d %H:%M")
+        a_supprimer.update(idx)
+        ajouts.append(fusionnee)
+
+    if not a_supprimer:
+        return notes, 0
+    garde = [n for i, n in enumerate(notes) if i not in a_supprimer] + ajouts
+    return garde, len(notes) - len(garde)
+
+# --- Mémoire commune : dédoublonnage + mise en ordre des consignes -----------
+def dedupe_global_memories():
+    """Dédoublonne la MÉMOIRE COMMUNE (faits généraux + consignes) : local, sans LLM. On garde la
+    version la plus RÉCENTE d'un groupe de souvenirs quasi identiques. Une consigne et un fait
+    ordinaire ne sont JAMAIS confondus (ils vivent dans des blocs de prompt distincts)."""
+    mems = memory().get("memories", [])
+    if len(mems) < 2:
+        return 0
+    garde, supprimes = [], 0
+    for m in mems:
+        doublon = None
+        for g in garde:
+            if _is_directive(g) != _is_directive(m):
+                continue
+            if _too_similar(g.get("text", ""), m.get("text", "")):
+                doublon = g
+                break
+        if doublon is None:
+            garde.append(m)
+        else:
+            if m.get("date", "") > doublon.get("date", ""):
+                garde[garde.index(doublon)] = m
+            supprimes += 1
+    if supprimes:
+        memory()["memories"] = garde
+        mark_memory_dirty()
+    return supprimes
+
+async def consolidate_global_memories():
+    """Fusionne (via LLM) les SOUVENIRS COMMUNS factuels qui se recoupent — ceux que le dédoublonnage
+    local rate parce qu'ils se ressemblent par le SENS et non par les mots (« X est une drag queen »
+    répété en variantes). Conservateur, ne touche pas aux consignes. Renvoie le nb net retiré."""
+    if quota_exhausted():
+        return 0
+    mems = memory().get("memories", [])
+    faits = [(i, m) for i, m in enumerate(mems) if not _is_directive(m)]
+    if len(faits) < 3:
+        return 0
+    lignes = [f"{pos}. ({m.get('date','?')[:10]}) [{m.get('category','général')}] {m.get('text','')}"
+              for pos, (_, m) in enumerate(faits)]
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": CONSOLIDATE_SYSTEM},
+             {"role": "user", "content": "Souvenirs :\n" + "\n".join(lignes)}],
+            max_tokens=600, temperature=0.1,
+        )
+        raw = re.sub(r"^```(json)?|```$", "", (resp.choices[0].message.content or "").strip(), flags=re.MULTILINE).strip()
+        fusions = json.loads(raw).get("fusions", [])
+    except Exception as e:
+        print(f"⚠️ Fusion des souvenirs communs : {str(e)[:90]}")
+        return 0
+
+    pos_to_gi = {pos: gi for pos, (gi, _) in enumerate(faits)}
+    a_supprimer_gi, ajouts = set(), []
+    for f in fusions:
+        pos_idx = [int(x) for x in f.get("remplace", []) if str(x).isdigit() and int(x) in pos_to_gi]
+        texte = (f.get("texte") or "").strip()
+        if len(pos_idx) < 2 or not texte:
+            continue
+        gis = [pos_to_gi[p] for p in pos_idx]
+        base = max((mems[g] for g in gis), key=lambda m: m.get("date", ""))
+        nouvelle = dict(base)
+        nouvelle["text"] = texte
+        nouvelle["date"] = max((mems[g].get("date", "") for g in gis), default=base.get("date", ""))
+        a_supprimer_gi.update(gis)
+        ajouts.append(nouvelle)
+    if not a_supprimer_gi:
+        return 0
+    nouveaux = [m for i, m in enumerate(mems) if i not in a_supprimer_gi] + ajouts
+    retires = len(mems) - len(nouveaux)
+    memory()["memories"] = nouveaux
+    mark_memory_dirty()
+    return max(0, retires)
+
+CONSOLIDATE_DIRECTIVE_SYSTEM = (
+    "Tu es un module de MISE EN ORDRE des consignes permanentes d'un assistant. On te donne une "
+    "liste NUMÉROTÉE de consignes (ordres sur SON comportement). Tu repères : (a) les consignes "
+    "REDONDANTES qui disent la même chose → à fusionner en une seule formulation nette ; (b) une "
+    "consigne qu'une autre plus RÉCENTE remplace, précise ou annule → on garde la récente, on retire "
+    "l'ancienne. Tu n'inventes AUCUNE consigne et tu ne perds aucune intention. En cas de doute, tu "
+    "ne touches à rien. Réponds UNIQUEMENT en JSON : "
+    '{"fusions": [{"remplace": [indices], "texte": "consigne finale"}], "supprimer": [indices périmés]}.'
+)
+
+async def consolidate_directives():
+    """Range les CONSIGNES de la mémoire commune : fusionne les redondantes, retire celles qu'une
+    consigne plus récente a rendues caduques (LLM, conservateur). Renvoie le nb net retiré."""
+    if quota_exhausted():
+        return 0
+    mems = memory().get("memories", [])
+    directives = [(i, m) for i, m in enumerate(mems) if _is_directive(m)]
+    if len(directives) < 2:
+        return 0
+    lignes = [f"{pos}. ({m.get('date','?')[:10]}) {m.get('text','')}"
+              for pos, (_, m) in enumerate(directives)]
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": CONSOLIDATE_DIRECTIVE_SYSTEM},
+             {"role": "user", "content": "Consignes :\n" + "\n".join(lignes)}],
+            max_tokens=400, temperature=0.1,
+        )
+        raw = re.sub(r"^```(json)?|```$", "", (resp.choices[0].message.content or "").strip(), flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"⚠️ Mise en ordre des consignes : {str(e)[:90]}")
+        return 0
+
+    pos_to_gi = {pos: gi for pos, (gi, _) in enumerate(directives)}
+    a_supprimer_gi = {pos_to_gi[int(x)] for x in data.get("supprimer", [])
+                      if str(x).isdigit() and int(x) in pos_to_gi}
+    ajouts = []
+    for f in data.get("fusions", []):
+        pos_idx = [int(x) for x in f.get("remplace", []) if str(x).isdigit() and int(x) in pos_to_gi]
+        texte = (f.get("texte") or "").strip()
+        if len(pos_idx) < 2 or not texte:
+            continue
+        gis = [pos_to_gi[p] for p in pos_idx]
+        base = max((mems[g] for g in gis), key=lambda m: m.get("date", ""))
+        nouvelle = dict(base)
+        nouvelle["text"] = texte
+        nouvelle["date"] = now().strftime("%Y-%m-%d %H:%M")
+        a_supprimer_gi.update(gis)
+        ajouts.append(nouvelle)
+
+    if not a_supprimer_gi and not ajouts:
+        return 0
+    nouveaux = [m for i, m in enumerate(mems) if i not in a_supprimer_gi] + ajouts
+    retires = len(mems) - len(nouveaux)
+    memory()["memories"] = nouveaux
+    mark_memory_dirty()
+    return max(0, retires)
+
+async def clean_all_memory(use_llm=True, merge=False):
+    """Nettoyage GLOBAL depuis le panneau.
+      1) Mémoire commune : dédoublonnage local (toujours) + mise en ordre des consignes qui se
+         superposent (si merge & use_llm & quota).
+      2) Chaque fiche (membres + serveurs) : dédoublonnage local (toujours) → fusion des notes qui
+         se recoupent (si merge & quota) → contradictions (si use_llm & quota).
+      3) LIMITE DURE : chaque MEMBRE est ramené à MAX_USER_NOTES notes (les serveurs gardent leur
+         propre plafond). On sacrifie d'abord les moins précieuses, jamais une note humaine.
+    Renvoie un bilan chiffré."""
+    dbl, contr, fus, plafonnees, fiches = 0, 0, 0, 0, 0
+    mem_dbl = dedupe_global_memories()
+    consignes = 0
+    if merge and use_llm and not quota_exhausted():
+        mem_dbl += await consolidate_global_memories()   # fusion sémantique des faits communs
+        consignes = await consolidate_directives()
+
+    async def _clean_notes(notes, is_member):
+        nonlocal dbl, contr, fus, plafonnees, fiches
+        if len(notes) >= 2:
+            fiches += 1
+            notes, d = dedupe_notes(notes)
+            dbl += d
+            if merge and len(notes) >= 3 and not quota_exhausted():
+                notes, f = await consolidate_notes(notes)
+                fus += f
+            if use_llm and len(notes) >= 2 and not quota_exhausted():
+                notes, c = await clean_contradictions(notes)
+                contr += c
+        if is_member and len(notes) > MAX_USER_NOTES:
+            avant = len(notes)
+            notes = _trim_notes(notes, MAX_USER_NOTES)
+            plafonnees += avant - len(notes)
+        return notes
+
+    for rec in list(memory().get("users", {}).values()):
+        rec["notes"] = await _clean_notes(rec.get("notes", []), True)
+    for rec in list(memory().get("guilds", {}).values()):
+        rec["notes"] = await _clean_notes(rec.get("notes", []), False)
+
+    if dbl or contr or fus or plafonnees or mem_dbl or consignes:
         mark_memory_dirty()
         await flush_memory()
-    print(f"🧹 Nettoyage mémoire : {dbl} doublon(s), {contr} contradiction(s) retiré(s) sur {fiches} fiche(s).")
-    return {"doublons": dbl, "contradictions": contr, "fiches": fiches}
+    print(f"🧹 Nettoyage : {dbl} doublon(s), {fus} fusion(s), {contr} contradiction(s), "
+          f"{plafonnees} note(s) au-delà du plafond, {mem_dbl} souvenir(s) commun(s) redondant(s), "
+          f"{consignes} consigne(s) rangée(s) — sur {fiches} fiche(s).")
+    return {"doublons": dbl, "fusions": fus, "contradictions": contr, "plafonnees": plafonnees,
+            "memoires": mem_dbl, "consignes": consignes, "fiches": fiches}
 
 def forget_stale_notes():
     """Passe sur toutes les fiches (membres et serveurs) et efface les notes de l'IA
@@ -1559,7 +1797,7 @@ def get_user_context(user_id, member=None, guild=None):
     if notes:
         lines.append("Ce que tu sais d'elle (sers-t'en pour la reconnaître, sans le réciter) :")
         for n in _notes_for_context(notes, NOTES_IN_CONTEXT):
-            t = _note_text(n)
+            t = _note_ctx_text(n)
             if t:
                 lines.append(f"- {t}")
     return "\n".join(lines)
@@ -1586,7 +1824,7 @@ def member_notes_block(guild, members):
         # Une note peut être un dict {"text": …} OU, sur d'anciennes données, une simple
         # chaîne. On tolère les deux et on ignore ce qui est vide : une note malformée ne
         # doit JAMAIS faire planter la réponse (sinon Tenebris se tait pour ce membre).
-        textes = [_note_text(n) for n in notes]
+        textes = [_note_ctx_text(n) for n in notes]
         textes = [t for t in textes if t]
         if textes:
             corps = " ; ".join(textes[-CROSS_USER_NOTES_EACH * 2:])
@@ -1627,7 +1865,7 @@ def get_cross_user_context(guild, exclude_user_id=None):
 
     lines, total = [], 0
     for _, name, notes in candidates[:CROSS_USER_MAX_MEMBERS]:
-        textes = [t for t in (_note_text(n) for n in notes) if t]
+        textes = [t for t in (_note_ctx_text(n) for n in notes) if t]
         if not textes:
             continue
         block = f"{name} : " + " ; ".join(textes)
@@ -9411,16 +9649,23 @@ async def admin_clean_memory(request):
         return guard
     data = await _read_json(request)
     use_llm = data.get("contradictions", True)
+    merge = data.get("merge", False)
     tid = task_new("Nettoyage de la mémoire")
 
     async def _run():
         try:
-            task_step(tid, 15, "Recherche des doublons…")
+            task_step(tid, 10, "Dédoublonnage (notes + mémoire commune)…")
+            if merge:
+                task_step(tid, 35, "Fusion des notes qui se recoupent + mise en ordre des consignes…")
             if use_llm:
-                task_step(tid, 40, "Analyse des contradictions (peut prendre un moment)…")
-            bilan = await clean_all_memory(use_llm=use_llm)
-            task_done(tid, f"{bilan['doublons']} doublon(s) et {bilan['contradictions']} "
-                           f"contradiction(s) retiré(s) sur {bilan['fiches']} fiche(s).")
+                task_step(tid, 60, "Analyse des contradictions (peut prendre un moment)…")
+            bilan = await clean_all_memory(use_llm=use_llm, merge=merge)
+            resume = (f"{bilan['doublons']} doublon(s), {bilan['fusions']} fusion(s), "
+                      f"{bilan['contradictions']} contradiction(s), {bilan['plafonnees']} note(s) "
+                      f"au-delà du plafond de {MAX_USER_NOTES}, {bilan['memoires']} souvenir(s) "
+                      f"commun(s) redondant(s), {bilan['consignes']} consigne(s) rangée(s) — "
+                      f"sur {bilan['fiches']} fiche(s).")
+            task_done(tid, resume)
         except Exception as e:
             task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
 
@@ -10243,18 +10488,20 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <h2 class="title">Console d'administration</h2>
 
       <div class="adm-sec">
-        <h3>Nettoyage de la mémoire</h3>
+        <h3>Nettoyage & optimisation de la mémoire</h3>
         <div style="color:var(--dim);font-size:13px;margin-bottom:12px">
-          Fait le ménage dans les notes de tout le monde : supprime les <b>doublons</b> (même info
-          répétée, on garde la plus récente) et les <b>contradictions</b> (deux infos incompatibles,
-          on garde la plus récente et on retire l'ancienne). Les notes que tu as écrites à la main
-          ne sont jamais touchées.
+          Fait le ménage dans les notes de tout le monde et dans la mémoire commune :
+          supprime les <b>doublons</b> (même info répétée), <b>fusionne</b> les notes qui se
+          recoupent en une seule plus riche, retire les <b>contradictions</b> (on garde la plus
+          récente), range les <b>consignes qui se superposent</b>, et applique la
+          <b>limite de 10 notes par personne</b>. Les notes écrites à la main ne sont jamais touchées.
         </div>
         <div class="btnrow" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <button class="mini" id="clean_go" onclick="cleanMemory(true, this)">🧹 Nettoyer (doublons + contradictions)</button>
-          <button class="mini ghost" onclick="cleanMemory(false, this)">⚡ Doublons seulement (rapide)</button>
+          <button class="mini" id="clean_go" onclick="cleanMemory({merge:true, llm:true}, this)">🔀 Optimiser tout (doublons + fusion + contradictions + plafond 10)</button>
+          <button class="mini ghost" onclick="cleanMemory({merge:false, llm:true}, this)">🧹 Nettoyer (doublons + contradictions)</button>
+          <button class="mini ghost" onclick="cleanMemory({merge:false, llm:false}, this)">⚡ Doublons + plafond (rapide, local)</button>
         </div>
-        <div style="color:var(--dim);font-size:12px;margin-top:8px">La détection des contradictions utilise le modèle (Cerebras) : un peu plus lente, mais elle comprend le sens.</div>
+        <div style="color:var(--dim);font-size:12px;margin-top:8px">La fusion et les contradictions utilisent le modèle (Cerebras) : un peu plus lentes, mais elles comprennent le sens. Le mode rapide reste 100&nbsp;% local.</div>
       </div>
 
       <div class="adm-sec">
@@ -11217,12 +11464,16 @@ async function libAction(action, btn){
   }
 }
 
-async function cleanMemory(withLlm, btn){
-  const msg = withLlm
-    ? 'Nettoyer la mémoire (doublons + contradictions) ? Les notes écrites à la main sont préservées.'
-    : 'Retirer les doublons de toutes les fiches ?';
+async function cleanMemory(opts, btn){
+  opts = opts || {};
+  const merge = !!opts.merge, llm = opts.llm !== false;
+  const msg = merge
+    ? 'Optimiser toute la mémoire (doublons + fusion des notes proches + contradictions + consignes) et appliquer la limite de 10 notes par personne ? Les notes écrites à la main sont préservées.'
+    : (llm
+        ? 'Nettoyer la mémoire (doublons + contradictions) et appliquer la limite de 10 notes par personne ?'
+        : 'Retirer les doublons (local) et appliquer la limite de 10 notes par personne ?');
   if(!window.confirm(msg)) return;
-  const {status, body} = await busy(btn, ()=>jpost('/admin/api/clean_memory', {contradictions: withLlm}), '…');
+  const {status, body} = await busy(btn, ()=>jpost('/admin/api/clean_memory', {contradictions: llm, merge: merge}), '…');
   if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
   if(body.task){
     taskFollow(body.task, 'Nettoyage de la mémoire', ()=>{ if(window._curUser) openUser(window._curUser); });
