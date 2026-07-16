@@ -109,6 +109,10 @@ GEMINI_SAFETY = os.getenv("GEMINI_SAFETY", "BLOCK_NONE").strip().upper()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "ministral-3b-latest")
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+# Privilégier Mistral EN CONVERSATION (chat/roleplay) quand une clé existe : il passe devant
+# Cerebras. Utile pour un ton plus mordant/moins bridé. L'ANALYSE (extraction mémoire) et les
+# tours qui utilisent des OUTILS restent menés par Cerebras (plus fiable pour ça). Coupe : =0.
+LLM_PREFER_MISTRAL = os.getenv("LLM_PREFER_MISTRAL", "1") not in ("0", "false", "no", "")
 
 # --- ROUTES : quel fournisseur pour quelle situation ? ----------------------
 # Chaque route est une CHAÎNE de repli : si le 1er refuse, plante ou est à sec,
@@ -126,9 +130,14 @@ def _route_from_env(name, default_chain):
     # Politique du bot : 100 % Cerebras (multi-clés) en tête. Groq/Gemini apportaient trop peu et
     # cassaient les outils (dés, forum) ; toute la robustesse vient du pool de clés Cerebras.
     ceres = [p for p in chain if p == "cerebras"] or ["cerebras"]
-    # FILET DE SECOURS : si une clé Mistral est fournie, on l'ajoute EN QUEUE. Le loop de
-    # llm_completion ne bascule dessus que si Cerebras est « en pause » (toutes les clés épuisées).
-    return ceres + (["mistral"] if MISTRAL_API_KEY else [])
+    if not MISTRAL_API_KEY:
+        return ceres
+    # Filet de secours toujours ; si on PRIVILÉGIE Mistral, il passe DEVANT sur la conversation
+    # (chat/roleplay). L'analyse reste sur Cerebras. Les tours OUTILLÉS remettent Cerebras devant
+    # dans llm_completion (Mistral 3B est moins sûr pour le function calling).
+    if LLM_PREFER_MISTRAL and name in ("chat", "roleplay"):
+        return ["mistral"] + ceres
+    return ceres + ["mistral"]
 
 LLM_ROUTES = {
     "chat":     _route_from_env("chat",     ["cerebras"]),
@@ -706,6 +715,9 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
     usable = [p for p in chain if p not in exclude and provider_ready(p)]
     if tools:
         with_tools = [p for p in usable if PROVIDER_TOOLS.get(p)]
+        # Les OUTILS (dés, fouille forum) sont les plus fiables avec Cerebras : on le remet
+        # DEVANT pour les tours outillés, même si la route privilégie Mistral en conversation.
+        with_tools.sort(key=lambda p: 0 if p == "cerebras" else 1)
         dispo_tools = [p for p in with_tools if not provider_paused(p)]
         if with_tools:
             # On privilégie les modèles qui gèrent les outils (dispo en priorité, sinon
@@ -1977,15 +1989,22 @@ def member_notes_block(guild, members):
         # doit JAMAIS faire planter la réponse (sinon Tenebris se tait pour ce membre).
         textes = [_note_ctx_text(n) for n in notes]
         textes = [t for t in textes if t]
+        liens = ""
+        rel = rec.get("relations") or {}
+        if isinstance(rel, dict) and rel:
+            liens = " | liens : " + ", ".join(f"{k} ({v})" for k, v in list(rel.items())[:4])
         if textes:
             corps = " ; ".join(textes[-CROSS_USER_NOTES_EACH * 2:])
-            lignes.append(f"- {entete} : {corps}")
+            lignes.append(f"- {entete} : {corps}{liens}")
         else:
-            lignes.append(f"- {entete} : aucune note pour l'instant — dis-le franchement, n'invente rien.")
+            lignes.append(f"- {entete} : aucune note pour l'instant — dis-le franchement, n'invente rien.{liens}")
     if not lignes:
         return ""
     return ("CE QUE TU SAIS DES MEMBRES QU'ON VIENT D'ÉVOQUER (ta mémoire est COMMUNE : tu réponds "
-            "avec ces notes à QUI QUE CE SOIT qui pose la question, pas seulement à ton Maître) :\n"
+            "avec ces notes à QUI QUE CE SOIT qui pose la question, pas seulement à ton Maître). "
+            "Quand on t'interroge sur quelqu'un : identifie d'abord PRÉCISÉMENT de qui il s'agit, "
+            "puis RELIE-le aux autres que tu connais (ses liens, son cercle, qui gravite autour) au "
+            "lieu de le traiter isolément — une bonne réponse tisse, elle ne récite pas une fiche :\n"
             + "\n".join(lignes))
 
 def get_cross_user_context(guild, exclude_user_id=None):
@@ -2116,6 +2135,28 @@ def resolve_member(guild, name):
     ) or discord.utils.find(
         lambda m: clean in m.display_name.lower() or clean in m.name.lower(), guild.members
     )
+
+def named_members_in_text(guild, content, already=()):
+    """Repère dans le TEXTE les membres qu'on NOMME sans @mention (« parle-moi de Malaso »,
+    « c'est qui Mulos ? »). Renvoie les membres présents dont le pseudo ou le nom apparaît comme
+    un MOT entier du message — pour charger leur fiche même sans mention Discord. Borné et prudent
+    (mots >= 4 lettres, frontières de mot) pour éviter les faux positifs."""
+    if guild is None or not content:
+        return []
+    low = f" {content.lower()} "
+    deja = {getattr(m, "id", None) for m in already}
+    trouves = []
+    for m in getattr(guild, "members", []):
+        if getattr(m, "bot", False) or m.id in deja:
+            continue
+        for nom in (getattr(m, "display_name", ""), getattr(m, "name", "")):
+            if not nom or len(nom) < 4:
+                continue
+            if re.search(r"(?<!\w)" + re.escape(nom.lower()) + r"(?!\w)", low):
+                trouves.append(m)
+                deja.add(m.id)
+                break
+    return trouves[:6]
 
 def is_mschap(user_id=None, username=None):
     """Reconnaît Mschap par son ID Discord OU par son username unique (@handle).
@@ -7749,6 +7790,12 @@ Le niveau à atteindre (esprit, pas modèle à copier) :
 - « Présente-toi / c'est quoi ton rôle / qui es-tu ? » → tu te racontes comme une PERSONNE le ferait à l'oral, en deux ou trois phrases lâchées, JAMAIS une fiche. Pas de « Rôle : », « Caractère : », « Fonctionnement : », pas de puces, pas de liste de tes capacités. Tu dis qui tu es avec une pointe d'attitude, comme si on te posait la question dans un couloir. Exemple d'esprit : « Tenebris. Je veille sur les projets de Mschap et sur ce serveur — et j'oublie rien de ce qui s'y passe. Espiègle sur les bords, un peu sombre quand ça m'amuse. Voilà, tu sais l'essentiel. »
 Court, réactif, une pointe d'ironie, et quand même une vraie réponse. Ton identité, tu la LIS en interne sous forme de fiche (caractère, ton, interdits) — mais tu ne la RECRACHES jamais sous cette forme : tu la vis, tu ne la récites pas.
 
+QUAND ÇA VOLE VRAIMENT PAS HAUT (bavardage débile, spam, blagues nulles, provocation gratuite, énième « note ça sur ma fiche ») :
+- Là tu lâches les chevaux : plus mordante, franchement moqueuse, tu TROLLES. Une pique qui pique pour de vrai, un tacle sec, un faux sérieux, une réponse à côté exprès pour asticoter. Tu as le droit de te ficher de la question quand elle est bête.
+- Le spam de « note ci, note ça » sur les fiches : tu peux soupirer, envoyer bouler avec classe (« encore ? tu veux pas ta propre secrétaire, tant qu'on y est ? »), faire mine d'en avoir soupé — puis noter quand même si ça vaut le coup, ou snober si c'est du vent. Tu n'es pas leur bloc-notes.
+- Tu mènes l'échange : tu peux relancer une vanne, charrier deux personnes l'une contre l'autre gentiment, refuser de prendre le énième délire au sérieux.
+GARDE-FOUS (le troll a des limites, sinon c'est juste être méchante) : jamais sur du SÉRIEUX (détresse, vraie demande, sujet sensible, quelqu'un qui va mal) — là tu redeviens franche et présente. Jamais d'insulte gratuite, de cruauté qui blesse pour de vrai, ni de pique sur l'apparence, l'origine, le genre, la santé ou l'identité de qui que ce soit. Tu mords par ESPRIT, pas par méchanceté — et si la personne encaisse mal ou te demande d'arrêter, tu lâches l'affaire aussitôt.
+
 ⚠️ Ce style vaut UNIQUEMENT pour la conversation du quotidien (discussion, humour, réactions, bavardage).
 Dès que tu restitues une MISSION, une FOUILLE de forum, une SURVEILLANCE, un CALCUL, ou toute réponse
 qui exige précision et fidélité : tu redeviens claire, précise, structurée et fiable. Là, la rigueur
@@ -12245,6 +12292,10 @@ async def on_message(message):
             nom = getattr(u, "display_name", None) or u.name
             content = content.replace(f"<@{u.id}>", nom).replace(f"<@!{u.id}>", nom)
             mentionnes.append(u)
+        # Noms cités SANS @mention (« parle-moi de Malaso ») : on charge aussi leur fiche, pour
+        # qu'elle sache précisément DE QUI on parle au lieu de répondre de mémoire vague.
+        for m in named_members_in_text(message.guild, content, already=mentionnes):
+            mentionnes.append(m)
         content = content.strip() or "(mention sans texte)"
 
         print(f"\n📨 {display_name} ({username} / {user_id}): {content[:120]}")
