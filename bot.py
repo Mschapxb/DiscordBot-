@@ -3527,6 +3527,13 @@ _TOPIC_RE = re.compile(
 )
 # Forums / catégories (pour descendre d'un niveau) : forumactif /f12-... /c3-..., phpBB viewforum.
 _FORUM_RE = re.compile(r'(viewforum|/f\d+-|/c\d+-|/forum|/f/|[?&]f=\d|/category|/categorie)', re.IGNORECASE)
+# Identifiant d'une SECTION forumactif : /f2-... ou /f2p25-... (pagination) ou /c3-... .
+# Sert au mode STRICT : ne garder que les sujets qui vivent DANS la section demandée.
+_FORUM_SECTION_ID_RE = re.compile(r"/(f|c)(\d+)(?:p\d+)?-", re.IGNORECASE)
+
+def _section_id(url):
+    m = _FORUM_SECTION_ID_RE.search(url or "")
+    return f"{m.group(1).lower()}{m.group(2)}" if m else None
 
 def _host(u):
     from urllib.parse import urlparse
@@ -4119,17 +4126,25 @@ async def _find_topic_for(grab, origin, name, known_topics, index=None):
                 return fallback
     return None, None
 
-async def fouiller_forum(url, sujet=""):
+async def fouiller_forum(url, sujet="", strict=False):
     """Explore un forum/site depuis un lien pour rassembler l'info sur un sujet :
       1) utilise le MOTEUR DE RECHERCHE du forum si un sujet est donné,
       2) lit la page d'accueil,
       3) descend dans les sous-forums pour trouver les discussions,
       4) lit les meilleures discussions et agrège tout (avec sources, pour un résumé cité).
-    Borné (budget de requêtes) et sécurisé (anti-SSRF, même hôte, délai de politesse)."""
+    Borné (budget de requêtes) et sécurisé (anti-SSRF, même hôte, délai de politesse).
+    strict=True : on RESTE dans la section/page fournie (pas de recherche globale, pas d'index
+    de tout le forum, pas de rebond vers d'autres sections). Utile quand on demande un avis « sur
+    CETTE partie du forum » : on ne va PAS voir ailleurs."""
     root = _safe_url(url)
     if not root:
         return "URL invalide ou adresse interne bloquée."
     origin = _origin(root)
+    # Sécurité : le mode strict n'a de sens que sur une SECTION (page /f… ou /c…). Si on ne nous
+    # a donné qu'un lien de section, on force strict même si l'appelant l'a oublié.
+    is_section = bool(_section_id(root)) or bool(_FORUM_RE.search(root))
+    if strict and not is_section:
+        strict = False   # un lien de sujet isolé ou l'accueil : rien à « rester dedans »
     kw = _words(sujet)
     fetches = 0
     visited = set()
@@ -4144,13 +4159,17 @@ async def fouiller_forum(url, sujet=""):
                                     cookie_jar=aiohttp.CookieJar(unsafe=True))
     try:
         return await _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
-                                           visited, topics, subforums, context_blocks, echecs)
+                                           visited, topics, subforums, context_blocks, echecs,
+                                           strict=strict)
     finally:
         await session.close()
 
 async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
-                                visited, topics, subforums, context_blocks, echecs):
+                                visited, topics, subforums, context_blocks, echecs,
+                                strict=False):
     topic_section = {}     # url du sujet -> section du forum où il vit (sa « zone »)
+    scope_id = _section_id(root) if strict else None   # section à laquelle on se limite
+    section_pages = set()  # autres pages de LA MÊME section (pagination) — mode strict
 
     async def grab(u):
         nonlocal fetches
@@ -4178,13 +4197,20 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
                 if base_is_forum and full not in topic_section:
                     topic_section[full] = base
             elif _FORUM_RE.search(full):
+                if strict:
+                    # En STRICT on ignore toutes les autres sections : on ne retient QUE la
+                    # pagination de la section demandée (/f2p25-… a le même id que /f2-…).
+                    if scope_id and _section_id(full) == scope_id and full not in visited:
+                        section_pages.add(full)
+                    continue
                 hay = (anchor + " " + full).lower()
                 sc = 1 + 2 * _kw_hits(kw, hay)
                 if full not in subforums or sc > subforums[full][0]:
                     subforums[full] = (sc, anchor)
 
     # 1) Recherche intégrée du forum (résultats = discussions très pertinentes)
-    if sujet.strip():
+    #    IGNORÉE en mode strict : le moteur cherche dans TOUT le forum, on sortirait de la section.
+    if sujet.strip() and not strict:
         for surl in _build_search_urls(origin, sujet):
             page = await grab(surl)
             if page and not page.get("error"):
@@ -4205,9 +4231,10 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
             f"=== SOURCE: {root_page['url']} ({_page_title(root_page['html'])}) ===\n"
             f"{_html_to_text(_clean_forum_html(root_page['html']))[:FORUM_ROOT_TEXT]}")
         harvest(root_page["html"], root_page["url"])
-    elif not topics:
+    elif not topics and not strict:
         # La racine est injoignable ET la recherche n'a rien donné : on tente l'origine du site
         # (le lien fourni pointait peut-être vers une page morte ou protégée).
+        # JAMAIS en strict : on ne remonte pas à l'accueil, on reste sur la section demandée.
         if root != origin:
             alt = await grab(origin)
             if alt and not alt.get("error"):
@@ -4216,10 +4243,21 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
                     f"{_html_to_text(_clean_forum_html(alt['html']))[:FORUM_ROOT_TEXT]}")
                 harvest(alt["html"], alt["url"])
 
+    # 2-strict) On parcourt les AUTRES PAGES de la MÊME section (pagination) pour lister TOUS
+    #           ses sujets — sans jamais sortir de la section. Borné à quelques pages.
+    if strict and section_pages:
+        for sp in sorted(section_pages)[:FORUM_MAX_SUBFORUMS]:
+            if fetches >= FORUM_MAX_FETCHES:
+                break
+            page = await grab(sp)
+            if page and not page.get("error"):
+                harvest(page["html"], page["url"])
+
     # 2bis) INDEX DU FORUM — on se dote de la liste des sujets EXISTANTS, au lieu de dépendre
     #       d'un moteur de recherche souvent réservé aux membres. C'est ce qui permet de
     #       vraiment retrouver les fiches (Tasglev, Tsita, le Collège…).
-    index, paths, _section_paths = await build_forum_index(
+    #       IGNORÉ en strict : l'index couvre tout le forum, on sortirait de la section.
+    index, paths, _section_paths = ({}, {}, {}) if strict else await build_forum_index(
         grab, origin, root_html=(root_page or {}).get("html"))
     if index:
         # a) Les sujets dont le TITRE correspond au sujet demandé sont des cibles de choix.
@@ -4280,7 +4318,7 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
         if len(p) > len(main_path):
             main_path = p
     zone_topics = {}
-    for s_url, s_name in list(zones.items())[:2]:
+    for s_url, s_name in ([] if strict else list(zones.items())[:2]):
         if fetches >= FORUM_MAX_FETCHES:
             break
         page = await grab(s_url)
@@ -4300,7 +4338,8 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
     #    L'Enquêteur choisit les pistes à suivre (une entité du même Empire mérite d'être lue,
     #    un autre continent sans rapport non), puis le Vérificateur écarte ce qui, une fois lu,
     #    s'avère hors-sujet. Un simple filtre par mots-clés était trop bête pour ça.
-    if read and fetches < FORUM_MAX_FETCHES:
+    #    IGNORÉ en strict : le second rebond suit des liens vers d'AUTRES sections — interdit ici.
+    if read and fetches < FORUM_MAX_FETCHES and not strict:
         extrait = "\n".join(main_text)[:3000]
         subject_terms = [t for t in kw if len(t) >= 4]
 
@@ -4443,7 +4482,14 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
             "(Aucune discussion exploitable trouvée sur ce sujet : le forum n'a peut-être aucun résultat, "
             "exige une connexion, ou charge son contenu en JavaScript." + detail +
             " Résume ce qui a pu être lu, cite les liens, et signale honnêtement ce qui a échoué.)")
-    return WEB_WRITE_DIRECTIVE + ("\n\n".join(context_blocks))[:FORUM_TOOL_RESULT_MAX]
+    tete = ""
+    if strict:
+        tete = ("[CADRE STRICT] On t'a demandé de rester DANS cette section précise du forum. "
+                "Tout ce qui suit vient UNIQUEMENT d'elle : ne parle de RIEN d'autre, ne va pas "
+                "chercher ailleurs, et n'invente aucun élément absent d'ici. Si on te demande TON "
+                "avis ou ta préférence, TRANCHE : choisis parmi ce que tu as lu et assume ce choix "
+                "(tu as le droit d'avoir un favori), en citant le(s) sujet(s) correspondant(s).\n\n")
+    return WEB_WRITE_DIRECTIVE + tete + ("\n\n".join(context_blocks))[:FORUM_TOOL_RESULT_MAX]
 
 # ============================================================
 # BIBLIOTHÈQUE DU FORUM — carte + mots-clés, mémorisés, pour cibler vite les bons sujets
@@ -6127,10 +6173,11 @@ TOOLS = [
             "required": ["urls"]}}},
     {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement au lieu de partir de l'accueil. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien).",
+        "description": "APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement au lieu de partir de l'accueil. Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section, sans aller voir ailleurs. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien).",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "description": "À remplir dès qu'un lien précis est donné : section (/f2-...), sujet (/t45-...) ou autre site. Laisse vide seulement pour une recherche générale sur tout le forum officiel."},
-            "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"}},
+            "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"},
+            "strict": {"type": "boolean", "description": "true = reste STRICTEMENT dans la section/page de 'url', sans explorer le reste du forum. À activer quand on restreint à « cette section / cette partie » ou qu'on demande ton avis sur celle-ci."}},
             "required": ["sujet"]}}},
     {"type": "function", "function": {
         "name": "recherche_web",
@@ -6513,7 +6560,13 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
                     noms = ", ".join(c["titre"] for c in cibles if c.get("titre"))
                     print(f"📖 Bibliothèque : sujets ciblés pour « {sujet} » → {noms}")
                     depart = cibles[0]["url"]     # on démarre la fouille sur le sujet le plus pertinent
-            return await fouiller_forum(depart or args.get("url") or FORUM_URL, sujet)
+            url_arg = args.get("url")
+            strict = bool(args.get("strict", False))
+            # Un lien de SECTION explicite (/f2-…, /c3-…) ⇒ on reste dedans par défaut : l'utilisateur
+            # a pointé une zone précise. On n'écrase pas un strict=false posé volontairement.
+            if url_arg and _section_id(url_arg) and "strict" not in args:
+                strict = True
+            return await fouiller_forum(depart or url_arg or FORUM_URL, sujet, strict=strict)
         if name == "recherche_web":
             return await recherche_web(args.get("requete", ""), lire=args.get("lire", 2))
         if name == "resumer_salon":
