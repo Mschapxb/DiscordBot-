@@ -1811,6 +1811,7 @@ def _guild_record(guild_id, name=""):
         mark_memory_dirty()
     rec.setdefault("notes", [])
     rec.setdefault("summary", "")
+    rec.setdefault("channels", {})     # {cid: {name, resume, msgs, maj}} — analyse par salon
     return rec
 
 def add_guild_note(guild_id, text, category="observation", importance="normale", author="IA", guild_name=""):
@@ -5223,6 +5224,10 @@ def seed_user(member):
     return fresh
 
 OBSERVE_SYSTEM = "Tu observes des messages Discord pour en tirer des notes UTILES sur les personnes. Réponds UNIQUEMENT en JSON brut."
+CHANNEL_SUMMARY_SYSTEM = (
+    "Tu résumes un SALON Discord en 1 à 2 phrases, factuel et utile : à quoi il sert, ce qu'on y "
+    "fait/dit, l'ambiance. Pas de blabla, pas de liste, pas de JSON — juste le résumé. Si le salon "
+    "est vide de sens (spam, hors-sujet), dis-le simplement.")
 OBSERVE_PROMPT = """Voici des messages récents postés par {name} sur un serveur Discord :
 {msgs}
 
@@ -5470,11 +5475,14 @@ def note_quota_error(err):
 PURPOSE_REFRESH_DAYS = 30      # la vocation d'un serveur ne se recalcule pas tous les jours
 _observing = set()             # serveurs en cours d'observation (évite les doublons concurrents)
 
-async def observe_guild(guild, per_channel=40, max_authors=8, max_channels=20, force_purpose=False):
+async def observe_guild(guild, per_channel=40, max_authors=8, max_channels=20, force_purpose=False,
+                        deep=False, progress=None):
     """Parcourt le serveur, crée les fiches et prend des notes utiles (membres + serveur).
-    Renvoie un RAPPORT détaillé pour qu'on sache exactement ce qui s'est passé."""
+    deep=True : analyse À FOND — TOUS les salons accessibles, plus de messages, et un RÉSUMÉ par
+    salon stocké en mémoire (ce qui alimente la page /serveur). Renvoie un RAPPORT détaillé."""
     rep = {"notes": 0, "fiches": 0, "salons": 0, "salons_lus": 0, "messages": 0,
-           "auteurs": 0, "proposees": 0, "filtrees": 0, "erreurs": [], "raison": "", "but": ""}
+           "auteurs": 0, "proposees": 0, "filtrees": 0, "salons_resumes": 0,
+           "erreurs": [], "raison": "", "but": ""}
     if guild is None:
         rep["raison"] = "Pas de serveur."
         return rep
@@ -5490,17 +5498,19 @@ async def observe_guild(guild, per_channel=40, max_authors=8, max_channels=20, f
     _observing.add(guild.id)
     try:
         return await _observe_guild_inner(guild, per_channel, max_authors, max_channels,
-                                          force_purpose, rep)
+                                          force_purpose, rep, deep=deep, progress=progress)
     finally:
         _observing.discard(guild.id)
 
-async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, force_purpose, rep):
+async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, force_purpose, rep,
+                               deep=False, progress=None):
     rep["fiches"] = await seed_guild_members(guild)
 
     me = _guild_me(guild)
     channels = list(guild.text_channels)[:max_channels]
     rep["salons"] = len(channels)
     by_author = {}
+    par_salon = {}                     # cid -> {"name", "msgs":[...]} (pour le résumé par salon)
     for channel in channels:
         try:
             if me is not None:
@@ -5517,11 +5527,45 @@ async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, fo
                 slot = by_author.setdefault(a.id, {"member": a, "msgs": []})
                 if len(slot["msgs"]) < 15:
                     slot["msgs"].append(msg.content[:300])
+                if deep:
+                    cslot = par_salon.setdefault(channel.id, {"name": channel.name, "msgs": []})
+                    if len(cslot["msgs"]) < 40:
+                        cslot["msgs"].append(f"[{a.display_name}] {msg.content[:220]}")
             rep["salons_lus"] += 1
         except discord.errors.Forbidden:
             continue
         except Exception as e:
             rep["erreurs"].append(f"#{getattr(channel, 'name', '?')}: {e}")
+
+    # --- Passe DEEP : un résumé par salon (à quoi il sert, ce qui s'y dit) → mémoire /serveur ---
+    if deep and par_salon:
+        grec0 = _guild_record(guild.id, guild.name)
+        chans = grec0.setdefault("channels", {})
+        total = len(par_salon)
+        for i, (cid, data) in enumerate(par_salon.items(), 1):
+            if quota_exhausted():
+                break
+            if progress:
+                progress(min(70, 20 + int(45 * i / total)), f"Résumé du salon #{data['name']} ({i}/{total})…")
+            if len(data["msgs"]) < 2:
+                chans[str(cid)] = {"name": data["name"], "resume": "(trop peu d'activité pour résumer)",
+                                   "msgs": len(data["msgs"]), "maj": now().strftime("%Y-%m-%d %H:%M")}
+                continue
+            try:
+                resp = await extract_completion(
+                    [{"role": "system", "content": CHANNEL_SUMMARY_SYSTEM},
+                     {"role": "user", "content": f"Salon #{data['name']} du serveur {guild.name}.\n"
+                                                 "Messages récents :\n" + "\n".join(data["msgs"])}],
+                    max_tokens=160, temperature=0.2)
+                resume = " ".join((resp.choices[0].message.content or "").split())[:400]
+                if resume:
+                    chans[str(cid)] = {"name": data["name"], "resume": resume,
+                                       "msgs": len(data["msgs"]), "maj": now().strftime("%Y-%m-%d %H:%M")}
+                    rep["salons_resumes"] += 1
+            except Exception as e:
+                rep["erreurs"].append(f"résumé #{data['name']}: {e}")
+                note_quota_error(e)
+        mark_memory_dirty()
 
     if not rep["messages"]:
         # Pas de bavardage lisible → on continue quand même : la STRUCTURE suffit
@@ -5655,6 +5699,27 @@ async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, fo
           f"{rep['messages']} msg lus dans {rep['salons_lus']}/{rep['salons']} salons"
           + (f" — erreurs: {rep['erreurs'][:2]}" if rep["erreurs"] else ""))
     return rep
+
+async def analyse_serveur_complet(progress=None):
+    """Analyse À FOND tous les serveurs du bot depuis le début : fiches membres, RÉSUMÉ de chaque
+    salon, but/ambiance du serveur, notes utiles. Alimente la page /serveur. Bilan agrégé."""
+    total = {"serveurs": 0, "salons_resumes": 0, "notes": 0, "fiches": 0, "erreurs": []}
+    guilds = list(bot.guilds)
+    for guild in guilds:
+        if quota_exhausted():
+            total["erreurs"].append("quota Cerebras épuisé — relance plus tard pour finir")
+            break
+        rep = await observe_guild(guild, per_channel=120, max_authors=12, max_channels=80,
+                                  force_purpose=True, deep=True, progress=progress)
+        total["serveurs"] += 1
+        total["salons_resumes"] += rep.get("salons_resumes", 0)
+        total["notes"] += rep.get("notes", 0)
+        total["fiches"] += rep.get("fiches", 0)
+        total["erreurs"] += rep.get("erreurs", [])[:3]
+    await flush_memory()
+    if progress:
+        progress(100, "Terminé")
+    return total
 
 # ============================================================
 # OUTILS D'EXPLORATION DU SERVEUR
@@ -11235,6 +11300,120 @@ load();
 </script>
 </body></html>"""
 
+SERVEUR_HTML = r"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serveur — ce que Tenebris a compris</title>
+<style>
+:root{--bg:#0e0d13;--panel:#17151f;--panel2:#1e1b28;--line:#2c2838;--txt:#e7e3f0;--dim:#9a93ad;--acc:#b57edc;--acc2:#7c5cbf}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh}
+header{padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0;color:var(--acc)}
+header a{color:var(--acc);text-decoration:none;font-size:13px}
+header button{background:var(--acc2);border:0;color:#fff;border-radius:8px;padding:7px 12px;cursor:pointer;margin-left:auto}
+.wrap{max-width:940px;margin:0 auto;padding:22px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:20px}
+.card h2{color:var(--acc);margin:0 0 4px}
+.meta{color:var(--dim);font-size:13px;margin-bottom:10px}
+.tags{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.tag{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:3px 11px;font-size:12.5px;color:var(--dim)}
+.summary{font-size:14.5px;line-height:1.55;margin:8px 0}
+h3{color:var(--txt);font-size:14px;margin:16px 0 8px;border-bottom:1px solid var(--line);padding-bottom:5px}
+.chan{padding:9px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+.chan:last-child{border-bottom:0}
+.chan .n{color:var(--acc)}
+.chan .r{color:var(--dim);margin-top:2px}
+.note{padding:5px 0;font-size:13.5px;color:var(--txt)}
+.note::before{content:"•";color:var(--acc);margin-right:8px}
+.empty{color:var(--dim);text-align:center;padding:40px}
+</style></head>
+<body>
+<header>
+  <h1>🛰️ Serveur — ce que Tenebris a compris</h1>
+  <a href="/admin">← retour admin</a> <a href="/forum">📚 forum</a>
+  <button onclick="analyser(this)">🔍 Analyser à fond</button>
+</header>
+<div class="wrap" id="wrap"><div class="empty">Chargement…</div></div>
+<script>
+const esc=s=>(s||"").replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function load(){
+  const r=await fetch("/admin/api/serveur"); if(r.status===401){location.href="/admin";return;}
+  const d=await r.json(); const w=document.getElementById("wrap");
+  const S=d.serveurs||[];
+  if(!S.length){w.innerHTML='<div class="empty">Aucun serveur analysé pour l\'instant. Clique « Analyser à fond ».</div>';return;}
+  w.innerHTML=S.map(g=>{
+    const tags=[g.type,g.theme,g.public,g.confiance?('confiance: '+g.confiance):''].filter(Boolean)
+      .map(t=>`<span class="tag">${esc(t)}</span>`).join("");
+    const acts=(g.activites||[]).map(a=>`<span class="tag">${esc(a)}</span>`).join("");
+    const chans=(g.channels||[]).map(c=>`<div class="chan"><div class="n">#${esc(c.name)}</div><div class="r">${esc(c.resume||"—")}</div></div>`).join("");
+    const notes=(g.notes||[]).map(n=>`<div class="note">${esc(n)}</div>`).join("");
+    return `<div class="card">
+      <h2>${esc(g.name)}</h2>
+      <div class="meta">${g.members||0} membres · dernière analyse : ${esc(g.last_observed||"jamais")}</div>
+      ${g.purpose?`<div class="summary"><b>But :</b> ${esc(g.purpose)}</div>`:``}
+      <div class="tags">${tags}${acts}</div>
+      ${g.summary?`<div class="summary">${esc(g.summary)}</div>`:``}
+      ${chans?`<h3>Salons (${(g.channels||[]).length})</h3>${chans}`:`<h3>Salons</h3><div class="r" style="color:var(--dim)">Pas encore de résumé par salon — lance « Analyser à fond ».</div>`}
+      ${notes?`<h3>Ce qu'elle en retient</h3>${notes}`:``}
+    </div>`;
+  }).join("");
+}
+async function analyser(btn){
+  btn.disabled=true; btn.textContent="Analyse lancée…";
+  const r=await fetch("/admin/api/serveur",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"analyser"})});
+  if(r.status===401){location.href="/admin";return;}
+  btn.textContent="⏳ en cours (reviens dans quelques min)";
+  setTimeout(()=>{btn.disabled=false;btn.textContent="🔄 Rafraîchir";btn.onclick=()=>load();},8000);
+}
+load();
+</script>
+</body></html>"""
+
+async def admin_serveur_api(request):
+    """Données de /serveur (admin) : identité, résumé par salon, notes — et déclenchement de l'analyse."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    if request.method == "POST":
+        data = await _read_json(request)
+        if data.get("action") == "analyser":
+            tid = task_new("Analyse complète du serveur")
+
+            async def _run():
+                try:
+                    task_step(tid, 3, "Lecture des salons…")
+                    bilan = await analyse_serveur_complet(progress=lambda p, e="": task_step(tid, p, e))
+                    reste = f" ({', '.join(bilan['erreurs'][:2])})" if bilan.get("erreurs") else ""
+                    task_done(tid, f"{bilan['serveurs']} serveur(s), {bilan['salons_resumes']} salon(s) "
+                                   f"résumé(s), {bilan['notes']} note(s), {bilan['fiches']} fiche(s). "
+                                   f"Voir /serveur.{reste}")
+                except Exception as e:
+                    task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+            asyncio.create_task(_run())
+            return web.json_response({"ok": True, "task": tid})
+        return web.json_response({"error": "action inconnue"}, status=400)
+
+    out = []
+    for gid, g in memory().get("guilds", {}).items():
+        chans = sorted(g.get("channels", {}).values(), key=lambda c: c.get("name", ""))
+        out.append({
+            "id": gid, "name": g.get("name", gid),
+            "summary": g.get("summary", ""), "purpose": g.get("purpose", ""),
+            "type": g.get("type", ""), "theme": g.get("theme", ""), "public": g.get("public", ""),
+            "activites": g.get("activites", []), "confiance": g.get("confiance", ""),
+            "members": g.get("members", 0), "last_observed": g.get("last_observed", ""),
+            "channels": chans,
+            "notes": [t for t in (_note_text(n) for n in g.get("notes", [])) if t][-15:],
+        })
+    return web.json_response({"serveurs": out})
+
+async def admin_serveur_page(request):
+    if not _is_authed(request):
+        raise web.HTTPFound("/admin")
+    return web.Response(text=SERVEUR_HTML, content_type="text/html")
+
 async def admin_forum_api(request):
     """Données de la page /forum : arborescence, contenu d'un sujet, recherche interne."""
     guard = _auth_guard(request)
@@ -11292,6 +11471,10 @@ def _register_admin_routes(app):
     app.router.add_get("/forum", admin_forum_page)
     app.router.add_get("/forum/", admin_forum_page)
     app.router.add_get("/admin/api/forum", admin_forum_api)
+    app.router.add_get("/serveur", admin_serveur_page)
+    app.router.add_get("/serveur/", admin_serveur_page)
+    app.router.add_get("/admin/api/serveur", admin_serveur_api)
+    app.router.add_post("/admin/api/serveur", admin_serveur_api)
     app.router.add_get("/admin", admin_index)
     app.router.add_get("/admin/", admin_index)
     app.router.add_post("/admin/api/login", admin_login)
@@ -11807,6 +11990,20 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           <button class="mini ghost" onclick="cleanMemory({merge:false, llm:false}, this)">⚡ Doublons + plafond (rapide, local)</button>
         </div>
         <div style="color:var(--dim);font-size:12px;margin-top:8px">La fusion et les contradictions utilisent le modèle (Cerebras) : un peu plus lentes, mais elles comprennent le sens. Le mode rapide reste 100&nbsp;% local.</div>
+      </div>
+
+      <div class="adm-sec">
+        <h3>Observation du serveur</h3>
+        <div style="color:var(--dim);font-size:13px;margin-bottom:12px">
+          Tenebris analyse le serveur À FOND (tous les salons accessibles, depuis le début) : elle
+          résume <b>chaque salon</b>, cerne le but et l'ambiance, et prend des notes utiles — le tout
+          consultable dans une page dédiée (comme /forum, mais pour le serveur).
+          <a href="/serveur" target="_blank" style="color:var(--acc);margin-left:6px">🛰️ Ouvrir /serveur ↗</a>
+        </div>
+        <div class="btnrow" style="flex-wrap:wrap;gap:8px">
+          <button class="mini" onclick="analyserServeur(this)">🔍 Analyser le serveur à fond</button>
+        </div>
+        <div style="color:var(--dim);font-size:12px;margin-top:8px">Ça lit beaucoup de messages et fait un résumé par salon (Cerebras) : quelques minutes selon la taille du serveur. Tourne en fond.</div>
       </div>
 
       <div class="adm-sec">
@@ -12763,6 +12960,12 @@ async function loadLibrary(){
 async function libToggle(){
   const {status, body} = await jpost('/admin/api/library', {action:'toggle', actif: $('#lib_toggle').checked});
   if(status===200){ renderLibrary(body); toast(body.actif?'Remplissage automatique activé.':'Remplissage automatique coupé.'); }
+}
+async function analyserServeur(btn){
+  if(!window.confirm("Lancer une analyse À FOND du serveur (tous les salons, résumé par salon) ? Ça peut prendre quelques minutes et consomme du quota.")) return;
+  const {status, body} = await busy(btn, ()=>jpost('/admin/api/serveur', {action:'analyser'}), '…');
+  if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
+  if(body.task){ taskFollow(body.task, 'Analyse complète du serveur', null); }
 }
 async function libAction(action, btn){
   if(action==='vider' && !window.confirm('Vider toute la bibliothèque du forum ?')) return;
