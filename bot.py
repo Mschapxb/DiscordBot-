@@ -4856,6 +4856,7 @@ def forum_weave():
     global _forum_content_dirty
     from collections import Counter
     lib, fc = library(), forum_content()
+    mentions = _add_mention_links()        # liens par NOM (cités sans hyperlien)
     # 1) rétroliens : qui pointe vers moi ?
     retro = {}
     for src_url, e in fc.items():
@@ -4893,6 +4894,7 @@ def forum_weave():
     orphelins = sum(1 for u in tous if not _chemin_of(u))
     return {"retroliens": sum(len(v) for v in retro.values()),
             "liens": sum(len(e.get("liens", [])) for e in fc.values()),
+            "mentions": mentions,
             "rubriques_inferees": inferees, "orphelins": orphelins}
 
 async def forum_repair(progress=None):
@@ -4930,6 +4932,130 @@ async def forum_repair(progress=None):
         progress(100, "Terminé")
     stats["rubriques_relues"] = relues
     return stats
+
+# --- Réécriture des articles (synthèse propre + notes pour elle) --------------
+REWRITE_SYSTEM = (
+    "Tu es l'archiviste d'un wiki. On te donne le contenu BRUT d'un article (forum-wiki), souvent "
+    "bruité : citations, signatures, dates, hors-sujet, redites. Tu produis une FICHE PROPRE et "
+    "COMPLÈTE, en gardant TOUTE l'information utile (info par info) mais réorganisée et lisible. Tu "
+    "n'INVENTES rien, tu ne rajoutes aucun fait absent. Réponds UNIQUEMENT en JSON : "
+    '{"synthese": "l\'article réécrit, clair et structuré, sans le bruit du forum", '
+    '"notes": ["fait clé court 1", "fait clé court 2", …]}. '
+    "Les notes : 3 à 8 faits saillants très courts, pour se repérer vite sans tout relire."
+)
+FORUM_REWRITE_MAX_CHARS = 12000   # texte brut envoyé au modèle
+FORUM_SYNTHESE_MAX = 9000         # taille max de la synthèse stockée
+
+async def forum_rewrite_batch(taille=6, progress=None):
+    """Réécrit un LOT d'articles pas encore synthétisés : pour chacun, une SYNTHÈSE propre et
+    complète + des NOTES clés (mémoire de Tenebris). Incrémental : rappeler continue là où ça s'est
+    arrêté. Quota-aware. Renvoie {faits, restants}."""
+    fc = forum_content()
+    cibles = [u for u, e in fc.items() if e.get("contenu") and not e.get("synthese")]
+    total_restant = len(cibles)
+    faits = 0
+    for i, url in enumerate(cibles[:taille], 1):
+        if quota_exhausted():
+            break
+        e = fc[url]
+        if progress:
+            progress(int(90 * i / min(taille, len(cibles) or 1)), f"Réécriture {i}…")
+        try:
+            resp = await extract_completion(
+                [{"role": "system", "content": REWRITE_SYSTEM},
+                 {"role": "user", "content": f"Titre : {e.get('titre','')}\n"
+                                             f"Rubrique : {e.get('chemin','')}\n\n"
+                                             f"Contenu brut :\n{e.get('contenu','')[:FORUM_REWRITE_MAX_CHARS]}"}],
+                max_tokens=1600, temperature=0.2)
+            raw = re.sub(r"^```(json)?|```$", "", (resp.choices[0].message.content or "").strip(),
+                         flags=re.MULTILINE).strip()
+            data = json.loads(raw)
+        except Exception as ex:
+            note_quota_error(ex)
+            print(f"⚠️ Réécriture ({e.get('titre','?')[:30]}) : {str(ex)[:70]}")
+            continue
+        synth = (data.get("synthese") or "").strip()
+        notes = [str(n).strip() for n in (data.get("notes") or []) if str(n).strip()][:8]
+        if synth:
+            e["synthese"] = synth[:FORUM_SYNTHESE_MAX]
+            e["notes"] = notes
+            e["synth_maj"] = now().strftime("%Y-%m-%d %H:%M")
+            faits += 1
+        if faits % 5 == 0:
+            save_forum_content()
+    save_forum_content(force=True)
+    return {"faits": faits, "restants": max(0, total_restant - faits)}
+
+def _title_index():
+    """{ titre_normalisé : url } des articles, pour repérer les MENTIONS par nom. On écarte les
+    titres trop courts/ambigus (< 4 lettres normalisées)."""
+    idx = {}
+    for url, e in library().items():
+        n = _norm(e.get("titre") or "")
+        if len(n) >= 4 and n not in idx:
+            idx[n] = url
+    return idx
+
+def _add_mention_links():
+    """Liens par MENTION : un article qui NOMME un autre (« Tasglev ») sans hyperlien est quand même
+    relié. On scanne le contenu de chaque fiche à la recherche des titres des autres fiches."""
+    idx = _title_index()
+    fc = forum_content()
+    ajouts = 0
+    for url, e in fc.items():
+        contenu = e.get("contenu") or ""
+        if not contenu:
+            continue
+        hay = _norm(contenu)
+        liens = e.setdefault("liens", [])
+        deja = {l.get("url") for l in liens}
+        for terme, cible in idx.items():
+            if cible == url or cible in deja or len(liens) >= 30:
+                continue
+            if re.search(r"(?<![a-z0-9])" + re.escape(terme) + r"(?![a-z0-9])", hay):
+                liens.append({"url": cible,
+                              "titre": (library().get(cible, {}).get("titre") or _slug_title(cible))[:120],
+                              "type": "mention"})
+                deja.add(cible)
+                ajouts += 1
+    return ajouts
+
+async def consulter_forum(sujet):
+    """Répond depuis la COPIE INTERNE du forum (synthèses + notes + liens) — INSTANTANÉ, sans rien
+    re-télécharger. C'est la mémoire du wiki : Tenebris s'y réfère au lieu de tout relire à chaque fois."""
+    hits = library_lookup(sujet, limit=4)
+    if not hits:
+        return ("Rien dans ma copie interne du forum sur ce sujet. "
+                "Au besoin je peux fouiller le forum en direct (fouiller_forum).")
+    fc = forum_content()
+    blocs = []
+    for h in hits:
+        u = h.get("url")
+        e = fc.get(u, {})
+        titre = e.get("titre") or h.get("titre") or _slug_title(u or "")
+        chemin = _chemin_of(u)
+        corps = (e.get("synthese") or e.get("contenu") or "").strip()
+        notes = e.get("notes") or []
+        liens = [l.get("titre") for l in e.get("liens", []) if l.get("titre")][:8]
+        if not corps and not notes:
+            continue
+        bloc = f"=== {titre} ==="
+        if chemin:
+            bloc += f"\nRubrique : {chemin}"
+        if notes:
+            bloc += "\nPoints clés : " + " · ".join(notes)
+        if corps:
+            bloc += "\n" + corps[:3500]
+        if liens:
+            bloc += "\nLiée à : " + ", ".join(liens)
+        bloc += f"\n(source : {u})"
+        blocs.append(bloc)
+    if not blocs:
+        return ("Ma copie interne n'a pas encore de contenu sur ce sujet — lance une « Copie "
+                "complète » dans l'admin. Je peux sinon fouiller le forum en direct.")
+    return (WEB_WRITE_DIRECTIVE +
+            "TA COPIE INTERNE DU FORUM (déjà lue, fiable — réponds À PARTIR DE ÇA et cite les fiches) :\n\n"
+            + "\n\n".join(blocs))
 
 def save_forum_content(force=False):
     global _forum_content_dirty
@@ -6538,8 +6664,14 @@ TOOLS = [
             "urls": {"type": "string", "description": "Une ou plusieurs URLs (séparées par des espaces ou virgules)"}},
             "required": ["urls"]}}},
     {"type": "function", "function": {
+        "name": "consulter_forum",
+        "description": "TA MÉMOIRE DU FORUM — à essayer EN PREMIER pour toute question de lore/univers du projet (Orbis Naturae). Répond depuis ta COPIE INTERNE déjà lue (fiches réécrites, notes clés, liens entre articles), INSTANTANÉMENT et sans rien re-télécharger. Utilise-le pour le lore connu (personnages, lieux, factions, créatures…). Ne passe à fouiller_forum (lecture en direct, plus lente) QUE si ta copie ne suffit pas, est vide sur le sujet, ou qu'on veut du TRÈS récent. Cite les fiches que tu utilises.",
+        "parameters": {"type": "object", "properties": {
+            "sujet": {"type": "string", "description": "Ce que tu cherches dans ta copie (ex : 'Linnorms', 'Empire Skaldien', 'Malaso')"}},
+            "required": ["sujet"]}}},
+    {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement au lieu de partir de l'accueil. Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section, sans aller voir ailleurs. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien).",
+        "description": "Lecture EN DIRECT du forum (plus lente). N'y recours qu'APRÈS consulter_forum si ta copie interne ne suffit pas, ou pour du contenu récent/absent de ta copie. APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement au lieu de partir de l'accueil. Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section, sans aller voir ailleurs. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien).",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "description": "À remplir dès qu'un lien précis est donné : section (/f2-...), sujet (/t45-...) ou autre site. Laisse vide seulement pour une recherche générale sur tout le forum officiel."},
             "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"},
@@ -6914,6 +7046,8 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             return head + "\n" + "\n".join(f"- ({n['date'][:10]}) {n['text']}" for n in notes)
         if name == "lire_page":
             return await tool_lire_page(args.get("urls", ""))
+        if name == "consulter_forum":
+            return await consulter_forum(args.get("sujet", ""))
         if name == "fouiller_forum":
             sujet = args.get("sujet", "")
             # La bibliothèque ne REMPLACE plus la lecture (elle ne stocke que des mots-clés) :
@@ -10582,6 +10716,31 @@ async def admin_library(request):
         asyncio.create_task(_run())
         return web.json_response({"ok": True, "task": tid})
 
+    if action == "reecrire":
+        tid = task_new("Réécriture des articles")
+
+        async def _run():
+            try:
+                tour = 0
+                restants = 1
+                while restants > 0 and tour < 60 and not quota_exhausted():
+                    tour += 1
+                    task_step(tid, min(95, tour * 4), f"Réécriture… (lot {tour})")
+                    st = await forum_rewrite_batch(taille=6)
+                    restants = st.get("restants", 0)
+                    if st.get("faits", 0) == 0:
+                        break
+                await flush_memory()
+                reste = ("" if not restants else
+                         f" Il reste {restants} article(s) — reclique pour continuer "
+                         f"(ou quota Cerebras à reposer).")
+                task_done(tid, f"Articles réécrits en fiches propres + notes clés.{reste}")
+            except Exception as e:
+                task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+        asyncio.create_task(_run())
+        return web.json_response({"ok": True, "task": tid})
+
     if action == "reparer":
         tid = task_new("Réparation & tissage du forum")
 
@@ -10915,6 +11074,10 @@ main{flex:1;display:flex;min-height:0}
 .tleaf{padding:2px 0 2px 16px;font-size:13px;color:var(--txt)}
 .dim{color:var(--dim);font-size:12px}
 #view h3{margin:18px 0 8px}
+#view .notes{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:6px 14px;margin-bottom:16px;font-size:13.5px}
+#view .notes ul{margin:6px 0;padding-left:20px}
+#view .notes li{margin:3px 0}
+.synthead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
 #view pre{white-space:pre-wrap;word-wrap:break-word;line-height:1.55;font-family:inherit;font-size:14.5px;margin:0}
 #view a.src{color:var(--acc);font-size:12px;text-decoration:none}
 .empty{color:var(--dim);margin-top:40px;text-align:center}
@@ -10975,7 +11138,10 @@ async function openTopic(url, el){
         + d.retroliens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")+`</div>`:``)
     + `<div style="margin:10px 0"><button class="mini" onclick='toggleTree(${JSON.stringify(d.url)},${JSON.stringify(d.titre)})'>🌳 Arbre des liens</button></div>`
     + `<div id="tree-mount"></div>`
-    + (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » ou « Réparer » dans l'admin.</div>`);
+    + ((d.notes&&d.notes.length)?`<div class="notes"><b>📝 Notes (mémoire de Tenebris) :</b><ul>`+d.notes.map(n=>`<li>${esc(n)}</li>`).join("")+`</ul></div>`:``)
+    + (d.synthese
+        ? `<div class="synthwrap"><div class="synthead"><b>✍️ Fiche réécrite</b> <a href="#" onclick="toggleRaw();return false" id="rawlink" class="src">voir le brut</a></div><pre id="synth">${esc(d.synthese)}</pre><pre id="rawc" style="display:none">${esc(d.contenu||"")}</pre></div>`
+        : (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » ou « Réparer » dans l'admin.</div>`));
   v.scrollTop=0;
 }
 async function doSearch(){
@@ -10990,6 +11156,13 @@ async function doSearch(){
        <div class="x">${esc(r.chemin)}</div>
        ${r.extrait?`<div class="x">${esc(r.extrait)}</div>`:``}
      </div>`).join("");
+}
+function toggleRaw(){
+  const s=document.getElementById("synth"), r=document.getElementById("rawc"), l=document.getElementById("rawlink");
+  if(!s||!r) return;
+  const rawShown=r.style.display!=="none";
+  r.style.display=rawShown?"none":"block"; s.style.display=rawShown?"block":"none";
+  l.textContent=rawShown?"voir le brut":"voir la fiche réécrite";
 }
 document.getElementById("q").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();});
 // --- Arbre des liens : depuis un article, on déplie ses voisins de proche en proche ---
@@ -11070,6 +11243,8 @@ async def admin_forum_api(request):
             "chemin": lib_e.get("chemin", "") or (e or {}).get("chemin", ""),
             "resume": lib_e.get("resume", ""),
             "contenu": (e or {}).get("contenu", ""),
+            "synthese": (e or {}).get("synthese", ""),
+            "notes": (e or {}).get("notes", []),
             "liens": (e or {}).get("liens", []),
             "retroliens": (e or {}).get("retroliens", []),
             "maj": (e or {}).get("maj", "") or lib_e.get("maj", ""),
@@ -11634,6 +11809,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <div class="btnrow" style="flex-wrap:wrap;gap:8px">
           <button class="mini" id="lib_copy" onclick="libAction('copie', this)">📚 Copie complète (contenu)</button>
           <button class="mini" id="lib_fix" onclick="libAction('reparer', this)">🔧 Réparer & tisser (rubriques + liens)</button>
+          <button class="mini" id="lib_rw" onclick="libAction('reecrire', this)">✍️ Réécrire (fiches propres + notes)</button>
           <button class="mini ghost" id="lib_map" onclick="libAction('carte', this)">🗺️ Cartographier</button>
           <button class="mini ghost" id="lib_sum" onclick="libAction('resumer', this)">📖 Indexer maintenant</button>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-left:auto">
@@ -12580,7 +12756,7 @@ async function libAction(action, btn){
   const {status, body} = await busy(btn, ()=>jpost('/admin/api/library', {action}), '…');
   if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
   if(body.task){
-    const lbl = action==='carte'?'Cartographie du forum':(action==='copie'?'Copie complète du forum':(action==='reparer'?'Réparation & tissage':'Résumés du forum'));
+    const lbl = action==='carte'?'Cartographie du forum':(action==='copie'?'Copie complète du forum':(action==='reparer'?'Réparation & tissage':(action==='reecrire'?'Réécriture des articles':'Résumés du forum')));
     taskFollow(body.task, lbl, loadLibrary);
   } else {
     renderLibrary(body);
