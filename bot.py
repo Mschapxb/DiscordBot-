@@ -4843,6 +4843,94 @@ def store_topic_copy(url, entry, title, ptxt, links, sections):
     set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt, liens)
     return liens
 
+def _chemin_of(url):
+    """Rubrique d'un article (index prioritaire, sinon copie). '' si aucune."""
+    return (library().get(url, {}).get("chemin") or forum_content().get(url, {}).get("chemin") or "").strip()
+
+def forum_weave():
+    """INSPECTE la copie interne pour la TISSER — sans rien re-télécharger :
+      • construit le graphe : pour chaque article, QUI le cite (rétroliens / backlinks) ;
+      • pour un article SANS rubrique, en DÉDUIT une depuis ses voisins (ceux qui le citent ou
+        qu'il cite et qui, eux, en ont une), marquée « ≈ » car inférée.
+    Écrase la copie avec le résultat. Purement local. Renvoie des stats."""
+    global _forum_content_dirty
+    from collections import Counter
+    lib, fc = library(), forum_content()
+    # 1) rétroliens : qui pointe vers moi ?
+    retro = {}
+    for src_url, e in fc.items():
+        titre_src = (lib.get(src_url, {}).get("titre") or e.get("titre") or _slug_title(src_url))[:120]
+        for l in e.get("liens", []):
+            cible = l.get("url")
+            if not cible:
+                continue
+            arr = retro.setdefault(cible, [])
+            if src_url not in [r["url"] for r in arr]:
+                arr.append({"url": src_url, "titre": titre_src})
+    for url, e in fc.items():
+        e["retroliens"] = retro.get(url, [])[:24]
+
+    # 2) rubriques manquantes → inférence par voisinage (majorité des voisins rubriqués)
+    tous = set(list(lib) + list(fc))
+    def rub_ferme(u):                       # rubrique SÛRE (non inférée)
+        c = _chemin_of(u)
+        return c if c and not c.startswith("≈") else ""
+    inferees = 0
+    for url in [u for u in tous if not _chemin_of(u)]:
+        voisins = [l["url"] for l in fc.get(url, {}).get("liens", [])] + \
+                  [r["url"] for r in retro.get(url, [])]
+        cnt = Counter(rub_ferme(v) for v in voisins if rub_ferme(v))
+        if cnt:
+            approx = "≈ " + cnt.most_common(1)[0][0]
+            if url in lib:
+                lib[url]["chemin"] = approx
+            if url in fc:
+                fc[url]["chemin"] = approx
+            inferees += 1
+
+    _forum_content_dirty = True
+    mark_memory_dirty()
+    orphelins = sum(1 for u in tous if not _chemin_of(u))
+    return {"retroliens": sum(len(v) for v in retro.values()),
+            "liens": sum(len(e.get("liens", [])) for e in fc.values()),
+            "rubriques_inferees": inferees, "orphelins": orphelins}
+
+async def forum_repair(progress=None):
+    """RÉPARE les articles SANS rubrique en les RELISANT (le fil d'Ariane vient de la page réelle),
+    puis TISSE le graphe (rétroliens + inférence). Écrase la copie. C'est l'outil « à la demande »."""
+    lib = library()
+    a_reparer = [u for u in lib if not _chemin_of(u)]
+    total = len(a_reparer) or 1
+    relues = 0
+
+    async def grab(u):
+        await asyncio.sleep(0.15)
+        return await _fetch_raw(u)
+
+    for i, url in enumerate(a_reparer, 1):
+        if progress:
+            progress(int(78 * i / total), f"Relecture {i}/{total}…")
+        entry = lib.get(url, {})
+        got = await _read_topic_fully(grab, url, entry.get("titre", ""))
+        if not got or not got[1].strip():
+            continue
+        title, ptxt, _p, links, sections = got
+        avant = _chemin_of(url)
+        store_topic_copy(url, entry, title, ptxt, links, sections)
+        if _chemin_of(url) and not avant:
+            relues += 1
+        if i % 10 == 0:
+            save_forum_content()
+    if progress:
+        progress(88, "Tissage des liens et rubriques…")
+    stats = forum_weave()
+    save_forum_content(force=True)
+    mark_memory_dirty()
+    if progress:
+        progress(100, "Terminé")
+    stats["rubriques_relues"] = relues
+    return stats
+
 def save_forum_content(force=False):
     global _forum_content_dirty
     if _forum_content is None or (not _forum_content_dirty and not force):
@@ -4864,7 +4952,9 @@ def forum_content_stats():
     except OSError:
         pass
     avec = sum(1 for e in fc.values() if e.get("contenu"))
-    return {"sujets_copies": avec, "octets": octets}
+    liens = sum(len(e.get("liens", [])) for e in fc.values())
+    sans_rubrique = sum(1 for u in set(list(library()) + list(fc)) if not _chemin_of(u))
+    return {"sujets_copies": avec, "octets": octets, "liens": liens, "sans_rubrique": sans_rubrique}
 
 def forum_tree():
     """Arborescence pour la page /forum : rubrique -> [ {url, titre, maj, copie} ], à partir de
@@ -4961,7 +5051,8 @@ async def library_copy_all(progress=None, with_keywords=True):
 
     save_forum_content(force=True)
     mark_memory_dirty()
-    # plus rien à résumer en fond : on a déjà tout lu
+    forum_weave()               # tisse le graphe (rétroliens) + infère les rubriques manquantes
+    save_forum_content(force=True)
     library_meta()["a_resumer"] = [u for u in library_meta().get("a_resumer", []) if not _library_fresh(lib.get(u, {}))]
     if progress:
         progress(100, f"{copies} sujet(s) copiés")
@@ -10491,6 +10582,30 @@ async def admin_library(request):
         asyncio.create_task(_run())
         return web.json_response({"ok": True, "task": tid})
 
+    if action == "reparer":
+        tid = task_new("Réparation & tissage du forum")
+
+        async def _run():
+            try:
+                task_step(tid, 3, "Inspection de la copie…")
+                st = await forum_repair(progress=lambda p, e="": task_step(tid, p, e))
+                await flush_memory()
+                task_done(tid, f"{st.get('rubriques_relues', 0)} rubrique(s) réparée(s) par relecture, "
+                               f"{st.get('rubriques_inferees', 0)} déduite(s) par voisinage, "
+                               f"{st.get('retroliens', 0)} rétrolien(s) tissés. "
+                               f"Reste {st.get('orphelins', 0)} sans rubrique.")
+            except Exception as e:
+                task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
+
+        asyncio.create_task(_run())
+        return web.json_response({"ok": True, "task": tid})
+
+    if action == "tisser":
+        st = forum_weave()
+        save_forum_content(force=True)
+        await flush_memory()
+        return web.json_response({"ok": True, **st, "copie": forum_content_stats()})
+
     if action == "copie":
         tid = task_new("Copie complète du forum")
 
@@ -10788,6 +10903,18 @@ main{flex:1;display:flex;min-height:0}
 #view .liens{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;margin-bottom:16px;line-height:1.8}
 #view .liens a{color:var(--acc);text-decoration:none}
 #view .liens a:hover{text-decoration:underline}
+#view .path.orph{color:#e0a24e}
+.tree{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--panel);margin-bottom:14px}
+.tnode{padding:2px 0}
+.tnode>a,.tleaf a{color:var(--acc);text-decoration:none}
+.tnode>a:hover,.tleaf a:hover{text-decoration:underline}
+.tw{cursor:pointer;user-select:none;color:var(--dim);display:inline-block;width:14px}
+.tkids{margin-left:16px;border-left:1px solid var(--line);padding-left:10px}
+.twrap{position:relative}
+.ttype{color:var(--dim);font-size:11px;margin-right:2px}
+.tleaf{padding:2px 0 2px 16px;font-size:13px;color:var(--txt)}
+.dim{color:var(--dim);font-size:12px}
+#view h3{margin:18px 0 8px}
 #view pre{white-space:pre-wrap;word-wrap:break-word;line-height:1.55;font-family:inherit;font-size:14.5px;margin:0}
 #view a.src{color:var(--acc);font-size:12px;text-decoration:none}
 .empty{color:var(--dim);margin-top:40px;text-align:center}
@@ -10801,6 +10928,7 @@ main{flex:1;display:flex;min-height:0}
   <h1>📚 Forum — copie interne</h1>
   <span class="stats" id="stats">…</span>
   <a href="/admin">← retour admin</a>
+  <a href="#" onclick="showGraph();return false" style="margin-left:2px">🌳 vue graphe</a>
   <div id="search"><input id="q" placeholder="Rechercher dans le forum…" />
     <button onclick="doSearch()">Chercher</button></div>
 </header>
@@ -10838,13 +10966,16 @@ async function openTopic(url, el){
   const v=document.getElementById("view");
   if(d.error){v.innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
   v.innerHTML = `<h2>${esc(d.titre)}</h2>`
-    + (d.chemin?`<div class="path">📍 ${esc(d.chemin)}</div>`:``)
+    + (d.chemin?`<div class="path">📍 ${esc(d.chemin)}</div>`:`<div class="path orph">⚠️ sans rubrique</div>`)
     + `<div class="maj">Copié le ${esc(d.maj||"?")} · <a class="src" href="${esc(d.url)}" target="_blank">voir sur le forum ↗</a></div>`
     + (d.resume?`<div class="kw">🔑 ${esc(d.resume)}</div>`:``)
-    + ((d.liens&&d.liens.length)?`<div class="liens"><b>🔗 Articles liés :</b> `
-        + d.liens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")
-        + `</div>`:``)
-    + (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » dans l'admin.</div>`);
+    + ((d.liens&&d.liens.length)?`<div class="liens"><b>🔗 Cite :</b> `
+        + d.liens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")+`</div>`:``)
+    + ((d.retroliens&&d.retroliens.length)?`<div class="liens"><b>🔙 Cité par :</b> `
+        + d.retroliens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")+`</div>`:``)
+    + `<div style="margin:10px 0"><button class="mini" onclick='toggleTree(${JSON.stringify(d.url)},${JSON.stringify(d.titre)})'>🌳 Arbre des liens</button></div>`
+    + `<div id="tree-mount"></div>`
+    + (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » ou « Réparer » dans l'admin.</div>`);
   v.scrollTop=0;
 }
 async function doSearch(){
@@ -10861,6 +10992,59 @@ async function doSearch(){
      </div>`).join("");
 }
 document.getElementById("q").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();});
+// --- Arbre des liens : depuis un article, on déplie ses voisins de proche en proche ---
+async function toggleTree(url, titre){
+  const m=document.getElementById("tree-mount");
+  if(m.dataset.open==="1"){ m.innerHTML=""; m.dataset.open="0"; return; }
+  m.dataset.open="1"; m.innerHTML='<div class="tree"></div>';
+  await growNode(m.querySelector(".tree"), url, titre, new Set([url]));
+}
+async function growNode(parent, url, titre, seen){
+  const node=document.createElement("div"); node.className="tnode";
+  node.innerHTML=`<span class="tw">▸</span> <a href="#" onclick='openTopic(${JSON.stringify(url)});return false'>${esc(titre)}</a>`;
+  const kids=document.createElement("div"); kids.className="tkids"; kids.style.display="none";
+  parent.appendChild(node); parent.appendChild(kids);
+  let loaded=false;
+  node.querySelector(".tw").onclick=async(ev)=>{
+    ev.stopPropagation();
+    const open=kids.style.display!=="none";
+    kids.style.display=open?"none":"block";
+    node.querySelector(".tw").textContent=open?"▸":"▾";
+    if(!open&&!loaded){
+      loaded=true;
+      const d=await api("action=topic&url="+encodeURIComponent(url)); if(!d) return;
+      const voisins=[...(d.liens||[]).map(l=>({...l,type:'→'})),...(d.retroliens||[]).map(l=>({...l,type:'←'}))];
+      if(!voisins.length){ kids.innerHTML='<div class="tleaf">— aucun lien —</div>'; return; }
+      for(const vz of voisins){
+        if(seen.has(vz.url)){
+          const dupe=document.createElement("div"); dupe.className="tleaf";
+          dupe.innerHTML=`${vz.type} <a href="#" onclick='openTopic(${JSON.stringify(vz.url)});return false'>${esc(vz.titre)}</a> <span class="dim">(déjà dans l'arbre)</span>`;
+          kids.appendChild(dupe);
+        } else {
+          const s2=new Set(seen); s2.add(vz.url);
+          const wrap=document.createElement("div"); wrap.className="twrap";
+          wrap.innerHTML=`<span class="ttype">${vz.type}</span>`;
+          kids.appendChild(wrap);
+          await growNode(wrap, vz.url, vz.titre, s2);
+        }
+      }
+    }
+  };
+}
+// --- Vue graphe : orphelins (sans rubrique) + articles les plus connectés ---
+async function showGraph(){
+  const d=await api("action=graph"); if(!d) return;
+  if(cur){cur.classList.remove("active");cur=null;}
+  const v=document.getElementById("view");
+  const orph=d.orphelins||[], top=d.plus_lies||[];
+  v.innerHTML=`<h2>🌳 Tissage du forum</h2>`
+   +`<div class="kw">${(d.stats&&d.stats.total)||0} sujets · ${(d.stats&&d.stats.liens)||0} liens · <b style="color:${orph.length?'#e0a24e':'#5fd68a'}">${orph.length}</b> sans rubrique</div>`
+   +`<h3 style="color:var(--acc)">Articles les plus connectés</h3>`
+   + top.map(t=>`<div class="res" onclick='openTopic(${JSON.stringify(t.url)})'><div class="t">${esc(t.titre)} <span class="dim">· ${t.degre} liens</span></div><div class="x">${esc(t.chemin||'⚠️ sans rubrique')}</div></div>`).join("")
+   + (orph.length?`<h3 style="color:#e0a24e">Sans rubrique (${orph.length}) — lance « Réparer » dans l'admin</h3>`
+      + orph.map(t=>`<div class="res" onclick='openTopic(${JSON.stringify(t.url)})'><div class="t">${esc(t.titre)}</div></div>`).join(""):'');
+  v.scrollTop=0;
+}
 load();
 </script>
 </body></html>"""
@@ -10887,10 +11071,27 @@ async def admin_forum_api(request):
             "resume": lib_e.get("resume", ""),
             "contenu": (e or {}).get("contenu", ""),
             "liens": (e or {}).get("liens", []),
+            "retroliens": (e or {}).get("retroliens", []),
             "maj": (e or {}).get("maj", "") or lib_e.get("maj", ""),
         })
     if action == "search":
         return web.json_response({"resultats": forum_search(request.query.get("q", ""))})
+    if action == "graph":
+        # Vue d'ensemble du tissage : orphelins (sans rubrique) et articles les plus connectés.
+        lib, fc = library(), forum_content()
+        degres = []
+        for url in set(list(lib) + list(fc)):
+            e = fc.get(url, {})
+            titre = (lib.get(url, {}).get("titre") or e.get("titre") or _slug_title(url))[:120]
+            deg = len(e.get("liens", [])) + len(e.get("retroliens", []))
+            degres.append({"url": url, "titre": titre, "chemin": _chemin_of(url), "degre": deg})
+        orphelins = [d for d in degres if not d["chemin"]]
+        degres.sort(key=lambda d: -d["degre"])
+        return web.json_response({
+            "orphelins": orphelins[:100],
+            "plus_lies": [d for d in degres if d["degre"] > 0][:40],
+            "stats": {**library_stats(), **forum_content_stats()},
+        })
     return web.json_response({"error": "action inconnue"}, status=400)
 
 async def admin_forum_page(request):
@@ -11432,6 +11633,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <div id="lib_stats" style="font-size:13px;margin-bottom:12px;color:var(--dim)">Chargement…</div>
         <div class="btnrow" style="flex-wrap:wrap;gap:8px">
           <button class="mini" id="lib_copy" onclick="libAction('copie', this)">📚 Copie complète (contenu)</button>
+          <button class="mini" id="lib_fix" onclick="libAction('reparer', this)">🔧 Réparer & tisser (rubriques + liens)</button>
           <button class="mini ghost" id="lib_map" onclick="libAction('carte', this)">🗺️ Cartographier</button>
           <button class="mini ghost" id="lib_sum" onclick="libAction('resumer', this)">📖 Indexer maintenant</button>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-left:auto">
@@ -12359,6 +12561,8 @@ function renderLibrary(d){
     '<b style="color:var(--txt)">'+s.total+'</b> sujets cartographiés · '+
     '<b style="color:#7ddc9a">'+s.resumes+'</b> résumés à jour ('+pct+' %) · '+
     ((d.copie&&d.copie.sujets_copies)? ('<b style="color:var(--acc)">'+d.copie.sujets_copies+'</b> copiés intégralement ('+Math.round((d.copie.octets||0)/1024)+' Ko) · ') : '')+
+    ((d.copie&&d.copie.liens)? ('<b>'+d.copie.liens+'</b> liens · ') : '')+
+    ((d.copie&&d.copie.sans_rubrique)? ('<b style="color:#e0a24e">'+d.copie.sans_rubrique+'</b> sans rubrique · ') : '')+
     (s.a_faire? ('<b>'+s.a_faire+'</b> en attente · ') : '')+
     'dernière carte : '+(s.derniere_carte||'jamais');
 }
@@ -12376,7 +12580,7 @@ async function libAction(action, btn){
   const {status, body} = await busy(btn, ()=>jpost('/admin/api/library', {action}), '…');
   if(status!==200){ toast((body&&body.error)||'Échec.', true); return; }
   if(body.task){
-    const lbl = action==='carte'?'Cartographie du forum':(action==='copie'?'Copie complète du forum':'Résumés du forum');
+    const lbl = action==='carte'?'Cartographie du forum':(action==='copie'?'Copie complète du forum':(action==='reparer'?'Réparation & tissage':'Résumés du forum'));
     taskFollow(body.task, lbl, loadLibrary);
   } else {
     renderLibrary(body);
