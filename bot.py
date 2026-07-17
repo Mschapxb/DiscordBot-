@@ -4069,10 +4069,14 @@ def _proper_nouns(text, exclude_words, top=6):
 # on tombe sur une page de login et on conclut « rien trouvé », alors que les sujets existent.
 # On construit donc notre propre index : sitemap.xml (des centaines de sujets d'un coup),
 # puis à défaut exploration des rubriques. On y cherche ensuite les noms directement.
-INDEX_MAX_ENTRIES = 1500
-INDEX_SITEMAPS = 6          # sitemaps enfants suivis
-INDEX_MAX_SECTIONS = 40     # rubriques explorées (le forum est PROFOND : Monde > Continent >
-INDEX_DEPTH = 5             # Empire > Géographie > La crique… → il faut descendre loin)
+INDEX_MAX_ENTRIES = 2000
+INDEX_SITEMAPS = 30         # sitemaps enfants suivis (forumactif découpe la liste en plusieurs fichiers)
+INDEX_MAX_SECTIONS = 200    # rubriques ET pages de pagination explorées (le forem est PROFOND :
+INDEX_DEPTH = 7             # Monde > Continent > Empire > Géographie > La crique… → descendre loin)
+# Pages 2, 3… d'une même rubrique forumactif : /f2p25-… /c3p50-… ou ?start=25. Sans les suivre,
+# on ne voit que la 1re page de chaque section → la moitié des sujets manquent.
+_FORUM_PAGE_RE = re.compile(r'/[fc]\d+p\d+-', re.IGNORECASE)
+_START_PARAM_RE = re.compile(r'[?&]start=\d+', re.IGNORECASE)
 _LOC_RE = re.compile(r"(?is)<loc>\s*([^<\s]+)\s*</loc>")
 
 def _slug_title(url):
@@ -4083,7 +4087,7 @@ def _slug_title(url):
     slug = m.group(1) if m else path.rsplit("/", 1)[-1]
     return re.sub(r"[-_]+", " ", slug).strip().lower()
 
-async def build_forum_index(grab, origin, root_html=None):
+async def build_forum_index(grab, origin, root_html=None, progress=None):
     """Construit l'index du forum : {url_sujet: titre} + {url_sujet: chemin_hiérarchique}.
     Explore les rubriques EN PROFONDEUR (Monde > Continent > Empire > Géographie > …),
     car les fiches (Tasglev) sont enfouies loin sous la racine."""
@@ -4128,6 +4132,9 @@ async def build_forum_index(grab, origin, root_html=None):
             continue
         page = await grab(s_url)
         explored += 1
+        if progress and explored % 4 == 0:
+            progress(min(95, 30 + int(62 * explored / INDEX_MAX_SECTIONS)),
+                     f"Exploration… {len(index)} sujets, {explored} rubriques")
         if not page or page.get("error"):
             continue
         for full, anchor in _extract_links(page["html"], page["url"]):
@@ -4137,6 +4144,12 @@ async def build_forum_index(grab, origin, root_html=None):
             if _TOPIC_RE.search(full):
                 index.setdefault(full, label.lower() or _slug_title(full))
                 paths.setdefault(full, path)                    # ← le chemin du sujet
+            elif _FORUM_PAGE_RE.search(full) or _START_PARAM_RE.search(full):
+                # Page 2, 3… de LA MÊME rubrique → même chemin, on ne descend PAS d'un niveau.
+                # C'est ce qui récupère les sujets au-delà de la première page (la moitié manquante).
+                if full not in seen_sections:
+                    seen_sections.add(full)
+                    queue.append((full, path))
             elif _FORUM_RE.search(full) and full not in seen_sections and label:
                 seen_sections.add(full)
                 queue.append((full, path + [label]))            # on descend d'un cran
@@ -4579,7 +4592,7 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
 LIBRARY_TTL_DAYS = 30           # au bout de 30 jours, un résumé doit être re-vérifié
 LIBRARY_KEYWORDS_MAX = 120      # longueur max des mots-clés mémorisés (caractères)
 LIBRARY_BATCH = 8               # sujets traités par passage de fond (léger : plus besoin d'un gros résumé)
-LIBRARY_MAP_FETCHES = 60        # budget réseau d'une (re)cartographie de l'index
+LIBRARY_MAP_FETCHES = 260       # budget réseau d'une (re)cartographie COMPLÈTE (sections + pagination)
 LIBRARY_TEXT_FOR_SUMMARY = 1800 # texte lu par sujet avant d'en extraire les mots-clés
 
 # On ne garde plus un résumé rédigé (coûteux, périssable) mais quelques MOTS-CLÉS :
@@ -4647,7 +4660,7 @@ async def library_map(progress=None):
 
     if progress:
         progress(30, "Cartographie des rubriques…")
-    index, paths, _sections = await build_forum_index(grab, origin, root_html=root_html)
+    index, paths, _sections = await build_forum_index(grab, origin, root_html=root_html, progress=progress)
     if not index:
         return {"ok": False, "raison": "forum injoignable ou index vide", "sujets": 0}
 
