@@ -3775,6 +3775,32 @@ def _find_next_page(html, base_url, seen):
             return full
     return None
 
+_NAV_LINK_RE = re.compile(
+    r'(?is)<a\s[^>]*class=["\'][^"\']*\bnav\b[^"\']*["\'][^>]*href=["\']([^"\'\s]+)["\'][^>]*>(.*?)</a>')
+
+def _forum_breadcrumb(html, base_url, topic_url):
+    """Fil d'Ariane OFFICIEL forumactif (liens class=\"nav\", dans l'ordre d'affichage) : la vraie
+    hiérarchie du sujet — Rubrique › Sous-forum › … . Bien plus fiable que la reconstruction par
+    exploration. Renvoie [(url, label), …] en excluant Index/Portail. Vide si le thème ne marque pas."""
+    from urllib.parse import urljoin
+    crumbs, seen = [], set()
+    for m in _NAV_LINK_RE.finditer(html):
+        href, label = m.group(1).strip(), _html_to_text(m.group(2)).strip()
+        low = label.lower()
+        if not label or len(label) > 70 or low in (
+                "index", "accueil", "portail", "portal", "faq", "rechercher", "membres",
+                "profil", "connexion", "s'enregistrer", "voir les messages sans réponses"):
+            continue
+        try:
+            full = urljoin(base_url, href).split("#")[0]
+        except Exception:
+            continue
+        if not _same_host(topic_url, full) or not _FORUM_RE.search(full) or full in seen:
+            continue
+        seen.add(full)
+        crumbs.append((full, label))
+    return crumbs[:6]
+
 async def _read_topic_fully(grab, url, anchor=""):
     """Lit UNE discussion en entier : page 1 + ses pages suivantes.
     Renvoie (titre, texte, pages, liens_internes, sections) — `sections` vient du fil
@@ -3794,8 +3820,10 @@ async def _read_topic_fully(grab, url, anchor=""):
         html = page["html"]
         if not title:
             title = _page_title(html) or anchor
-        # Fil d'Ariane : les liens de type « forum/section » du HTML BRUT (avant nettoyage,
-        # car le breadcrumb est justement dans la navigation qu'on retire ensuite).
+        # Fil d'Ariane : d'abord le VRAI breadcrumb forumactif (liens class="nav", ordonnés),
+        # repli sur l'ancienne heuristique (tous les liens de section) si le thème ne le marque pas.
+        if not sections:
+            sections = _forum_breadcrumb(html, page["url"], url)
         if not sections:
             for full, a in _extract_links(html, page["url"]):
                 if _same_host(url, full) and _FORUM_RE.search(full):
@@ -3813,7 +3841,7 @@ async def _read_topic_fully(grab, url, anchor=""):
     if not texts:
         return None
     full_text = "\n\n".join(texts)
-    return title, _smart_truncate(full_text, FORUM_TEXT_PER_PAGE), pages, inner_links, sections[:2]
+    return title, _smart_truncate(full_text, FORUM_TEXT_PER_PAGE), pages, inner_links, sections[:6]
 
 # --- Second rebond : entités citées (noms propres) et liens internes --------------------
 # Quand un post sur Salina mentionne « Tasglev » sans l'expliquer, il faut aller lire
@@ -4677,11 +4705,9 @@ async def _library_summarize_one(url):
         entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
         mark_memory_dirty()
         return False
-    title, ptxt, _pages, _links, _sections = got
-    if title:
-        entry["titre"] = title.strip()[:160]
-    # On garde AUSSI le contenu complet dans la copie interne (page /forum).
-    set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt)
+    title, ptxt, _pages, links, sections = got
+    # Copie interne : titre + chemin officiel (fil d'Ariane) + contenu complet + liens vers d'autres fiches.
+    store_topic_copy(url, entry, title, ptxt, links, sections)
 
     try:
         resp = await extract_completion(
@@ -4778,13 +4804,44 @@ def forum_content():
             _forum_content = {}
     return _forum_content
 
-def set_forum_content(url, titre, chemin, texte):
+def set_forum_content(url, titre, chemin, texte, liens=None):
     global _forum_content_dirty
     fc = forum_content()
     fc[url] = {"titre": (titre or "")[:200], "chemin": chemin or "",
                "contenu": (texte or "").strip()[:FORUM_CONTENT_MAX_CHARS],
+               "liens": (liens or [])[:24],
                "maj": now().strftime("%Y-%m-%d %H:%M")}
     _forum_content_dirty = True
+
+def _forum_liens(inner_links, self_url):
+    """Transforme les renvois bruts [(url, ancre)] trouvés dans un article en liens NOMMÉS
+    [{url, titre}] vers d'autres fiches — en récupérant le vrai titre depuis l'index quand on
+    l'a. C'est ce qui tisse le wiki : chaque fiche pointe vers celles qu'elle mentionne."""
+    lib = library()
+    out, seen = [], set()
+    for full, ancre in inner_links or []:
+        u = (full or "").split("#")[0]
+        if not u or u == self_url or u in seen:
+            continue
+        seen.add(u)
+        titre = (lib.get(u, {}).get("titre") or (ancre or "").strip() or _slug_title(u))[:120]
+        out.append({"url": u, "titre": titre})
+        if len(out) >= 24:
+            break
+    return out
+
+def store_topic_copy(url, entry, title, ptxt, links, sections):
+    """Enregistre un article dans la copie interne : titre, CHEMIN officiel (fil d'Ariane), CONTENU
+    complet et LIENS vers d'autres fiches. Met à jour le chemin de l'index quand le fil d'Ariane
+    est plus fiable que la carte reconstruite. Renvoie les liens résolus."""
+    if title:
+        entry["titre"] = title.strip()[:160]
+    crumb = " › ".join(lbl for _u, lbl in (sections or []) if lbl)
+    if crumb:
+        entry["chemin"] = crumb[:220]
+    liens = _forum_liens(links, url)
+    set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt, liens)
+    return liens
 
 def save_forum_content(force=False):
     global _forum_content_dirty
@@ -4880,10 +4937,8 @@ async def library_copy_all(progress=None, with_keywords=True):
         got = await _read_topic_fully(grab, url, entry.get("titre", ""))
         if not got or not got[1].strip():
             continue
-        title, ptxt, _pages, _links, _sections = got
-        if title:
-            entry["titre"] = title.strip()[:160]
-        set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt)
+        title, ptxt, _pages, links, sections = got
+        store_topic_copy(url, entry, title, ptxt, links, sections)
         copies += 1
         # Mots-clés (bonus, pour la recherche interne) — seulement si le quota tient.
         if with_keywords and not quota_exhausted():
@@ -10730,6 +10785,9 @@ main{flex:1;display:flex;min-height:0}
 #view .path{color:var(--dim);font-size:13px;margin-bottom:2px}
 #view .maj{color:var(--dim);font-size:12px;margin-bottom:16px}
 #view .kw{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--dim);font-size:13px;margin-bottom:16px}
+#view .liens{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;margin-bottom:16px;line-height:1.8}
+#view .liens a{color:var(--acc);text-decoration:none}
+#view .liens a:hover{text-decoration:underline}
 #view pre{white-space:pre-wrap;word-wrap:break-word;line-height:1.55;font-family:inherit;font-size:14.5px;margin:0}
 #view a.src{color:var(--acc);font-size:12px;text-decoration:none}
 .empty{color:var(--dim);margin-top:40px;text-align:center}
@@ -10780,9 +10838,12 @@ async function openTopic(url, el){
   const v=document.getElementById("view");
   if(d.error){v.innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
   v.innerHTML = `<h2>${esc(d.titre)}</h2>`
-    + (d.chemin?`<div class="path">${esc(d.chemin)}</div>`:``)
+    + (d.chemin?`<div class="path">📍 ${esc(d.chemin)}</div>`:``)
     + `<div class="maj">Copié le ${esc(d.maj||"?")} · <a class="src" href="${esc(d.url)}" target="_blank">voir sur le forum ↗</a></div>`
     + (d.resume?`<div class="kw">🔑 ${esc(d.resume)}</div>`:``)
+    + ((d.liens&&d.liens.length)?`<div class="liens"><b>🔗 Articles liés :</b> `
+        + d.liens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")
+        + `</div>`:``)
     + (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » dans l'admin.</div>`);
   v.scrollTop=0;
 }
@@ -10825,6 +10886,7 @@ async def admin_forum_api(request):
             "chemin": lib_e.get("chemin", "") or (e or {}).get("chemin", ""),
             "resume": lib_e.get("resume", ""),
             "contenu": (e or {}).get("contenu", ""),
+            "liens": (e or {}).get("liens", []),
             "maj": (e or {}).get("maj", "") or lib_e.get("maj", ""),
         })
     if action == "search":
