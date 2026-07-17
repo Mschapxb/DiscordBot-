@@ -5507,16 +5507,30 @@ async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, fo
     rep["fiches"] = await seed_guild_members(guild)
 
     me = _guild_me(guild)
-    channels = list(guild.text_channels)[:max_channels]
+
+    def _lisible(c):
+        if me is None:
+            return True
+        try:
+            p = c.permissions_for(me)
+            return p.read_messages and p.read_message_history
+        except Exception:
+            return False
+
+    # TOUS les salons où elle a le droit de lire (texte + annonces + fils actifs) — filtrés par
+    # permission AVANT tout plafond. En mode « à fond », AUCUNE limite : elle voit tout ce qui lui
+    # est accessible. En veille passive, on garde un plafond pour ménager le quota.
+    lisibles = [c for c in guild.text_channels if _lisible(c)]
+    for th in getattr(guild, "threads", []):
+        if _lisible(th):
+            lisibles.append(th)
+    channels = lisibles if deep else lisibles[:max_channels]
     rep["salons"] = len(channels)
+    rep["salons_accessibles"] = len(lisibles)
     by_author = {}
     par_salon = {}                     # cid -> {"name", "msgs":[...]} (pour le résumé par salon)
     for channel in channels:
         try:
-            if me is not None:
-                perms = channel.permissions_for(me)
-                if not (perms.read_messages and perms.read_message_history):
-                    continue
             async for msg in channel.history(limit=per_channel):
                 a = msg.author
                 if getattr(a, "bot", False) or (bot.user and a.id == bot.user.id):
@@ -5703,7 +5717,7 @@ async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, fo
 async def analyse_serveur_complet(progress=None):
     """Analyse À FOND tous les serveurs du bot depuis le début : fiches membres, RÉSUMÉ de chaque
     salon, but/ambiance du serveur, notes utiles. Alimente la page /serveur. Bilan agrégé."""
-    total = {"serveurs": 0, "salons_resumes": 0, "notes": 0, "fiches": 0, "erreurs": []}
+    total = {"serveurs": 0, "salons_accessibles": 0, "salons_resumes": 0, "notes": 0, "fiches": 0, "erreurs": []}
     guilds = list(bot.guilds)
     for guild in guilds:
         if quota_exhausted():
@@ -5712,6 +5726,7 @@ async def analyse_serveur_complet(progress=None):
         rep = await observe_guild(guild, per_channel=120, max_authors=12, max_channels=80,
                                   force_purpose=True, deep=True, progress=progress)
         total["serveurs"] += 1
+        total["salons_accessibles"] += rep.get("salons_accessibles", 0)
         total["salons_resumes"] += rep.get("salons_resumes", 0)
         total["notes"] += rep.get("notes", 0)
         total["fiches"] += rep.get("fiches", 0)
@@ -11386,7 +11401,8 @@ async def admin_serveur_api(request):
                     bilan = await analyse_serveur_complet(progress=lambda p, e="": task_step(tid, p, e))
                     reste = f" ({', '.join(bilan['erreurs'][:2])})" if bilan.get("erreurs") else ""
                     task_done(tid, f"{bilan['serveurs']} serveur(s), {bilan['salons_resumes']} salon(s) "
-                                   f"résumé(s), {bilan['notes']} note(s), {bilan['fiches']} fiche(s). "
+                                   f"résumé(s) sur {bilan['salons_accessibles']} accessible(s), "
+                                   f"{bilan['notes']} note(s), {bilan['fiches']} fiche(s). "
                                    f"Voir /serveur.{reste}")
                 except Exception as e:
                     task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
