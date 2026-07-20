@@ -77,18 +77,18 @@ def _load_mistral_keys():
 MISTRAL_API_KEYS = _load_mistral_keys()
 MISTRAL_API_KEY = MISTRAL_API_KEYS[0] if MISTRAL_API_KEYS else ""
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-medium-latest")
-MISTRAL_ANALYSE_MODEL = os.getenv("MISTRAL_ANALYSE_MODEL", "mistral-small-latest")
-# Raisonnement ajustable : Medium 3.5 et Small 4 acceptent `reasoning_effort` (low/medium/high).
-# Le bot transporte déjà un « effort » par tâche ; on le transmet quand le modèle sait le lire.
-# Si l'API refuse le paramètre (modèle plus ancien), on renvoie la requête SANS, automatiquement.
-MISTRAL_REASONING = os.getenv("MISTRAL_REASONING", "1") not in ("0", "false", "no", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_ANALYSE_MODEL = os.getenv("MISTRAL_ANALYSE_MODEL", MISTRAL_MODEL)
+# Raisonnement ajustable (`reasoning_effort`) : DÉSACTIVÉ par défaut — il alourdit les appels et
+# fait mordre le rate-limit du tier gratuit. Pour l'essayer : MISTRAL_REASONING=1 dans le .env.
+# Si l'API refuse le paramètre, la requête est renvoyée SANS, automatiquement.
+MISTRAL_REASONING = os.getenv("MISTRAL_REASONING", "0") not in ("0", "false", "no", "")
 _REASONING_MODELS = ("medium", "small-4", "small-latest", "small-2603", "magistral", "large")
 _no_reasoning = set()          # modèles ayant refusé le paramètre → on n'insiste plus
 # Si le modèle demandé est retiré/inaccessible (404), on bascule au suivant au lieu de
 # perdre TOUTES les réponses en silence.
-MISTRAL_MODEL_FALLBACKS = ["mistral-medium-latest", "mistral-small-latest",
-                           "ministral-8b-latest", "open-mistral-nemo"]
+MISTRAL_MODEL_FALLBACKS = ["mistral-small-latest", "ministral-8b-latest",
+                           "ministral-3b-latest", "open-mistral-nemo"]
 
 # --- ROUTES : une seule chaîne, Mistral partout -----------------------------
 # On garde la mécanique de routes (chat / roleplay / analyse) car tout le code s'en sert,
