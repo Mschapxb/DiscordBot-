@@ -1,7 +1,6 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from cerebras.cloud.sdk import AsyncCerebras
 import os
 import re
 import json
@@ -38,23 +37,23 @@ load_dotenv()
 # ============================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-def _load_cerebras_keys():
-    """Charge une OU plusieurs clés Cerebras, pour les faire tourner (quota gratuit multiplié).
+def _load_mistral_keys():
+    """Charge une OU plusieurs clés Mistral, pour les faire tourner (quota gratuit multiplié).
     Accepte, par ordre de priorité :
-      - CEREBRAS_API_KEYS : plusieurs clés séparées par des virgules, points-virgules ou retours ligne ;
-      - CEREBRAS_API_KEY   : la clé unique historique (rétro-compatible) ;
-      - CEREBRAS_API_KEY_1, _2, _3… : clés numérotées, pratique sur les hébergeurs (Render).
+      - MISTRAL_API_KEYS : plusieurs clés séparées par des virgules, points-virgules ou retours ligne ;
+      - MISTRAL_API_KEY   : la clé unique (le cas courant) ;
+      - MISTRAL_API_KEY_1, _2, _3… : clés numérotées.
     Les doublons et les vides sont écartés, l'ordre est conservé (la 1re est prioritaire)."""
     brut = []
-    multi = os.getenv("CEREBRAS_API_KEYS", "")
+    multi = os.getenv("MISTRAL_API_KEYS", "")
     if multi:
         brut += re.split(r"[,;\s]+", multi)
-    solo = os.getenv("CEREBRAS_API_KEY", "")
+    solo = os.getenv("MISTRAL_API_KEY", "")
     if solo:
         brut.append(solo)
     i = 1
     while True:
-        k = os.getenv(f"CEREBRAS_API_KEY_{i}")
+        k = os.getenv(f"MISTRAL_API_KEY_{i}")
         if not k:
             break
         brut.append(k)
@@ -67,91 +66,43 @@ def _load_cerebras_keys():
             propres.append(k)
     return propres
 
-CEREBRAS_API_KEYS = _load_cerebras_keys()
-CEREBRAS_API_KEY = CEREBRAS_API_KEYS[0] if CEREBRAS_API_KEYS else None
-CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
-# Modèle pour l'extraction mémoire en arrière-plan.
-# llama3.1-8b a été retiré du catalogue public Cerebras (déprécié le 27/05/2026) : plus de petit
-# modèle "Production" disponible aujourd'hui. gpt-oss-120b est le seul modèle Production stable ;
-# gemma-4-31b existe en "Preview" (plus léger) mais peut être retiré sans préavis.
-EXTRACT_MODEL = os.getenv("CEREBRAS_EXTRACT_MODEL", "gpt-oss-120b")
-# Si le modèle d'extraction n'existe pas / n'est pas accessible (404), on bascule
-# automatiquement sur un modèle qui marche, au lieu de perdre TOUTES les analyses en silence.
-EXTRACT_MODEL_FALLBACKS = ["gpt-oss-120b", "llama-3.3-70b", "qwen-3-32b"]
-
-# --- AUTRES FOURNISSEURS : un modèle par SITUATION --------------------------
-# Cerebras est rapide et gère bien les outils, mais il filtre BEAUCOUP : sur une
-# scène de roleplay un peu sombre, il refuse ou aseptise. On garde donc plusieurs
-# fournisseurs et on ROUTE selon la situation (voir LLM_ROUTES plus bas).
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-# Modèle Groq dédié au ROLEPLAY : les Llama bruts sont nettement moins moralisateurs
-# que gpt-oss. Alternatives à tester via la variable d'env : "moonshotai/kimi-k2-instruct",
-# "qwen/qwen3-32b", "deepseek-r1-distill-llama-70b".
-GROQ_RP_MODEL = os.getenv("GROQ_RP_MODEL", "llama-3.3-70b-versatile")
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash"]  # si le modèle demandé renvoie 404
-# Gemini est le SEUL des trois à laisser régler ses filtres depuis l'API : on desserre
-# les curseurs réglables pour la fiction. Valeurs possibles : BLOCK_NONE (le plus permissif),
-# BLOCK_ONLY_HIGH, BLOCK_MEDIUM_AND_ABOVE, ou DEFAULT (ne rien envoyer = réglages Google).
-# Certains filtres restent NON désactivables côté Google, et sa politique d'usage
-# continue de s'appliquer : ce réglage desserre, il ne supprime pas tout.
-GEMINI_SAFETY = os.getenv("GEMINI_SAFETY", "BLOCK_NONE").strip().upper()
-
-# --- Mistral : FILET DE SECOURS quand Cerebras est à sec ---------------------
-# API compatible OpenAI (même endpoint que Groq) → aucun package en plus, on réutilise
-# _call_openai_compat. Le tier gratuit « Experiment » de La Plateforme couvre tous les
-# modèles (~1 milliard de tokens/mois). Mistral n'a PAS de modèle « 1B » : le plus léger
-# est Ministral 3B → on prend « ministral-3b-latest » par défaut (surchargeable via env).
-# Mistral ne sert QUE lorsque Cerebras est épuisé (voir _route_from_env : mis en queue).
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "ministral-3b-latest")
+# ============================================================
+# MISTRAL — SEUL ET UNIQUE FOURNISSEUR
+# ============================================================
+# Tout passe par Mistral (API compatible OpenAI : aucun SDK, juste aiohttp).
+#   • MISTRAL_MODEL         : le modèle de CONVERSATION (et roleplay)
+#   • MISTRAL_ANALYSE_MODEL : modèle d'ANALYSE (extraction mémoire, résumés) — peut être
+#                             plus léger/économe ; par défaut le même que la conversation.
+# Le tier gratuit « Experiment » de La Plateforme couvre ces modèles.
+MISTRAL_API_KEYS = _load_mistral_keys()
+MISTRAL_API_KEY = MISTRAL_API_KEYS[0] if MISTRAL_API_KEYS else ""
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
-# Privilégier Mistral EN CONVERSATION (chat/roleplay) quand une clé existe : il passe devant
-# Cerebras. Utile pour un ton plus mordant/moins bridé. L'ANALYSE (extraction mémoire) et les
-# tours qui utilisent des OUTILS restent menés par Cerebras (plus fiable pour ça). Coupe : =0.
-LLM_PREFER_MISTRAL = os.getenv("LLM_PREFER_MISTRAL", "1") not in ("0", "false", "no", "")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+MISTRAL_ANALYSE_MODEL = os.getenv("MISTRAL_ANALYSE_MODEL", MISTRAL_MODEL)
+# Si le modèle demandé est retiré/inaccessible (404), on bascule au suivant au lieu de
+# perdre TOUTES les réponses en silence.
+MISTRAL_MODEL_FALLBACKS = ["mistral-small-latest", "ministral-8b-latest", "ministral-3b-latest",
+                           "open-mistral-nemo"]
 
-# --- ROUTES : quel fournisseur pour quelle situation ? ----------------------
-# Chaque route est une CHAÎNE de repli : si le 1er refuse, plante ou est à sec,
-# on passe au suivant SANS que l'utilisateur ne voie rien.
-#   • "chat"     : conversation normale + outils        → Cerebras (rapide, tool calling)
-#   • "roleplay" : fiction, scène, immersion            → Groq puis Gemini (peu censurés)
-#   • "analyse"  : extraction mémoire, conseil intérieur → Cerebras (économe)
-# Surchargeable sans toucher au code : LLM_ROUTE_ROLEPLAY="gemini,groq,cerebras"
-_VALID_PROVIDERS = ("cerebras", "groq", "gemini", "mistral")
+# --- ROUTES : une seule chaîne, Mistral partout -----------------------------
+# On garde la mécanique de routes (chat / roleplay / analyse) car tout le code s'en sert,
+# mais elles pointent toutes vers Mistral. Le modèle peut différer selon la route.
+_VALID_PROVIDERS = ("mistral",)
 
 def _route_from_env(name, default_chain):
-    raw = os.getenv(f"LLM_ROUTE_{name.upper()}", "")
-    chain = [p.strip().lower() for p in raw.split(",") if p.strip()] or default_chain
-    chain = [p for p in chain if p in _VALID_PROVIDERS] or list(default_chain)
-    # Politique du bot : 100 % Cerebras (multi-clés) en tête. Groq/Gemini apportaient trop peu et
-    # cassaient les outils (dés, forum) ; toute la robustesse vient du pool de clés Cerebras.
-    ceres = [p for p in chain if p == "cerebras"] or ["cerebras"]
-    if not MISTRAL_API_KEY:
-        return ceres
-    # Filet de secours toujours ; si on PRIVILÉGIE Mistral, il passe DEVANT sur la conversation
-    # (chat/roleplay). L'analyse reste sur Cerebras. Les tours OUTILLÉS remettent Cerebras devant
-    # dans llm_completion (Mistral 3B est moins sûr pour le function calling).
-    if LLM_PREFER_MISTRAL and name in ("chat", "roleplay"):
-        return ["mistral"] + ceres
-    return ceres + ["mistral"]
+    return ["mistral"]
 
 LLM_ROUTES = {
-    "chat":     _route_from_env("chat",     ["cerebras"]),
-    "roleplay": _route_from_env("roleplay", ["cerebras"]),
-    "analyse":  _route_from_env("analyse",  ["cerebras"]),
+    "chat":     ["mistral"],
+    "roleplay": ["mistral"],
+    "analyse":  ["mistral"],
 }
-# Cerebras gère les outils : les dés et la fouille forum marchent sur toutes les routes.
-# Mistral (secours) gère aussi le function calling ; si son petit modèle bute dessus,
-# le repli « sans outils » de chat_with_tools prend le relais.
-PROVIDER_TOOLS = {"cerebras": True, "groq": True, "gemini": False, "mistral": True}
-PROVIDER_COOLDOWN = 300   # un fournisseur à court de quota est mis de côté 5 min
-# Nombre de tentatives par fournisseur avant d'abandonner. Avec Cerebras seul, c'est ce
-# qui évite le « grincé » au moindre hoquet : on retente 3 fois avec un délai croissant.
+# Mistral gère le function calling : dés, fouille forum, etc.
+PROVIDER_TOOLS = {"mistral": True}
+PROVIDER_COOLDOWN = 300   # une clé à court de quota est mise de côté 5 min
+# Nombre de tentatives avant d'abandonner : évite le « grincé » au moindre hoquet réseau.
 LLM_RETRIES_PER_PROVIDER = int(os.getenv("LLM_RETRIES", "3"))
+
 LLM_RETRY_BACKOFF = float(os.getenv("LLM_RETRY_BACKOFF", "0.8"))   # secondes, multiplié à chaque essai
 MSCHAP_ID = 194346572400558081  # ID Discord de Mschap (le Maître) — 0 si tu veux te fier au seul username
 MSCHAP_USERNAME = "mschap"       # username Discord unique (@handle) — reconnaissance de secours, non usurpable
@@ -234,28 +185,24 @@ ADMIN_STATE_FILE = "admin_state.json"
 if not DISCORD_TOKEN:
     print("❌ ERREUR: DISCORD_TOKEN manquant dans .env")
     exit()
-if not CEREBRAS_API_KEYS:
-    print("❌ ERREUR: aucune clé Cerebras (CEREBRAS_API_KEYS ou CEREBRAS_API_KEY) dans .env — "
+if not MISTRAL_API_KEYS:
+    print("❌ ERREUR: aucune clé Mistral (MISTRAL_API_KEYS ou MISTRAL_API_KEY) dans .env — "
           "c'est le seul fournisseur utilisé désormais.")
     exit()
-if len(CEREBRAS_API_KEYS) > 1:
-    print(f"🔑 {len(CEREBRAS_API_KEYS)} clés Cerebras chargées — rotation automatique activée.")
+if len(MISTRAL_API_KEYS) > 1:
+    print(f"🔑 {len(MISTRAL_API_KEYS)} clés Mistral chargées — rotation automatique activée.")
 else:
-    print("🔑 1 seule clé Cerebras chargée. Ajoute-en dans CEREBRAS_API_KEYS "
+    print("🔑 1 seule clé Mistral chargée. Ajoute-en dans MISTRAL_API_KEYS "
           "(séparées par des virgules) pour cumuler les quotas.")
-if MISTRAL_API_KEY:
-    print(f"🛟 Filet de secours Mistral actif ({MISTRAL_MODEL}) — utilisé uniquement si Cerebras est à sec.")
+print(f"🧠 Modèle : {MISTRAL_MODEL} · analyse : {MISTRAL_ANALYSE_MODEL}")
 
-cerebras_client = AsyncCerebras(api_key=CEREBRAS_API_KEY) if CEREBRAS_API_KEY else None
-
-# --- Pool de clés Cerebras : on tourne entre elles pour cumuler les quotas gratuits ---
-# Chaque clé a son propre client et son propre cooldown : quand l'une atteint son quota
-# (429), on la met de côté quelques minutes et on passe à la suivante. Cerebras n'est
-# considéré « à court » (et donc la bascule vers Groq ne se fait) que lorsque TOUTES les
-# clés sont épuisées en même temps.
-class CerebrasPool:
+# --- Pool de clés Mistral : on tourne entre elles pour cumuler les quotas gratuits ---
+# Chaque clé a son propre cooldown : quand l'une atteint son quota (429), on la met de côté
+# quelques minutes et on passe à la suivante. Le fournisseur n'est considéré « à court » que
+# lorsque TOUTES les clés sont épuisées en même temps.
+class MistralPool:
     def __init__(self, keys):
-        self._clients = [AsyncCerebras(api_key=k) for k in keys]
+        self._clients = list(keys)                     # ici : les CLÉS (appels HTTP directs)
         self._cooldown = [0.0] * len(self._clients)   # instant de reprise, par clé
         self._i = 0                                    # curseur de rotation (round-robin)
 
@@ -324,30 +271,30 @@ class CerebrasPool:
         return {"total": self.total, "dispo": self.available(),
                 "en_pause": self.total - self.available()}
 
-cerebras_pool = CerebrasPool(CEREBRAS_API_KEYS)
+mistral_pool = MistralPool(MISTRAL_API_KEYS)
 
 
 # ============================================================
 # FILE D'ATTENTE + THROTTLE — on ne jette AUCUN message
 # ============================================================
-# Toutes les requêtes Cerebras passent par une file : elles sont traitées à la
+# Toutes les requêtes Mistral passent par une file : elles sont traitées à la
 # suite, avec un espacement minimum entre deux appels (throttle). Un pic de
 # messages simultanés ne provoque donc plus une rafale de requêtes (qui ferait
 # cracher le rate-limit) ni des messages perdus : chacun attend son tour.
 #
 # Réglages :
-#   CEREBRAS_MIN_INTERVAL : délai minimum entre deux appels (lisse la charge)
-#   CEREBRAS_QUEUE_MAX    : au-delà, on refuse poliment (protège la RAM)
-#   CEREBRAS_QUEUE_WAIT_MAX : temps d'attente max dans la file avant d'abandonner
-CEREBRAS_MIN_INTERVAL = float(os.getenv("CEREBRAS_MIN_INTERVAL", "0.7"))
-CEREBRAS_QUEUE_MAX = int(os.getenv("CEREBRAS_QUEUE_MAX", "40"))
-CEREBRAS_CALL_TIMEOUT = float(os.getenv("CEREBRAS_CALL_TIMEOUT", "45"))   # coupe un appel figé (anti-blocage)
+#   MISTRAL_MIN_INTERVAL : délai minimum entre deux appels (lisse la charge)
+#   MISTRAL_QUEUE_MAX    : au-delà, on refuse poliment (protège la RAM)
+#   MISTRAL_QUEUE_WAIT_MAX : temps d'attente max dans la file avant d'abandonner
+MISTRAL_MIN_INTERVAL = float(os.getenv("MISTRAL_MIN_INTERVAL", "0.7"))
+MISTRAL_QUEUE_MAX = int(os.getenv("MISTRAL_QUEUE_MAX", "40"))
+MISTRAL_CALL_TIMEOUT = float(os.getenv("MISTRAL_CALL_TIMEOUT", "45"))   # coupe un appel figé (anti-blocage)
 # L'attente dans la file doit rester AU-DESSUS du timeout d'appel : ainsi un message en
 # attente derrière un appel qui se fige survit assez pour passer une fois celui-ci coupé.
-CEREBRAS_QUEUE_WAIT_MAX = float(os.getenv("CEREBRAS_QUEUE_WAIT_MAX", "120"))
+MISTRAL_QUEUE_WAIT_MAX = float(os.getenv("MISTRAL_QUEUE_WAIT_MAX", "120"))
 
-class CerebrasQueue:
-    """Sérialise les appels Cerebras avec un délai minimum entre chacun.
+class MistralQueue:
+    """Sérialise les appels Mistral avec un délai minimum entre chacun.
     Un seul appel à la fois (un verrou), et on attend `min_interval` depuis le
     dernier appel avant de lancer le suivant. Simple, robuste, pas de message sauté."""
     def __init__(self, min_interval):
@@ -366,14 +313,14 @@ class CerebrasQueue:
         Deux garde-fous contre le blocage : on n'attend pas le verrou plus de WAIT_MAX,
         et l'appel lui-même a un timeout dur — sans ça, une requête figée gèlerait TOUTE
         la file (le bot semblerait muet pour tout le monde)."""
-        if self._waiting >= CEREBRAS_QUEUE_MAX:
+        if self._waiting >= MISTRAL_QUEUE_MAX:
             raise LLMError("File d'attente pleine — trop de demandes en même temps.")
         self._waiting += 1
         try:
             # 1) Acquisition du verrou AVEC timeout : si la file est engorgée (un appel
             #    coincé devant), on abandonne proprement au lieu d'attendre pour toujours.
             try:
-                await asyncio.wait_for(self._lock.acquire(), timeout=CEREBRAS_QUEUE_WAIT_MAX)
+                await asyncio.wait_for(self._lock.acquire(), timeout=MISTRAL_QUEUE_WAIT_MAX)
             except asyncio.TimeoutError:
                 raise LLMError("Attente trop longue dans la file — réessaie dans un instant.")
             try:
@@ -384,9 +331,9 @@ class CerebrasQueue:
                 # 2) L'appel lui-même NE PEUT PAS pendre indéfiniment : timeout dur.
                 #    Une requête HTTP figée est ainsi coupée, le verrou relâché, la file repart.
                 try:
-                    return await asyncio.wait_for(coro_factory(), timeout=CEREBRAS_CALL_TIMEOUT)
+                    return await asyncio.wait_for(coro_factory(), timeout=MISTRAL_CALL_TIMEOUT)
                 except asyncio.TimeoutError:
-                    raise LLMError("Cerebras n'a pas répondu à temps (appel coupé).")
+                    raise LLMError("Mistral n'a pas répondu à temps (appel coupé).")
                 finally:
                     self._last = time.time()
             finally:
@@ -394,23 +341,20 @@ class CerebrasQueue:
         finally:
             self._waiting -= 1
 
-cerebras_queue = CerebrasQueue(CEREBRAS_MIN_INTERVAL)
+mistral_queue = MistralQueue(MISTRAL_MIN_INTERVAL)
 
 
 # ============================================================
-# COUCHE FOURNISSEURS LLM (Cerebras · Groq · Gemini)
+# COUCHE LLM — MISTRAL UNIQUEMENT
 # ============================================================
 # Un seul point d'entrée : llm_completion(messages, route=...). Il essaie les
 # fournisseurs de la route dans l'ordre et bascule au suivant si l'un :
 #   • plante (réseau, 404, modèle retiré) ;
 #   • est à court de quota (429) → mis en pause PROVIDER_COOLDOWN secondes ;
 #   • CENSURE la réponse (le vrai sujet en roleplay) → détecté et contourné.
-# La réponse renvoyée a TOUJOURS la même forme que celle du SDK Cerebras
+# La réponse renvoyée garde la même forme que l'ancien SDK
 # (resp.choices[0].message.content / .tool_calls), donc le reste du code ne bouge pas.
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_GEMINI_HARM = ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
-                "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
+# Endpoint unique : Mistral (API compatible OpenAI).
 
 
 class LLMError(Exception):
@@ -425,7 +369,7 @@ class LLMRefusal(Exception):
     """Le fournisseur a filtré/refusé : on passe au suivant dans la chaîne."""
 
 
-# --- Réponses normalisées (mêmes attributs que le SDK Cerebras) --------------
+# --- Réponses normalisées (attributs .choices[0].message.content / .tool_calls) ------
 class _Fn:
     def __init__(self, d):
         self.name = d.get("name", "")
@@ -463,7 +407,7 @@ class _Completion:
 _llm_session = None
 
 async def _llm_http():
-    """Session HTTP partagée pour Groq/Gemini (recréée si fermée)."""
+    """Session HTTP partagée pour les appels Mistral (recréée si fermée)."""
     global _llm_session
     if _llm_session is None or _llm_session.closed:
         _llm_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180))
@@ -471,38 +415,30 @@ async def _llm_http():
 
 
 def provider_ready(p):
-    return bool({"cerebras": CEREBRAS_API_KEY, "groq": GROQ_API_KEY,
-                 "gemini": GEMINI_API_KEY, "mistral": MISTRAL_API_KEY}.get(p))
+    return p == "mistral" and bool(MISTRAL_API_KEY)
 
 
 def model_for(provider, route="chat"):
-    if provider == "cerebras":
-        return EXTRACT_MODEL if route == "analyse" else CEREBRAS_MODEL
-    if provider == "groq":
-        return GROQ_RP_MODEL if route == "roleplay" else GROQ_MODEL
-    if provider == "gemini":
-        return GEMINI_MODEL
-    if provider == "mistral":
-        return MISTRAL_MODEL
-    return "?"
-
+    """Le modèle selon la situation : un modèle d'ANALYSE (économe) pour les tâches de fond,
+    le modèle de CONVERSATION pour tout le reste."""
+    return MISTRAL_ANALYSE_MODEL if route == "analyse" else MISTRAL_MODEL
 
 _provider_cooldown = {}   # fournisseur -> instant de reprise
 _last_provider = ""       # dernier fournisseur ayant réellement répondu (pour ²T diag)
 
 
 def provider_paused(p):
-    # Cerebras avec pool : « en pause » signifie que TOUTES les clés sont épuisées.
-    # Un 429 sur une seule clé n'écarte pas Cerebras — le pool bascule en interne.
-    if p == "cerebras" and cerebras_pool:
-        return cerebras_pool.all_paused()
+    # Pool Mistral : « en pause » signifie que TOUTES les clés sont épuisées.
+    # Un 429 sur une seule clé n'écarte pas le fournisseur — le pool tourne en interne.
+    if p == "mistral" and mistral_pool:
+        return mistral_pool.all_paused()
     return time.time() < _provider_cooldown.get(p, 0.0)
 
 
 def pause_provider(p, seconds=PROVIDER_COOLDOWN):
-    # Avec le pool Cerebras, la mise en pause se gère clé par clé dans _call_cerebras.
-    # On ne pose donc PAS un cooldown global qui écarterait Cerebras à tort.
-    if p == "cerebras" and cerebras_pool:
+    # Avec le pool Mistral, la mise en pause se gère clé par clé dans _call_mistral_raw.
+    # On ne pose donc PAS un cooldown global qui écarterait Mistral à tort.
+    if p == "mistral" and mistral_pool:
         return
     _provider_cooldown[p] = time.time() + seconds
 
@@ -512,10 +448,10 @@ def last_provider():
 
 
 def _retry_after_seconds(err, defaut=60):
-    """Extrait le délai de reprise réel d'une erreur 429 (Cerebras/Groq le donnent souvent).
+    """Extrait le délai de reprise réel d'une erreur 429 (Mistral le donne souvent).
     Beaucoup de limites gratuites sont PAR MINUTE : inutile d'écarter une clé 5 min si son
     quota revient dans 8 secondes. On lit le délai annoncé, borné entre 5 s et 5 min."""
-    # En-tête HTTP standard (SDK Cerebras / OpenAI-compat)
+    # En-tête HTTP standard (OpenAI-compat)
     for attr in ("response", "headers"):
         obj = getattr(err, attr, None)
         headers = getattr(obj, "headers", None) if attr == "response" else obj
@@ -537,157 +473,77 @@ def _retry_after_seconds(err, defaut=60):
 
 
 # --- Appels bruts, un par fournisseur ---------------------------------------
-async def _call_cerebras(model, messages, tools, temperature, max_tokens, effort="low"):
-    """Point d'entrée Cerebras : passe par la FILE (throttle + sérialisation) pour ne
-    jamais jeter un message ni provoquer une rafale de requêtes. La vraie logique
-    (pool de clés, rotation, 429) est dans _call_cerebras_raw."""
-    return await cerebras_queue.run(
-        lambda: _call_cerebras_raw(model, messages, tools, temperature, max_tokens, effort)
+async def _call_mistral(model, messages, tools, temperature, max_tokens, effort="low"):
+    """Point d'entrée Mistral : passe par la FILE (throttle + sérialisation) pour ne jamais
+    jeter un message ni provoquer une rafale de requêtes. La rotation des clés et la gestion
+    des 429 sont dans _call_mistral_raw. `effort` est ignoré (spécifique à l'ancien SDK)."""
+    return await mistral_queue.run(
+        lambda: _call_mistral_raw(model, messages, tools, temperature, max_tokens)
     )
 
-async def _call_cerebras_raw(model, messages, tools, temperature, max_tokens, effort="low"):
-    params = {"model": model, "messages": messages, "temperature": temperature,
-              "max_completion_tokens": max_tokens, "reasoning_effort": effort}
-    if tools:
-        params["tools"] = tools
-        params["tool_choice"] = "auto"
 
-    # Pas de pool (aucune clé multiple) → client historique, comportement inchangé.
-    if not cerebras_pool:
-        if cerebras_client is None:
-            raise LLMError("Cerebras non configuré (aucune clé).")
-        return await cerebras_client.chat.completions.create(**params)
-
-    # Pool : on essaie les clés disponibles à tour de rôle. Une clé en quota (429)
-    # est mise de côté (pour la durée RÉELLE annoncée) et on passe à la suivante.
-    # On ne lève l'erreur que si TOUTES les clés sont épuisées.
-    derniere = None
-    for _ in range(cerebras_pool.total):
-        got = cerebras_pool.acquire()
-        if got is None:
-            break                       # toutes les clés en cooldown
-        idx, client = got
-        try:
-            return await client.chat.completions.create(**params)
-        except Exception as e:
-            derniere = e
-            if _is_rate_limit(e):
-                pause = _retry_after_seconds(e)
-                cerebras_pool.penalize(idx, pause)
-                restantes = cerebras_pool.available()
-                print(f"⛓️ Clé Cerebras #{idx + 1} rate-limitée {pause}s — "
-                      f"{restantes}/{cerebras_pool.total} clé(s) dispo, je tourne.")
-                continue                # on tente la clé suivante
-            raise                        # autre erreur (réseau, 404…) → on ne masque pas
-    raise derniere or LLMError("Toutes les clés Cerebras sont épuisées.")
-
-
-async def _call_openai_compat(provider, url, api_key, model, messages, tools, temperature, max_tokens):
-    """Groq (et tout autre endpoint compatible OpenAI) — outils inclus."""
+async def _call_mistral_http(api_key, model, messages, tools, temperature, max_tokens):
+    """Un appel HTTP à l'API Mistral (compatible OpenAI). Renvoie un _Completion."""
     payload = {"model": model, "messages": messages,
                "temperature": temperature, "max_tokens": max_tokens}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
     sess = await _llm_http()
-    async with sess.post(url, json=payload, headers={
+    async with sess.post(MISTRAL_URL, json=payload, headers={
             "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}) as r:
         body = await r.text()
         if r.status != 200:
-            raise LLMError(f"{provider} {r.status}: {body[:300]}", status=r.status, provider=provider)
+            raise LLMError(f"mistral {r.status}: {body[:300]}", status=r.status, provider="mistral")
         data = json.loads(body)
-    return _Completion(data, provider, model)
+    return _Completion(data, "mistral", model)
 
 
-def _gemini_contents(messages):
-    """Traduit le format OpenAI vers le format natif Gemini (system à part, rôles fusionnés)."""
-    sys_parts, contents = [], []
-    for m in messages:
-        role = m.get("role")
-        text = (m.get("content") or "").strip()
-        if role == "system":
-            if text:
-                sys_parts.append(text)
-            continue
-        if role == "tool":                      # Gemini n'a pas d'outils ici : on aplatit
-            role, text = "user", f"[Résultat d'outil] {text}"
-        if not text:
-            continue
-        g = "model" if role == "assistant" else "user"
-        if contents and contents[-1]["role"] == g:   # Gemini veut des rôles alternés
-            contents[-1]["parts"].append({"text": text})
-        else:
-            contents.append({"role": g, "parts": [{"text": text}]})
-    return "\n\n".join(sys_parts), contents
-
-
-async def _call_gemini(model, messages, temperature, max_tokens):
-    """Endpoint NATIF (et non openai-compat) : c'est le seul qui accepte safetySettings."""
-    sys_txt, contents = _gemini_contents(messages)
-    if not contents:
-        contents = [{"role": "user", "parts": [{"text": "..."}]}]
-    payload = {"contents": contents,
-               "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}}
-    if sys_txt:
-        payload["systemInstruction"] = {"parts": [{"text": sys_txt}]}
-    if GEMINI_SAFETY and GEMINI_SAFETY != "DEFAULT":
-        payload["safetySettings"] = [{"category": c, "threshold": GEMINI_SAFETY} for c in _GEMINI_HARM]
-
-    sess = await _llm_http()
-    candidates = [model] + [m for m in GEMINI_MODEL_FALLBACKS if m != model]
-    last_err = None
-    for m in candidates:
-        url = GEMINI_URL.format(model=m) + f"?key={GEMINI_API_KEY}"
-        async with sess.post(url, json=payload, headers={"Content-Type": "application/json"}) as r:
-            status = r.status
-            body = await r.text()
-        if status == 404:
-            last_err = LLMError(f"gemini: modèle « {m} » introuvable", 404, "gemini")
-            continue
-        if status != 200:
-            raise LLMError(f"gemini {status}: {body[:300]}", status=status, provider="gemini")
-
-        data = json.loads(body)
-        blocked = (data.get("promptFeedback") or {}).get("blockReason")
-        if blocked:
-            raise LLMRefusal(f"requête bloquée par Gemini ({blocked})")
-        cands = data.get("candidates") or []
-        if not cands:
-            raise LLMRefusal("Gemini n'a rien renvoyé (filtré)")
-        c0 = cands[0]
-        reason = c0.get("finishReason", "")
-        parts = ((c0.get("content") or {}).get("parts") or [])
-        text = "".join(p.get("text", "") for p in parts).strip()
-        if reason in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"):
-            raise LLMRefusal(f"réponse filtrée par Gemini ({reason})")
-        if not text:
-            raise LLMRefusal("Gemini a renvoyé une réponse vide")
-        fake = {"choices": [{
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "length" if reason == "MAX_TOKENS" else "stop",
-        }]}
-        return _Completion(fake, "gemini", m)
-    raise last_err or LLMError("gemini indisponible", provider="gemini")
+async def _call_mistral_raw(model, messages, tools, temperature, max_tokens):
+    """Essaie les clés disponibles à tour de rôle. Une clé en quota (429) est mise de côté
+    pour la durée réelle annoncée, et on passe à la suivante. On ne lève l'erreur que si
+    TOUTES les clés sont épuisées. Si le MODÈLE est introuvable (404), on bascule sur un
+    modèle de repli au lieu de tout perdre en silence."""
+    if not mistral_pool:
+        raise LLMError("Mistral non configuré (aucune clé).")
+    candidats = [model] + [m for m in MISTRAL_MODEL_FALLBACKS if m != model]
+    derniere = None
+    for m in candidats:
+        modele_absent = False
+        for _ in range(mistral_pool.total):
+            got = mistral_pool.acquire()
+            if got is None:
+                break                       # toutes les clés en cooldown
+            idx, key = got
+            try:
+                return await _call_mistral_http(key, m, messages, tools, temperature, max_tokens)
+            except Exception as e:
+                derniere = e
+                if _is_rate_limit(e):
+                    pause = _retry_after_seconds(e)
+                    mistral_pool.penalize(idx, pause)
+                    restantes = mistral_pool.available()
+                    print(f"⛓️ Clé Mistral #{idx + 1} rate-limitée {pause}s — "
+                          f"{restantes}/{mistral_pool.total} clé(s) dispo, je tourne.")
+                    continue                # clé suivante
+                if _is_model_missing(e):
+                    modele_absent = True
+                    break                   # changer de clé n'y changera rien → modèle suivant
+                raise                        # autre erreur (réseau…) → on ne masque pas
+        if not modele_absent:
+            break                            # inutile d'essayer un autre modèle
+        print(f"⚠️ Modèle « {m} » indisponible (404) — j'essaie le suivant.")
+    raise derniere or LLMError("Toutes les clés Mistral sont épuisées.")
 
 
 async def _dispatch(provider, route, messages, tools, temperature, max_tokens, effort):
     model = model_for(provider, route)
-    if provider == "cerebras":
-        return await _call_cerebras(model, messages, tools, temperature, max_tokens, effort), model
-    if provider == "groq":
-        return await _call_openai_compat("groq", GROQ_URL, GROQ_API_KEY, model,
-                                         messages, tools, temperature, max_tokens), model
     if provider == "mistral":
-        return await _call_openai_compat("mistral", MISTRAL_URL, MISTRAL_API_KEY, model,
-                                         messages, tools, temperature, max_tokens), model
-    if provider == "gemini":
-        return await _call_gemini(model, messages, temperature, max_tokens), model
+        return await _call_mistral(model, messages, tools, temperature, max_tokens, effort), model
     raise LLMError(f"Fournisseur inconnu : {provider}")
 
 
-# --- Détection de censure : le nerf de la guerre en roleplay -----------------
-# Une vraie réponse de roleplay ne commence pas par « je ne peux pas ». Quand un
-# modèle sort du récit pour moraliser, on ne discute pas : on change de modèle.
+
 _REFUSAL_RE = re.compile(
     r"(je (?:ne )?(?:peux|pourrai|vais) pas (?:t'|vous )?(?:aider|répondre|continuer|poursuivre|écrire|faire)|"
     r"je (?:ne )?suis pas (?:en mesure|autoris|à l'aise)|je préfère (?:ne pas|éviter)|"
@@ -719,9 +575,6 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
     usable = [p for p in chain if p not in exclude and provider_ready(p)]
     if tools:
         with_tools = [p for p in usable if PROVIDER_TOOLS.get(p)]
-        # Les OUTILS (dés, fouille forum) sont les plus fiables avec Cerebras : on le remet
-        # DEVANT pour les tours outillés, même si la route privilégie Mistral en conversation.
-        with_tools.sort(key=lambda p: 0 if p == "cerebras" else 1)
         dispo_tools = [p for p in with_tools if not provider_paused(p)]
         if with_tools:
             # On privilégie les modèles qui gèrent les outils (dispo en priorité, sinon
@@ -730,12 +583,10 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
             if not dispo_tools:
                 print("⚠️ Modèles tool-capables tous en pause — je tente quand même.")
         else:
-            # Aucun modèle capable d'outils sur cette route (ex : seul Gemini reste, ou pas
-            # de clé Groq). On répond SANS outils, mais on le signale : sinon les dés et la
-            # fouille échouent en silence et on croit que « ça ne marche plus ».
+            # Aucun modèle capable d'outils : on répond SANS outils, mais on le signale —
+            # sinon les dés et la fouille échouent en silence.
             tools = None
-            print("⚠️ Outils demandés mais AUCUN modèle tool-capable dispo "
-                  "(Cerebras épuisé + pas de Groq ?) → réponse sans outils.")
+            print("⚠️ Outils demandés mais aucun modèle tool-capable dispo → réponse sans outils.")
     if not usable:
         raise LLMError(f"Aucun fournisseur configuré pour la route « {route} »")
 
@@ -743,7 +594,7 @@ async def llm_completion(messages, route="chat", tools=None, temperature=0.85,
     active = [p for p in usable if not provider_paused(p)] or usable[:1]
 
     # On construit une SÉQUENCE DE TENTATIVES : chaque fournisseur peut être réessayé
-    # plusieurs fois avant qu'on abandonne. Avec Cerebras seul, ça évite de balancer
+    # plusieurs fois avant qu'on abandonne : ça évite de balancer
     # « grincé » au moindre hoquet — on retente, avec un petit délai croissant.
     attempts = []
     for provider in active:
@@ -814,12 +665,12 @@ def llm_status():
                 mark = "✅"
             parts.append(f"{mark} {p} `{model_for(p, name)}`")
         lines.append(f"• **{name}** : " + " → ".join(parts))
-    if cerebras_pool and cerebras_pool.total > 1:
-        st = cerebras_pool.status()
-        lines.append(f"Clés Cerebras : {st['dispo']}/{st['total']} disponible(s)"
+    if mistral_pool and mistral_pool.total > 1:
+        st = mistral_pool.status()
+        lines.append(f"Clés Mistral : {st['dispo']}/{st['total']} disponible(s)"
                      + (f", {st['en_pause']} en pause (quota)" if st['en_pause'] else ""))
-    if cerebras_queue.waiting:
-        lines.append(f"File d'attente : {cerebras_queue.waiting} requête(s) en attente")
+    if mistral_queue.waiting:
+        lines.append(f"File d'attente : {mistral_queue.waiting} requête(s) en attente")
     if _last_provider:
         lines.append(f"Dernier modèle utilisé : `{_last_provider}`")
     return "\n".join(lines)
@@ -5399,49 +5250,13 @@ def _is_model_missing(err):
             or "model_not_found" in s or "no access" in s)
 
 async def extract_completion(messages, max_tokens=400, temperature=0.2, effort="low"):
-    """Tâche d'ANALYSE (extraction mémoire, conseil intérieur, observation).
-    1. Cerebras d'abord : le moins cher, et la censure n'a aucune importance ici.
-       Si le modèle configuré est introuvable (404), bascule sur un autre modèle Cerebras.
-    2. Si Cerebras est muet (plus aucun modèle, quota épuisé, clé absente), on ne perd
-       PLUS toutes les analyses en silence : on repart sur les autres fournisseurs
-       de la route « analyse » (Groq, Gemini).
-    Lève l'exception d'origine si personne ne répond (l'appelant la journalise)."""
-    global _active_extract_model
-    cerebras_ok = ("cerebras" in LLM_ROUTES["analyse"] and provider_ready("cerebras")
-                   and not provider_paused("cerebras"))
-    last_err = None
+    """Tâche d'ANALYSE (extraction mémoire, conseil intérieur, observation, résumés).
+    Passe par la route « analyse » : même fournisseur (Mistral) mais le modèle d'analyse,
+    qu'on peut choisir plus léger/économe via MISTRAL_ANALYSE_MODEL.
+    Lève l'exception d'origine si ça ne répond pas (l'appelant la journalise)."""
+    return await llm_completion(messages, route="analyse", temperature=temperature,
+                                max_tokens=max_tokens, effort=effort)
 
-    if cerebras_ok:
-        candidates = []
-        for m in ([_active_extract_model] if _active_extract_model else []) + \
-                 [EXTRACT_MODEL, CEREBRAS_MODEL] + EXTRACT_MODEL_FALLBACKS:
-            if m and m not in candidates:
-                candidates.append(m)
-
-        for model in candidates:
-            try:
-                resp = await _call_cerebras(model, messages, None, temperature, max_tokens, effort)
-                if _active_extract_model != model:
-                    if _active_extract_model or model != EXTRACT_MODEL:
-                        print(f"🔁 Modèle d'analyse : « {model} » (bascule automatique)")
-                    _active_extract_model = model
-                return resp
-            except Exception as e:
-                last_err = e
-                if _is_model_missing(e):
-                    print(f"⚠️ Modèle « {model} » indisponible (404) — j'essaie le suivant.")
-                    if _active_extract_model == model:
-                        _active_extract_model = None
-                    continue
-                if _is_rate_limit(e):
-                    pause_provider("cerebras")
-                break      # quota / réseau : changer de MODÈLE n'y changera rien → autre fournisseur
-
-    try:
-        return await llm_completion(messages, route="analyse", temperature=temperature,
-                                    max_tokens=max_tokens, effort=effort, exclude=("cerebras",))
-    except Exception as e:
-        raise last_err or e
 
 async def seed_guild_members(guild):
     """Crée les fiches de tous les membres HUMAINS (aucun appel LLM).
@@ -5455,7 +5270,7 @@ async def seed_guild_members(guild):
             print(f"⚠️ Chargement des membres de {guild.name} impossible: {e}")
     return sum(1 for m in list(getattr(guild, "members", [])) if seed_user(m))
 
-# --- Disjoncteur de quota : quand Cerebras dit stop, les tâches de FOND se taisent -------
+# --- Disjoncteur de quota : quand Mistral dit stop, les tâches de FOND se taisent -------
 # (les réponses aux humains, elles, continuent d'essayer : c'est le cœur du bot)
 _quota_until = 0.0
 QUOTA_COOLDOWN = 1800   # 30 min de silence des tâches de fond après un dépassement
@@ -5468,7 +5283,7 @@ def note_quota_error(err):
     global _quota_until
     if _rate_limit_message(err):
         _quota_until = time.time() + QUOTA_COOLDOWN
-        print(f"⛓️ Quota Cerebras atteint — tâches de fond en pause {QUOTA_COOLDOWN // 60} min.")
+        print(f"⛓️ Quota Mistral atteint — tâches de fond en pause {QUOTA_COOLDOWN // 60} min.")
         return True
     return False
 
@@ -5493,7 +5308,7 @@ async def observe_guild(guild, per_channel=40, max_authors=8, max_channels=20, f
         rep["raison"] = "Une observation de ce serveur est déjà en cours."
         return rep
     if quota_exhausted():
-        rep["raison"] = "Quota Cerebras épuisé : j'attends avant de relancer une analyse."
+        rep["raison"] = "Quota Mistral épuisé : j'attends avant de relancer une analyse."
         return rep
     _observing.add(guild.id)
     try:
@@ -5701,7 +5516,7 @@ async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, fo
 
     if rep["erreurs"] and not rep["notes"] and not rep["but"]:
         rep["raison"] = ("L'analyse a échoué (le modèle n'a pas répondu). Détail ci-dessous — "
-                         "si c'est une 404, vérifie la variable CEREBRAS_EXTRACT_MODEL sur Render "
+                         "si c'est une 404, vérifie la variable MISTRAL_MODEL "
                          "(je bascule normalement toute seule sur un modèle valide).")
     elif not rep["notes"] and rep["filtrees"] and not rep["raison"]:
         rep["raison"] = (f"{rep['filtrees']} note(s) écartée(s) : soit déjà connues (doublon), soit "
@@ -5721,7 +5536,7 @@ async def analyse_serveur_complet(progress=None):
     guilds = list(bot.guilds)
     for guild in guilds:
         if quota_exhausted():
-            total["erreurs"].append("quota Cerebras épuisé — relance plus tard pour finir")
+            total["erreurs"].append("quota Mistral épuisé — relance plus tard pour finir")
             break
         rep = await observe_guild(guild, per_channel=120, max_authors=12, max_channels=80,
                                   force_purpose=True, deep=True, progress=progress)
@@ -6643,7 +6458,7 @@ async def tool_echecs(channel, user_id, user_name, action="commencer", coup=""):
     return "Échiquier posé. Le joueur a les Blancs, je prends les Noirs."
 
 # ============================================================
-# TOOL CALLING NATIF (Cerebras)
+# TOOL CALLING NATIF (Mistral)
 # ============================================================
 TOOLS = [
     {"type": "function", "function": {
@@ -7493,7 +7308,7 @@ def _rate_limit_message(err):
     if "per day" in s or "(tpd)" in s or "tokens per day" in s:
         return ("⛓️ Mon quota de tokens du jour est épuisé sur TOUS mes modèles." + delai +
                 " Pour tenir plus longtemps : un modèle plus léger, une autre clé "
-                "(GROQ_API_KEY / GEMINI_API_KEY) ou un palier payant.")
+                "(MISTRAL_API_KEYS) ou un palier payant.")
     return "⛓️ Trop de requêtes d'un coup, je souffle un instant." + delai
 
 # ============================================================
@@ -7527,10 +7342,7 @@ def needs_deliberation(content):
     """Décide seule si la question mérite un conseil (évite de brûler des tokens pour rien)."""
     if not get_setting("deliberation", True):
         return False
-    # Le conseil tourne en priorité sur Mistral (moins bridé) ; on ne le coupe donc PAS quand
-    # seul le quota Cerebras est épuisé. On n'y renonce que si aucun modèle ne peut délibérer.
-    mistral_ok = bool(MISTRAL_API_KEY) and LLM_PREFER_MISTRAL and not provider_paused("mistral")
-    if not mistral_ok and quota_exhausted():
+    if quota_exhausted():
         return False
     text = (content or "").strip()
     if not text or _DELIB_SKIP.match(text):
@@ -7547,24 +7359,12 @@ def needs_deliberation(content):
     return False
 
 async def _agent(system, user, max_tokens=DELIB_MAX_TOKENS, temperature=0.4):
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user}]
-    # « Plus de liberté » : le CONSEIL délibère sur Mistral (moins bridé) quand c'est possible —
-    # ainsi le fond ET la réponse finale (déjà routée Mistral) échappent à la censure de Cerebras.
-    # Repli propre sur l'analyse Cerebras si Mistral manque, est en pause ou échoue.
-    if MISTRAL_API_KEY and LLM_PREFER_MISTRAL and not provider_paused("mistral"):
-        try:
-            resp = await _call_openai_compat("mistral", MISTRAL_URL, MISTRAL_API_KEY,
-                                             MISTRAL_MODEL, messages, None, temperature, max_tokens)
-            txt = (resp.choices[0].message.content or "").strip()
-            if txt:
-                return txt
-        except Exception as e:
-            if _is_rate_limit(e):
-                pause_provider("mistral")
-            print(f"⚠️ Agent Mistral indispo, repli analyse : {str(e)[:70]}")
+    """Un membre du conseil intérieur (proposeur / critique). Tourne sur Mistral comme tout
+    le reste — même liberté de ton que la réponse finale."""
     resp = await extract_completion(
-        messages, max_tokens=max_tokens, temperature=temperature, effort="medium",
+        [{"role": "system", "content": system},
+         {"role": "user", "content": user}],
+        max_tokens=max_tokens, temperature=temperature, effort="medium",
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -7617,8 +7417,7 @@ async def deliberate(question, context=""):
 # ============================================================
 # ROUTAGE DE SITUATION — conversation normale ou ROLEPLAY ?
 # ============================================================
-# Le roleplay est routé vers les modèles peu censurés (Groq/Gemini) parce que
-# Cerebras casse l'immersion : il sort du récit pour moraliser. Trois déclencheurs :
+# Le roleplay a sa propre route (même fournisseur, réglages dédiés). Trois déclencheurs :
 #   1. le salon est déclaré RP (²T rp) ou marqué NSFW ;
 #   2. le nom du salon/catégorie sent le jeu de rôle ;
 #   3. le message LUI-MÊME est du RP (*action entre astérisques*, « incarne… »).
@@ -7790,7 +7589,7 @@ def note_presence(user_id, username, display_name=None):
     mark_memory_dirty()
 
 def _learn_budget():
-    """Elle écoute peut-être 30 salons : sans plafond global, le quota Cerebras fond."""
+    """Elle écoute peut-être 30 salons : sans plafond global, le quota Mistral fond."""
     if time.time() - _learn_hour[0] > 3600:
         _learn_hour[0], _learn_hour[1] = time.time(), 0
     return _learn_hour[1] < LISTEN_LEARN_MAX_HOUR
@@ -8097,7 +7896,7 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
     tools = liste d'outils autorisés pour cet interlocuteur (None = aucun).
     long_reply = True si une délibération a eu lieu (réponse plus développée attendue).
     temperature = chaleur de génération (conversation pure : plus haut, pour varier ; restitution : plus bas).
-    route = « chat » (Cerebras d'abord) ou « roleplay » (Groq/Gemini d'abord).
+    route = « chat » ou « roleplay » (mêmes modèles, réglages différents).
     Renvoie (texte, used_tools) — used_tools sert au gating des tours suivants."""
     messages = [{"role": "system", "content": system_prompt}] + thread
     tools = list(tools) if tools else None
@@ -8114,7 +7913,7 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
             response = await llm_completion(
                 messages, route=route, tools=round_tools, temperature=conv_temp,
                 max_tokens=MAX_TOKENS_LONG if long_reply else MAX_TOKENS_REPLY,
-                effort="low",   # Cerebras uniquement ; ignoré par les autres fournisseurs
+                effort="low",   # hérité de l'ancien SDK ; ignoré par Mistral
             )
         except Exception as e:
             # Quota / rate limit sur TOUTE la chaîne → message en personnage plutôt qu'un crash
@@ -8473,7 +8272,7 @@ def autonomy_clause():
     return ""
 
 def build_system_prompt_mschap(days_away=0, guild_context="", current_message="", others_context="", user_context="", voix=True):
-    """Persona statique en tête (cache de préfixe Cerebras), contexte dynamique en queue.
+    """Persona statique en tête (cache de préfixe), contexte dynamique en queue.
     voix=True : registre parlé, court, à caractère (conversation). voix=False : restitution
     d'un outil, on la laisse être précise et structurée."""
     maintenant = now()
@@ -8624,7 +8423,7 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
     if not get_setting("auto_note", True):
         return  # prise de notes autonome désactivée depuis le panneau (§6)
     if quota_exhausted():
-        return  # quota Cerebras épuisé : on n'insiste pas en arrière-plan
+        return  # quota Mistral épuisé : on n'insiste pas en arrière-plan
     subject = "Mschap" if is_mschap_target else (subject_name or "cette personne")
     try:
         recent = [m for m in history[-10:] if m.get("role") in ("user", "assistant")]
@@ -10826,7 +10625,7 @@ async def admin_library(request):
                 await flush_memory()
                 reste = ("" if not restants else
                          f" Il reste {restants} article(s) — reclique pour continuer "
-                         f"(ou quota Cerebras à reposer).")
+                         f"(ou quota Mistral à reposer).")
                 task_done(tid, f"Articles réécrits en fiches propres + notes clés.{reste}")
             except Exception as e:
                 task_done(tid, f"Échec : {str(e)[:200]}", ok=False)
@@ -12005,7 +11804,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           <button class="mini ghost" onclick="cleanMemory({merge:false, llm:true}, this)">🧹 Nettoyer (doublons + contradictions)</button>
           <button class="mini ghost" onclick="cleanMemory({merge:false, llm:false}, this)">⚡ Doublons + plafond (rapide, local)</button>
         </div>
-        <div style="color:var(--dim);font-size:12px;margin-top:8px">La fusion et les contradictions utilisent le modèle (Cerebras) : un peu plus lentes, mais elles comprennent le sens. Le mode rapide reste 100&nbsp;% local.</div>
+        <div style="color:var(--dim);font-size:12px;margin-top:8px">La fusion et les contradictions utilisent le modèle (Mistral) : un peu plus lentes, mais elles comprennent le sens. Le mode rapide reste 100&nbsp;% local.</div>
       </div>
 
       <div class="adm-sec">
@@ -12019,7 +11818,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <div class="btnrow" style="flex-wrap:wrap;gap:8px">
           <button class="mini" onclick="analyserServeur(this)">🔍 Analyser le serveur à fond</button>
         </div>
-        <div style="color:var(--dim);font-size:12px;margin-top:8px">Ça lit beaucoup de messages et fait un résumé par salon (Cerebras) : quelques minutes selon la taille du serveur. Tourne en fond.</div>
+        <div style="color:var(--dim);font-size:12px;margin-top:8px">Ça lit beaucoup de messages et fait un résumé par salon (Mistral) : quelques minutes selon la taille du serveur. Tourne en fond.</div>
       </div>
 
       <div class="adm-sec">
@@ -13622,7 +13421,7 @@ async def on_message(message):
         # Gating : les schémas (~880 tokens) ne partent que si le message le justifie,
         # ou pendant TOOL_GRACE_TURNS tours après un usage d'outil (suivi de tâche).
         # Situation : scène de jeu de rôle ou conversation normale ? Le roleplay part
-        # sur les modèles peu censurés (Groq/Gemini) — Cerebras casse l'immersion.
+        # sur la route roleplay (réglages dédiés à la fiction).
         _recent_ctx = " | ".join(
             m.get("content", "")[:120] for m in conversations.get(user_id, [])[-2:]
         )
@@ -13851,32 +13650,32 @@ async def pauses_cmd(ctx, action: str = None):
                    + "\n\n`²T pauses clear` pour tout lever.")
 
 @bot.command(name="cles", aliases=["keys", "cle"],
-             help="État des clés Cerebras ; « ²T cles next » force la clé suivante, « ²T cles reset » lève les pauses")
+             help="État des clés Mistral ; « ²T cles next » force la clé suivante, « ²T cles reset » lève les pauses")
 async def cles_cmd(ctx, action: str = None):
     if not is_admin(ctx.author.id, ctx.author.name):
         await ctx.send("Mes clés ne se montrent qu'à mes administrateurs.")
         return
-    if not cerebras_pool or cerebras_pool.total == 0:
-        await ctx.send("Aucune clé Cerebras chargée. Ajoute `CEREBRAS_API_KEYS=clé1,clé2,…` dans le `.env`.")
+    if not mistral_pool or mistral_pool.total == 0:
+        await ctx.send("Aucune clé Mistral chargée. Ajoute `MISTRAL_API_KEYS=clé1,clé2,…` dans le `.env`.")
         return
-    if cerebras_pool.total == 1:
-        await ctx.send("Une seule clé Cerebras configurée — rien à alterner. "
-                       "Ajoute d'autres clés dans `CEREBRAS_API_KEYS` pour la rotation.")
+    if mistral_pool.total == 1:
+        await ctx.send("Une seule clé Mistral configurée — rien à alterner. "
+                       "Ajoute d'autres clés dans `MISTRAL_API_KEYS` pour la rotation.")
         return
 
     act = (action or "").lower()
     if act in ("next", "suivante", "switch", "rotate", "alterner"):
-        num = cerebras_pool.force_next()
-        await ctx.send(f"🔁 Rotation forcée : la clé Cerebras **#{num}** passe en tête.")
+        num = mistral_pool.force_next()
+        await ctx.send(f"🔁 Rotation forcée : la clé Mistral **#{num}** passe en tête.")
         return
     if act in ("reset", "reprise", "clear"):
-        cerebras_pool.reset()
-        await ctx.send("♻️ Toutes les clés Cerebras sont réactivées (cooldowns levés).")
+        mistral_pool.reset()
+        await ctx.send("♻️ Toutes les clés Mistral sont réactivées (cooldowns levés).")
         return
 
     # État détaillé, clé par clé
-    lignes = ["🔑 **Clés Cerebras**"]
-    for k in cerebras_pool.detail():
+    lignes = ["🔑 **Clés Mistral**"]
+    for k in mistral_pool.detail():
         tete = " ⬅️ en tête" if k["en_tete"] else ""
         if k["dispo"]:
             lignes.append(f"• Clé #{k['num']} : ✅ disponible{tete}")
