@@ -77,12 +77,18 @@ def _load_mistral_keys():
 MISTRAL_API_KEYS = _load_mistral_keys()
 MISTRAL_API_KEY = MISTRAL_API_KEYS[0] if MISTRAL_API_KEYS else ""
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
-MISTRAL_ANALYSE_MODEL = os.getenv("MISTRAL_ANALYSE_MODEL", MISTRAL_MODEL)
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-medium-latest")
+MISTRAL_ANALYSE_MODEL = os.getenv("MISTRAL_ANALYSE_MODEL", "mistral-small-latest")
+# Raisonnement ajustable : Medium 3.5 et Small 4 acceptent `reasoning_effort` (low/medium/high).
+# Le bot transporte déjà un « effort » par tâche ; on le transmet quand le modèle sait le lire.
+# Si l'API refuse le paramètre (modèle plus ancien), on renvoie la requête SANS, automatiquement.
+MISTRAL_REASONING = os.getenv("MISTRAL_REASONING", "1") not in ("0", "false", "no", "")
+_REASONING_MODELS = ("medium", "small-4", "small-latest", "small-2603", "magistral", "large")
+_no_reasoning = set()          # modèles ayant refusé le paramètre → on n'insiste plus
 # Si le modèle demandé est retiré/inaccessible (404), on bascule au suivant au lieu de
 # perdre TOUTES les réponses en silence.
-MISTRAL_MODEL_FALLBACKS = ["mistral-small-latest", "ministral-8b-latest", "ministral-3b-latest",
-                           "open-mistral-nemo"]
+MISTRAL_MODEL_FALLBACKS = ["mistral-medium-latest", "mistral-small-latest",
+                           "ministral-8b-latest", "open-mistral-nemo"]
 
 # --- ROUTES : une seule chaîne, Mistral partout -----------------------------
 # On garde la mécanique de routes (chat / roleplay / analyse) car tout le code s'en sert,
@@ -194,7 +200,8 @@ if len(MISTRAL_API_KEYS) > 1:
 else:
     print("🔑 1 seule clé Mistral chargée. Ajoute-en dans MISTRAL_API_KEYS "
           "(séparées par des virgules) pour cumuler les quotas.")
-print(f"🧠 Modèle : {MISTRAL_MODEL} · analyse : {MISTRAL_ANALYSE_MODEL}")
+print(f"🧠 Modèle : {MISTRAL_MODEL} · analyse : {MISTRAL_ANALYSE_MODEL}"
+      + (" · raisonnement ajustable actif" if MISTRAL_REASONING else ""))
 
 # --- Pool de clés Mistral : on tourne entre elles pour cumuler les quotas gratuits ---
 # Chaque clé a son propre cooldown : quand l'une atteint son quota (429), on la met de côté
@@ -476,30 +483,48 @@ def _retry_after_seconds(err, defaut=60):
 async def _call_mistral(model, messages, tools, temperature, max_tokens, effort="low"):
     """Point d'entrée Mistral : passe par la FILE (throttle + sérialisation) pour ne jamais
     jeter un message ni provoquer une rafale de requêtes. La rotation des clés et la gestion
-    des 429 sont dans _call_mistral_raw. `effort` est ignoré (spécifique à l'ancien SDK)."""
+    des 429 sont dans _call_mistral_raw. `effort` règle la profondeur de réflexion (reasoning)
+    sur les modèles qui le gèrent."""
     return await mistral_queue.run(
-        lambda: _call_mistral_raw(model, messages, tools, temperature, max_tokens)
+        lambda: _call_mistral_raw(model, messages, tools, temperature, max_tokens, effort)
     )
 
 
-async def _call_mistral_http(api_key, model, messages, tools, temperature, max_tokens):
-    """Un appel HTTP à l'API Mistral (compatible OpenAI). Renvoie un _Completion."""
+async def _call_mistral_http(api_key, model, messages, tools, temperature, max_tokens, effort=None):
+    """Un appel HTTP à l'API Mistral (compatible OpenAI). Renvoie un _Completion.
+    Transmet `reasoning_effort` aux modèles qui le gèrent (Medium 3.5, Small 4…) : la réflexion
+    est plus poussée sur les tâches qui le méritent, sans changer de modèle. Si l'API refuse le
+    paramètre, on retente aussitôt SANS lui et on retient la leçon pour ce modèle."""
     payload = {"model": model, "messages": messages,
                "temperature": temperature, "max_tokens": max_tokens}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
+    veut_raisonner = (MISTRAL_REASONING and effort and model not in _no_reasoning
+                      and any(tag in model for tag in _REASONING_MODELS))
+    if veut_raisonner:
+        payload["reasoning_effort"] = effort
+
     sess = await _llm_http()
-    async with sess.post(MISTRAL_URL, json=payload, headers={
-            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}) as r:
-        body = await r.text()
-        if r.status != 200:
-            raise LLMError(f"mistral {r.status}: {body[:300]}", status=r.status, provider="mistral")
-        data = json.loads(body)
-    return _Completion(data, "mistral", model)
+    for essai in (1, 2):
+        async with sess.post(MISTRAL_URL, json=payload, headers={
+                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}) as r:
+            body = await r.text()
+            status = r.status
+        if status == 200:
+            return _Completion(json.loads(body), "mistral", model)
+        # Paramètre non supporté par ce modèle → on l'enlève et on retente une fois.
+        if (essai == 1 and "reasoning_effort" in payload
+                and ("Extra inputs are not permitted" in body or "reasoning_effort" in body)):
+            payload.pop("reasoning_effort", None)
+            _no_reasoning.add(model)
+            print(f"ℹ️ « {model} » n'accepte pas reasoning_effort — je continue sans.")
+            continue
+        raise LLMError(f"mistral {status}: {body[:300]}", status=status, provider="mistral")
+    raise LLMError("mistral: échec inattendu", provider="mistral")
 
 
-async def _call_mistral_raw(model, messages, tools, temperature, max_tokens):
+async def _call_mistral_raw(model, messages, tools, temperature, max_tokens, effort=None):
     """Essaie les clés disponibles à tour de rôle. Une clé en quota (429) est mise de côté
     pour la durée réelle annoncée, et on passe à la suivante. On ne lève l'erreur que si
     TOUTES les clés sont épuisées. Si le MODÈLE est introuvable (404), on bascule sur un
@@ -516,7 +541,7 @@ async def _call_mistral_raw(model, messages, tools, temperature, max_tokens):
                 break                       # toutes les clés en cooldown
             idx, key = got
             try:
-                return await _call_mistral_http(key, m, messages, tools, temperature, max_tokens)
+                return await _call_mistral_http(key, m, messages, tools, temperature, max_tokens, effort)
             except Exception as e:
                 derniere = e
                 if _is_rate_limit(e):
@@ -7364,7 +7389,7 @@ async def _agent(system, user, max_tokens=DELIB_MAX_TOKENS, temperature=0.4):
     resp = await extract_completion(
         [{"role": "system", "content": system},
          {"role": "user", "content": user}],
-        max_tokens=max_tokens, temperature=temperature, effort="medium",
+        max_tokens=max_tokens, temperature=temperature, effort="high",
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -7913,7 +7938,7 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
             response = await llm_completion(
                 messages, route=route, tools=round_tools, temperature=conv_temp,
                 max_tokens=MAX_TOKENS_LONG if long_reply else MAX_TOKENS_REPLY,
-                effort="low",   # hérité de l'ancien SDK ; ignoré par Mistral
+                effort="low",   # conversation : réflexion légère (rapide et vif)
             )
         except Exception as e:
             # Quota / rate limit sur TOUTE la chaîne → message en personnage plutôt qu'un crash
