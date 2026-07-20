@@ -3441,6 +3441,14 @@ WEB_WRITE_DIRECTIVE = (
     "forum » — et reste vague plutôt que d'inventer.\n"
     "Attention aussi aux citations : un texte du forum peut reprendre une œuvre extérieure "
     "(film, roman) ; ne la confonds pas avec le lore du monde.\n"
+    "CLOISON ÉTANCHE — TU N'UTILISES QUE LE FORUM ICI : ta réponse s'appuie EXCLUSIVEMENT sur les "
+    "sources ci-dessous et sur ta copie du forum. Tes notes sur les MEMBRES Discord (ce que les "
+    "joueurs t'ont raconté en conversation, ce que tu sais d'eux, leurs habitudes, vos échanges) "
+    "n'ont RIEN à faire dans une restitution de forum : tu ne les cites pas, tu ne t'en sers pas "
+    "pour compléter, deviner ou expliquer quoi que ce soit. Un pseudo Discord n'est PAS un "
+    "personnage du lore, et un personnage du lore n'est PAS son joueur : ne mélange jamais les deux. "
+    "Si une information manque dans les sources, tu dis qu'elle manque — tu ne la combles pas avec "
+    "ce que tu sais des gens.\n"
     "FORMAT OBLIGATOIRE — tu TERMINES TOUJOURS par une section, sur sa propre ligne :\n"
     "Sources :\n"
     "puis la liste, une par ligne, des URLs (celles qui suivent « SOURCE: ») que tu as RÉELLEMENT "
@@ -4905,7 +4913,11 @@ REWRITE_SYSTEM = (
     "Tu es l'archiviste d'un wiki. On te donne le contenu BRUT d'un article (forum-wiki), souvent "
     "bruité : citations, signatures, dates, hors-sujet, redites. Tu produis une FICHE PROPRE et "
     "COMPLÈTE, en gardant TOUTE l'information utile (info par info) mais réorganisée et lisible. Tu "
-    "n'INVENTES rien, tu ne rajoutes aucun fait absent. Réponds UNIQUEMENT en JSON : "
+    "n'INVENTES rien, tu ne rajoutes aucun fait absent. TU TRAVAILLES EN VASE CLOS : tout ce que tu "
+    "écris doit provenir du texte fourni ci-dessous, RIEN d'autre — ni tes connaissances générales, "
+    "ni ce que tu croirais savoir des joueurs, des membres d'un Discord ou d'autres articles. Un "
+    "pseudo de joueur n'est pas un personnage, un personnage n'est pas son joueur. Si le texte est "
+    "incomplet, la fiche reste incomplète : tu ne combles aucun trou. Réponds UNIQUEMENT en JSON : "
     '{"synthese": "l\'article réécrit, clair et structuré, sans le bruit du forum", '
     '"notes": ["fait clé court 1", "fait clé court 2", …]}. '
     "Les notes : 3 à 8 faits saillants très courts, pour se repérer vite sans tout relire."
@@ -5069,7 +5081,9 @@ async def consulter_forum(sujet):
         return ("Ma copie interne n'a pas encore de contenu sur ce sujet — lance une « Copie "
                 "complète » dans l'admin. Je peux sinon fouiller le forum en direct.")
     return (WEB_WRITE_DIRECTIVE +
-            "TA COPIE INTERNE DU FORUM (déjà lue, fiable — réponds À PARTIR DE ÇA et cite les fiches) :\n\n"
+            "TA COPIE INTERNE DU FORUM (déjà lue, fiable — réponds À PARTIR DE ÇA et cite les fiches). "
+            "Tu n'utilises QUE ces fiches : rien de ce que tu sais des membres Discord n'entre ici, "
+            "et ce qui n'y figure pas, tu dis que tu ne l'as pas :\n\n"
             + "\n\n".join(blocs))
 
 def save_forum_content(force=False):
@@ -8225,6 +8239,28 @@ async def resolve_route(content, channel=None, user_id=None, recent=""):
     return route
 
 
+# Blocs du prompt qui portent la mémoire des JOUEURS (Discord). Pendant une restitution de forum,
+# on les RETIRE du contexte : elle ne doit répondre qu'avec ses sources forum, jamais avec ce
+# qu'elle sait des membres. C'est plus sûr qu'une simple consigne — l'info n'est même plus là.
+_BLOCS_MEMOIRE_JOUEURS = (
+    "CE QUE TU SAIS DE SÛR sur elle",
+    "IMPRESSIONS À CONFIRMER",
+    "CE QUE TU SAIS DES MEMBRES QU'ON VIENT D'ÉVOQUER",
+    "Ce que tu sais d'autres membres PRÉSENTS ici",
+    "POSTURE —",
+)
+
+def strip_player_memory(prompt):
+    """Retire du prompt système les blocs de mémoire sur les membres. Sert quand la réponse est
+    une RESTITUTION DE FORUM : la persona, le lieu et les règles restent, les notes joueurs partent."""
+    blocs = (prompt or "").split("\n\n")
+    gardes = [b for b in blocs if not any(m in b for m in _BLOCS_MEMOIRE_JOUEURS)]
+    if len(gardes) == len(blocs):
+        return prompt
+    return "\n\n".join(gardes) + (
+        "\n\nRAPPEL : pour cette réponse, tu ne disposes QUE de tes sources forum. Tes notes sur les "
+        "membres Discord ont été volontairement écartées — n'invente pas ce qui manque, dis-le.")
+
 async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=None, caller_name=None, caller_channel_id=None, long_reply=False, route="chat", temperature=0.85):
     """Boucle de conversation avec tool calling natif.
     tools = liste d'outils autorisés pour cet interlocuteur (None = aucun).
@@ -8320,9 +8356,12 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
             # TRACE DE TOUTE ACTION : sans ça, impossible de savoir si elle a vraiment agi
             # ou si elle s'est contentée de dire qu'elle l'avait fait.
             log_tool_call(tc.function.name, args, result, caller_name or str(caller_id))
-            if tc.function.name == "fouiller_forum":
+            if tc.function.name in ("fouiller_forum", "consulter_forum"):
                 cap = FORUM_TOOL_RESULT_MAX
                 long_reply = True
+                # RESTITUTION FORUM : on écarte la mémoire des joueurs du contexte, pour qu'elle
+                # ne puisse pas compléter le lore avec ce qu'elle sait des membres Discord.
+                messages[0]["content"] = strip_player_memory(messages[0]["content"])
             elif tc.function.name == "lister_membres":
                 cap = MEMBERS_TOOL_RESULT_MAX   # la liste ENTIÈRE doit passer, jamais tronquée à 4
                 long_reply = True
