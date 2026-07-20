@@ -3442,6 +3442,11 @@ FORUM_MAX_SUBFORUMS = 4        # nb de sous-forums explorés pour trouver des su
 FORUM_TEXT_PER_PAGE = 5000     # texte gardé par DISCUSSION principale (toutes pages réunies)
 FORUM_RELATED_TEXT = 2200      # texte gardé par fiche LIÉE (on en lit plusieurs : Tasglev, Tsita…)
 FORUM_ROOT_TEXT = 600          # texte gardé pour la page d'accueil (contexte)
+# --- ARCHIVAGE (copie interne /forum) : on lit le sujet EN ENTIER, pas un extrait -------------
+# Ces limites ne servent QU'à remplir la copie locale (elles ne repartent pas dans un prompt),
+# donc on peut être généreux : un article de wiki mérite d'être conservé complet.
+FORUM_ARCHIVE_PAGES = 30       # pages suivantes lues par sujet lors d'une copie complète
+FORUM_ARCHIVE_TEXT = 60000     # texte gardé par sujet à l'archivage
 FORUM_TOOL_RESULT_MAX = 28000  # plafond du contenu agrégé réinjecté
 _LINK_RE = re.compile(r'(?is)<a\s[^>]*?href=["\']([^"\'\s#]+)[^>]*>(.*?)</a>')
 # Sujets/discussions : phpBB, forumactif (/t45-...), Discourse (/t/), wikis, etc.
@@ -3678,8 +3683,11 @@ def _forum_breadcrumb(html, base_url, topic_url):
         crumbs.append((full, label))
     return crumbs[:6]
 
-async def _read_topic_fully(grab, url, anchor=""):
+async def _read_topic_fully(grab, url, anchor="", integral=False):
     """Lit UNE discussion en entier : page 1 + ses pages suivantes.
+    integral=True (archivage de la copie interne) : on lit BEAUCOUP plus de pages et on garde
+    le texte quasi entier — le forum est un wiki, une fiche tronquée à 5000 signes perd la moitié
+    de son lore. En fouille LIVE on reste borné (le résultat repart dans le prompt).
     Renvoie (titre, texte, pages, liens_internes, sections) — `sections` vient du fil
     d'Ariane : c'est la RUBRIQUE où vit le sujet (ex : « Empire Skaldien »). Sans ça,
     elle ne sait pas où elle est et part chercher à l'autre bout du monde."""
@@ -3687,7 +3695,8 @@ async def _read_topic_fully(grab, url, anchor=""):
     inner_links, sections = [], []
     current = url
     seen = set()
-    for _ in range(1 + FORUM_TOPIC_PAGES):
+    max_pages = FORUM_ARCHIVE_PAGES if integral else FORUM_TOPIC_PAGES
+    for _ in range(1 + max_pages):
         if not current or current in seen:
             break
         seen.add(current)
@@ -3718,7 +3727,8 @@ async def _read_topic_fully(grab, url, anchor=""):
     if not texts:
         return None
     full_text = "\n\n".join(texts)
-    return title, _smart_truncate(full_text, FORUM_TEXT_PER_PAGE), pages, inner_links, sections[:6]
+    cap = FORUM_ARCHIVE_TEXT if integral else FORUM_TEXT_PER_PAGE
+    return title, _smart_truncate(full_text, cap), pages, inner_links, sections[:6]
 
 # --- Second rebond : entités citées (noms propres) et liens internes --------------------
 # Quand un post sur Salina mentionne « Tasglev » sans l'expliquer, il faut aller lire
@@ -4589,7 +4599,7 @@ async def _library_summarize_one(url):
         await asyncio.sleep(0.15)
         return await _fetch_raw(u)
 
-    got = await _read_topic_fully(grab, url, entry.get("titre", ""))
+    got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
     if not got or not got[1].strip():
         entry["resume"] = "(vide)"
         entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
@@ -4679,7 +4689,7 @@ def library_targets(sujet, limit=5):
 # complet — potentiellement plusieurs Mo — vit dans un fichier À PART, écrit seulement lors d'une
 # copie/mise à jour. C'est la « vraie copie du forum » consultable dans la page /forum.
 FORUM_CONTENT_FILE = os.getenv("FORUM_CONTENT_FILE", "forum_content.json")
-FORUM_CONTENT_MAX_CHARS = 14000       # copie bornée par sujet (évite les fiches interminables)
+FORUM_CONTENT_MAX_CHARS = 60000       # copie quasi intégrale par sujet (wiki : on garde tout)
 _forum_content = None
 _forum_content_dirty = False
 
@@ -4697,9 +4707,19 @@ def forum_content():
 def set_forum_content(url, titre, chemin, texte, liens=None):
     global _forum_content_dirty
     fc = forum_content()
+    ancien = fc.get(url, {})
+    # On NE PERD PAS le travail à la main : les liens marqués « manuel » et les liens coupés
+    # survivent à une nouvelle copie/relecture du sujet.
+    manuels = [l for l in ancien.get("liens", []) if l.get("type") == "manuel"]
+    coupes = list(ancien.get("coupes", []))
+    nouveaux = [l for l in (liens or []) if l.get("url") not in coupes]
+    for m in manuels:
+        if not any(l.get("url") == m.get("url") for l in nouveaux):
+            nouveaux.append(m)
     fc[url] = {"titre": (titre or "")[:200], "chemin": chemin or "",
                "contenu": (texte or "").strip()[:FORUM_CONTENT_MAX_CHARS],
-               "liens": (liens or [])[:24],
+               "liens": nouveaux[:40], "coupes": coupes,
+               "synthese": ancien.get("synthese", ""), "notes": ancien.get("notes", []),
                "maj": now().strftime("%Y-%m-%d %H:%M")}
     _forum_content_dirty = True
 
@@ -4803,7 +4823,7 @@ async def forum_repair(progress=None):
         if progress:
             progress(int(78 * i / total), f"Relecture {i}/{total}…")
         entry = lib.get(url, {})
-        got = await _read_topic_fully(grab, url, entry.get("titre", ""))
+        got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
         if not got or not got[1].strip():
             continue
         title, ptxt, _p, links, sections = got
@@ -4899,8 +4919,9 @@ def _add_mention_links():
         hay = _norm(contenu)
         liens = e.setdefault("liens", [])
         deja = {l.get("url") for l in liens}
+        coupes = set(e.get("coupes", []))      # liens supprimés à la main → on ne les remet pas
         for terme, cible in idx.items():
-            if cible == url or cible in deja or len(liens) >= 30:
+            if cible == url or cible in deja or cible in coupes or len(liens) >= 30:
                 continue
             if re.search(r"(?<![a-z0-9])" + re.escape(terme) + r"(?![a-z0-9])", hay):
                 liens.append({"url": cible,
@@ -4909,6 +4930,49 @@ def _add_mention_links():
                 deja.add(cible)
                 ajouts += 1
     return ajouts
+
+# --- Édition MANUELLE des liens (tu corriges ce qui est faux ou manquant) ------
+# Un lien ajouté à la main est marqué "manuel" : le tissage automatique ne le supprime jamais.
+# Un lien supprimé à la main est mémorisé dans "coupes" : il ne réapparaîtra pas au prochain
+# tissage (sinon la détection par mention le remettrait en boucle).
+def forum_link_add(url, cible, titre=""):
+    """Crée un lien MANUEL url → cible. Renvoie (ok, message)."""
+    fc = forum_content()
+    if url == cible:
+        return False, "Un article ne se lie pas à lui-même."
+    e = fc.get(url)
+    if e is None:
+        return False, "Article inconnu dans la copie."
+    if cible not in library() and cible not in fc:
+        return False, "Cible inconnue dans la copie."
+    liens = e.setdefault("liens", [])
+    if any(l.get("url") == cible for l in liens):
+        return False, "Ce lien existe déjà."
+    nom = (titre or library().get(cible, {}).get("titre")
+           or fc.get(cible, {}).get("titre") or _slug_title(cible))[:120]
+    liens.append({"url": cible, "titre": nom, "type": "manuel"})
+    e.setdefault("coupes", [])
+    if cible in e["coupes"]:
+        e["coupes"].remove(cible)          # on rétablit un lien qu'on avait coupé
+    forum_weave()                           # rétroliens à jour immédiatement
+    save_forum_content(force=True)
+    return True, f"Lien ajouté vers « {nom} »."
+
+def forum_link_remove(url, cible):
+    """Supprime un lien url → cible et le mémorise pour qu'il ne revienne pas."""
+    fc = forum_content()
+    e = fc.get(url)
+    if e is None:
+        return False, "Article inconnu dans la copie."
+    avant = len(e.get("liens", []))
+    e["liens"] = [l for l in e.get("liens", []) if l.get("url") != cible]
+    coupes = e.setdefault("coupes", [])
+    if cible not in coupes:
+        coupes.append(cible)
+    forum_weave()
+    save_forum_content(force=True)
+    return (len(e["liens"]) < avant), ("Lien supprimé." if len(e["liens"]) < avant
+                                       else "Ce lien n'existait pas (il ne reviendra plus).")
 
 async def consulter_forum(sujet):
     """Répond depuis la COPIE INTERNE du forum (synthèses + notes + liens) — INSTANTANÉ, sans rien
@@ -5040,7 +5104,7 @@ async def library_copy_all(progress=None, with_keywords=True):
         if progress:
             progress(25 + int(70 * i / total), f"Copie {i}/{total}…")
         entry = lib.get(url, {})
-        got = await _read_topic_fully(grab, url, entry.get("titre", ""))
+        got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
         if not got or not got[1].strip():
             continue
         title, ptxt, _pages, links, sections = got
@@ -10991,6 +11055,25 @@ main{flex:1;display:flex;min-height:0}
 .tleaf{padding:2px 0 2px 16px;font-size:13px;color:var(--txt)}
 .dim{color:var(--dim);font-size:12px}
 #view h3{margin:18px 0 8px}
+.lk{display:inline-flex;align-items:center;gap:4px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:2px 6px 2px 10px;margin:2px 3px}
+.lk.man{border-color:var(--acc)}
+.lk.men{border-style:dashed}
+.lk i{cursor:pointer;color:var(--dim);font-style:normal;font-size:11px;padding:0 3px}
+.lk i:hover{color:#e06a6a}
+.liens input{background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:5px 9px;min-width:230px;margin:0 6px}
+.liens .mini,#view .mini{background:var(--acc2);border:0;color:#fff;border-radius:8px;padding:5px 11px;cursor:pointer;font-size:13px}
+#svgwrap{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-top:10px;overflow:hidden}
+#schema line.e{stroke:var(--line);stroke-width:1.4}
+#schema line.eman{stroke:var(--acc);stroke-width:2}
+#schema line.emen{stroke:var(--line);stroke-dasharray:4 3}
+#schema circle{cursor:pointer;stroke:var(--bg);stroke-width:2}
+#schema circle.c0{fill:var(--acc)}
+#schema circle.c1{fill:var(--acc2)}
+#schema circle.c2{fill:#4a4460}
+#schema text{fill:var(--txt);font-size:11px;text-anchor:middle;pointer-events:none}
+.lg{margin-left:10px}
+.lg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 10px}
+.lg i.c0{background:var(--acc)}.lg i.c1{background:var(--acc2)}.lg i.c2{background:#4a4460}
 #view .notes{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:6px 14px;margin-bottom:16px;font-size:13.5px}
 #view .notes ul{margin:6px 0;padding-left:20px}
 #view .notes li{margin:3px 0}
@@ -11009,6 +11092,7 @@ main{flex:1;display:flex;min-height:0}
   <span class="stats" id="stats">…</span>
   <a href="/admin">← retour admin</a>
   <a href="#" onclick="showGraph();return false" style="margin-left:2px">🌳 vue graphe</a>
+  <a href="#" onclick="showSchema('');return false" style="margin-left:2px">🕸️ schéma global</a>
   <div id="search"><input id="q" placeholder="Rechercher dans le forum…" />
     <button onclick="doSearch()">Chercher</button></div>
 </header>
@@ -11050,16 +11134,23 @@ async function openTopic(url, el){
     + `<div class="maj">Copié le ${esc(d.maj||"?")} · <a class="src" href="${esc(d.url)}" target="_blank">voir sur le forum ↗</a></div>`
     + (d.resume?`<div class="kw">🔑 ${esc(d.resume)}</div>`:``)
     + ((d.liens&&d.liens.length)?`<div class="liens"><b>🔗 Cite :</b> `
-        + d.liens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")+`</div>`:``)
+        + d.liens.map(l=>`<span class="lk ${l.type==='manuel'?'man':(l.type==='mention'?'men':'')}" title="${l.type==='manuel'?'ajouté à la main':(l.type==='mention'?'détecté par mention du nom':'lien du forum')}"><a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a><i onclick='delLink(${JSON.stringify(d.url)},${JSON.stringify(l.url)})' title="Supprimer ce lien">✕</i></span>`).join(" ")+`</div>`:``)
     + ((d.retroliens&&d.retroliens.length)?`<div class="liens"><b>🔙 Cité par :</b> `
         + d.retroliens.map(l=>`<a href="#" onclick='openTopic(${JSON.stringify(l.url)});return false'>${esc(l.titre)}</a>`).join(" · ")+`</div>`:``)
-    + `<div style="margin:10px 0"><button class="mini" onclick='toggleTree(${JSON.stringify(d.url)},${JSON.stringify(d.titre)})'>🌳 Arbre des liens</button></div>`
+    + `<div class="liens"><b>➕ Ajouter un lien :</b>
+         <input id="lkq" list="lktitres" placeholder="titre de l'article à relier…">
+         <datalist id="lktitres"></datalist>
+         <button class="mini" onclick='addLink(${JSON.stringify(d.url)})'>Relier</button></div>`
+    + `<div style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap">
+         <button class="mini" onclick='showSchema(${JSON.stringify(d.url)})'>🕸️ Schéma des liens</button>
+         <button class="mini" onclick='toggleTree(${JSON.stringify(d.url)},${JSON.stringify(d.titre)})'>🌳 Arbre des liens</button></div>`
     + `<div id="tree-mount"></div>`
     + ((d.notes&&d.notes.length)?`<div class="notes"><b>📝 Notes (mémoire de Tenebris) :</b><ul>`+d.notes.map(n=>`<li>${esc(n)}</li>`).join("")+`</ul></div>`:``)
     + (d.synthese
         ? `<div class="synthwrap"><div class="synthead"><b>✍️ Fiche réécrite</b> <a href="#" onclick="toggleRaw();return false" id="rawlink" class="src">voir le brut</a></div><pre id="synth">${esc(d.synthese)}</pre><pre id="rawc" style="display:none">${esc(d.contenu||"")}</pre></div>`
         : (d.contenu?`<pre>${esc(d.contenu)}</pre>`:`<div class="empty">Pas encore de copie de ce sujet. Lance « Copie complète » ou « Réparer » dans l'admin.</div>`));
   v.scrollTop=0;
+  fillTitres();
 }
 async function doSearch(){
   const q=document.getElementById("q").value.trim(); if(!q) return;
@@ -11073,6 +11164,104 @@ async function doSearch(){
        <div class="x">${esc(r.chemin)}</div>
        ${r.extrait?`<div class="x">${esc(r.extrait)}</div>`:``}
      </div>`).join("");
+}
+// --- Édition des liens (corriger ce qui est faux ou manquant) ---
+let _titres=null;
+async function fillTitres(){
+  const dl=document.getElementById("lktitres"); if(!dl) return;
+  if(!_titres){ const d=await api("action=titres"); if(!d) return; _titres=d.titres||[]; }
+  dl.innerHTML=_titres.map(t=>`<option value="${esc(t.titre)}">`).join("");
+}
+async function postForum(body){
+  const r=await fetch("/admin/api/forum",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.status===401){location.href="/admin";return null;}
+  return r.json();
+}
+async function addLink(url){
+  const inp=document.getElementById("lkq"); const q=(inp.value||"").trim(); if(!q) return;
+  if(!_titres){ await fillTitres(); }
+  const t=(_titres||[]).find(x=>x.titre.toLowerCase()===q.toLowerCase());
+  if(!t){ alert("Article introuvable : choisis un titre dans la liste."); return; }
+  const d=await postForum({action:"link_add", url:url, cible:t.url, titre:t.titre});
+  if(d && d.ok){ inp.value=""; openTopic(url, cur); } else if(d){ alert(d.message||"Échec."); }
+}
+async function delLink(url, cible){
+  if(!window.confirm("Supprimer ce lien ? Il ne sera pas recréé automatiquement.")) return;
+  const d=await postForum({action:"link_remove", url:url, cible:cible});
+  if(d && d.ok){ openTopic(url, cur); } else if(d){ alert(d.message||"Échec."); }
+}
+// --- SCHÉMA : le réseau des liens, dessiné (qui est lié à qui) ---
+async function showSchema(url){
+  const d=await api("action=schema&depth=2&url="+encodeURIComponent(url||"")); if(!d) return;
+  const v=document.getElementById("view");
+  const N=d.noeuds||[], E=d.aretes||[];
+  if(!N.length){ v.innerHTML=`<div class="empty">Aucun lien à représenter. Lance « Réparer & tisser » dans l'admin.</div>`; return; }
+  v.innerHTML=`<h2>🕸️ Schéma des liens</h2>
+    <div class="kw">${N.length} article(s), ${E.length} lien(s). Glisse les bulles, clique pour ouvrir la fiche.
+    <span class="lg"><i class="c0"></i>départ <i class="c1"></i>voisin direct <i class="c2"></i>plus loin</span></div>
+    <div id="svgwrap"></div>`;
+  drawSchema(document.getElementById("svgwrap"), N, E, d.depart);
+  v.scrollTop=0;
+}
+function drawSchema(host, N, E, depart){
+  const W=host.clientWidth||700, H=Math.max(420, Math.min(760, 180+N.length*16));
+  const idx={}; N.forEach((n,i)=>idx[n.url]=i);
+  // placement initial : le départ au centre, les autres en anneaux par niveau
+  const P=N.map((n,i)=>{
+    const lvl=n.niveau||0, r=lvl*Math.min(W,H)*0.22+ (lvl?0:0);
+    const a=(i/Math.max(1,N.length))*Math.PI*2;
+    return {x:W/2+Math.cos(a)*r+(lvl?0:0.01), y:H/2+Math.sin(a)*r, vx:0, vy:0, n:n};
+  });
+  const L=E.map(e=>({s:idx[e.de], t:idx[e.vers], type:e.type})).filter(l=>l.s!=null&&l.t!=null);
+  // petite simulation de forces (répulsion + ressorts) — pas de bibliothèque externe
+  for(let it=0; it<220; it++){
+    for(let i=0;i<P.length;i++) for(let j=i+1;j<P.length;j++){
+      let dx=P[j].x-P[i].x, dy=P[j].y-P[i].y, d2=dx*dx+dy*dy||1, d=Math.sqrt(d2);
+      const f=1800/d2; const fx=dx/d*f, fy=dy/d*f;
+      P[i].vx-=fx; P[i].vy-=fy; P[j].vx+=fx; P[j].vy+=fy;
+    }
+    L.forEach(l=>{
+      const a=P[l.s], b=P[l.t];
+      let dx=b.x-a.x, dy=b.y-a.y, d=Math.sqrt(dx*dx+dy*dy)||1;
+      const f=(d-110)*0.012, fx=dx/d*f, fy=dy/d*f;
+      a.vx+=fx; a.vy+=fy; b.vx-=fx; b.vy-=fy;
+    });
+    P.forEach(p=>{
+      if(p.n.niveau===0){ p.x=W/2; p.y=H/2; p.vx=p.vy=0; return; }   // le départ reste au centre
+      p.x+=Math.max(-12,Math.min(12,p.vx)); p.y+=Math.max(-12,Math.min(12,p.vy));
+      p.vx*=0.82; p.vy*=0.82;
+      p.x=Math.max(60,Math.min(W-60,p.x)); p.y=Math.max(28,Math.min(H-28,p.y));
+    });
+  }
+  const ed=L.map(l=>`<line x1="${P[l.s].x}" y1="${P[l.s].y}" x2="${P[l.t].x}" y2="${P[l.t].y}" class="e ${l.type==='manuel'?'eman':(l.type==='mention'?'emen':'')}"/>`).join("");
+  const nd=P.map((p,i)=>{
+    const t=p.n.titre.length>22?p.n.titre.slice(0,21)+"…":p.n.titre;
+    return `<g class="nd" data-i="${i}" transform="translate(${p.x},${p.y})">
+      <circle r="${p.n.niveau===0?13:9}" class="c${Math.min(2,p.n.niveau||0)}"><title>${esc(p.n.titre)}${p.n.chemin?" — "+esc(p.n.chemin):""}</title></circle>
+      <text y="-16">${esc(t)}</text></g>`;
+  }).join("");
+  host.innerHTML=`<svg id="schema" viewBox="0 0 ${W} ${H}" width="100%" height="${H}">${ed}${nd}</svg>`;
+  // interactions : clic = ouvrir la fiche, glisser = déplacer la bulle
+  const svg=document.getElementById("schema");
+  let drag=null, moved=false;
+  svg.querySelectorAll(".nd").forEach(g=>{
+    g.addEventListener("mousedown",e=>{drag={g:g,i:+g.dataset.i};moved=false;e.preventDefault();});
+    g.addEventListener("click",()=>{ if(!moved) openTopic(P[+g.dataset.i].n.url); });
+  });
+  svg.addEventListener("mousemove",e=>{
+    if(!drag) return; moved=true;
+    const r=svg.getBoundingClientRect();
+    const x=(e.clientX-r.left)/r.width*W, y=(e.clientY-r.top)/r.height*H;
+    P[drag.i].x=x; P[drag.i].y=y;
+    drag.g.setAttribute("transform",`translate(${x},${y})`);
+    L.forEach((l,k)=>{ if(l.s===drag.i||l.t===drag.i){
+      const ln=svg.querySelectorAll("line")[k];
+      ln.setAttribute("x1",P[l.s].x); ln.setAttribute("y1",P[l.s].y);
+      ln.setAttribute("x2",P[l.t].x); ln.setAttribute("y2",P[l.t].y);
+    }});
+  });
+  svg.addEventListener("mouseup",()=>{drag=null;});
+  svg.addEventListener("mouseleave",()=>{drag=null;});
 }
 function toggleRaw(){
   const s=document.getElementById("synth"), r=document.getElementById("rawc"), l=document.getElementById("rawlink");
@@ -11259,6 +11448,16 @@ async def admin_forum_api(request):
     guard = _auth_guard(request)
     if guard:
         return guard
+    if request.method == "POST":
+        data = await _read_json(request)
+        act = data.get("action")
+        if act == "link_add":
+            ok, msg = forum_link_add(data.get("url", ""), data.get("cible", ""), data.get("titre", ""))
+            return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 400)
+        if act == "link_remove":
+            ok, msg = forum_link_remove(data.get("url", ""), data.get("cible", ""))
+            return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 400)
+        return web.json_response({"error": "action inconnue"}, status=400)
     action = request.query.get("action", "tree")
     if action == "tree":
         return web.json_response({"forum": FORUM_URL, "tree": forum_tree(),
@@ -11283,6 +11482,72 @@ async def admin_forum_api(request):
         })
     if action == "search":
         return web.json_response({"resultats": forum_search(request.query.get("q", ""))})
+    if action == "titres":
+        # Pour l'autocomplétion quand on ajoute un lien à la main.
+        lib, fc = library(), forum_content()
+        out = [{"url": u, "titre": (lib.get(u, {}).get("titre") or fc.get(u, {}).get("titre")
+                                    or _slug_title(u))[:120]}
+               for u in set(list(lib) + list(fc))]
+        out.sort(key=lambda t: t["titre"].lower())
+        return web.json_response({"titres": out})
+    if action == "schema":
+        # SCHÉMA : le réseau autour d'un article (ses voisins, puis les voisins de ses voisins).
+        # C'est ce qui montre d'un coup d'œil qui est lié à qui — personnages, lieux, factions.
+        depart = request.query.get("url", "")
+        try:
+            prof = max(1, min(3, int(request.query.get("depth", "2"))))
+        except ValueError:
+            prof = 2
+        lib, fc = library(), forum_content()
+
+        def nom(u):
+            return (lib.get(u, {}).get("titre") or fc.get(u, {}).get("titre") or _slug_title(u))[:120]
+
+        def voisins(u):
+            e = fc.get(u, {})
+            out = {}
+            for l in e.get("liens", []):
+                if l.get("url"):
+                    out[l["url"]] = l.get("type", "lien")
+            for r in e.get("retroliens", []):
+                if r.get("url") and r["url"] not in out:
+                    out[r["url"]] = "retro"
+            return out
+
+        noeuds, aretes, vus = {}, [], set()
+        if depart:
+            noeuds[depart] = 0
+            frontiere = [depart]
+            for niveau in range(prof):
+                suivante = []
+                for u in frontiere:
+                    if u in vus:
+                        continue
+                    vus.add(u)
+                    for v, typ in voisins(u).items():
+                        if v not in noeuds:
+                            noeuds[v] = niveau + 1
+                            suivante.append(v)
+                        if not any(a["de"] == u and a["vers"] == v for a in aretes):
+                            aretes.append({"de": u, "vers": v, "type": typ})
+                frontiere = suivante
+                if len(noeuds) > 120:
+                    break
+        else:
+            degres = sorted(fc.items(), key=lambda kv: -(len(kv[1].get("liens", []))
+                                                         + len(kv[1].get("retroliens", []))))
+            for u, _e in degres[:60]:
+                noeuds[u] = 0
+            for u in list(noeuds):
+                for v, typ in voisins(u).items():
+                    if v in noeuds and not any(a["de"] == u and a["vers"] == v for a in aretes):
+                        aretes.append({"de": u, "vers": v, "type": typ})
+        return web.json_response({
+            "depart": depart,
+            "noeuds": [{"url": u, "titre": nom(u), "chemin": _chemin_of(u), "niveau": n}
+                       for u, n in noeuds.items()],
+            "aretes": aretes,
+        })
     if action == "graph":
         # Vue d'ensemble du tissage : orphelins (sans rubrique) et articles les plus connectés.
         lib, fc = library(), forum_content()
@@ -11311,6 +11576,7 @@ def _register_admin_routes(app):
     app.router.add_get("/forum", admin_forum_page)
     app.router.add_get("/forum/", admin_forum_page)
     app.router.add_get("/admin/api/forum", admin_forum_api)
+    app.router.add_post("/admin/api/forum", admin_forum_api)
     app.router.add_get("/serveur", admin_serveur_page)
     app.router.add_get("/serveur/", admin_serveur_page)
     app.router.add_get("/admin/api/serveur", admin_serveur_api)
