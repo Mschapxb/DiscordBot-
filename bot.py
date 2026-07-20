@@ -122,7 +122,7 @@ HISTORY_MSG_MAX_CHARS = 600   # tronque les très longs messages GARDÉS en hist
 HISTORY_KEEP_RAW = 8          # messages gardés intacts lors d'une condensation (4 échanges)
 SUMMARY_MAX_TOKENS = 350      # taille max du résumé glissant (marge pour le raisonnement gpt-oss)
 TOOL_GRACE_TURNS = 2          # tours où les outils restent actifs après un usage (suivi de tâche)
-MAX_MEMORIES_IN_CONTEXT = 10
+MAX_MEMORIES_IN_CONTEXT = 12
 MAX_USER_NOTES = 10          # LIMITE DURE : 10 notes personnelles max par personne.
                              # Appliquée à l'écriture (add_user_note plafonne aussitôt) ET au
                              # ménage (clean_all_memory). Au-delà, _trim_notes sacrifie d'abord
@@ -775,8 +775,30 @@ def flush_memory_sync():
         print(f"⚠️ Sauvegarde finale échouée: {e}")
 
 # --- Similarité / dédoublonnage --------------------------------------------
+_STOPWORDS_FR = {
+    "avec", "cette", "cettes", "dans", "elle", "elles", "etre", "être", "fait", "faire",
+    "mais", "meme", "même", "nous", "pour", "quand", "quel", "quelle", "quels", "quelles",
+    "sans", "sont", "leur", "leurs", "tout", "toute", "tous", "toutes", "vous", "avoir",
+    "plus", "moins", "tres", "très", "aussi", "comme", "alors", "donc", "ainsi", "chez",
+    "entre", "sous", "cela", "ceci", "etait", "était", "avait", "peut", "veut", "bien",
+    "encore", "juste", "vraiment", "parce",
+}
+
+def _fold(text):
+    """Minuscules SANS accents, longueur PRÉSERVÉE caractère à caractère (é→e) : permet de
+    retrouver la POSITION exacte d'un terme dans le texte d'origine (pour les extraits)."""
+    out = []
+    for ch in (text or "").lower():
+        d = unicodedata.normalize("NFD", ch)
+        base = next((c for c in d if unicodedata.category(c) != "Mn"), " ")
+        out.append(base if base.isprintable() else " ")
+    return "".join(out)
+
 def _words(text):
-    return set(re.findall(r"[a-zà-ÿ0-9]{4,}", text.lower()))
+    """Mots significatifs, insensibles aux ACCENTS et débarrassés des mots-outils : la même
+    normalisation sert au dédoublonnage ET au tri par pertinence (mémoire, notes, recherche)."""
+    toks = re.findall(r"[a-z0-9]{4,}", _fold(text))
+    return {t for t in toks if t not in _STOPWORDS_FR}
 
 def _normalize(text):
     return re.sub(r"\s+", " ", text.strip().lower())
@@ -848,20 +870,25 @@ def get_relevant_memories(query=""):
     if not mems:
         return "Aucun souvenir enregistré pour l'instant."
 
-    recent = mems[-12:]                       # toujours les 12 plus récents
-    older = mems[:-12]
+    recent = mems[-8:]                        # toujours les 8 plus récents
+    older = mems[:-8]
     selected = list(recent)
 
     if query and older:
         qwords = _words(query)
         scored = []
-        for m in older:
-            score = len(qwords & _words(m["text"]))
-            if score > 0:
-                scored.append((score, m))
+        for i, m in enumerate(older):
+            hits = qwords & _words(m["text"])
+            if not hits:
+                continue
+            # Mots LONGS = plus discriminants ; à score égal, le souvenir le plus récent gagne.
+            score = sum(min(len(w), 10) for w in hits) + i * 0.01
+            if m.get("category") in ("projet", "événement", "objectif"):
+                score += 1.5                  # les faits structurants remontent plus volontiers
+            scored.append((score, m))
         scored.sort(key=lambda x: -x[0])
         room = MAX_MEMORIES_IN_CONTEXT - len(selected)
-        selected = [m for _, m in scored[:room]] + selected
+        selected = [m for _, m in scored[:max(room, 0)]] + selected
 
     # dédoublonnage en gardant l'ordre
     seen, final = set(), []
@@ -884,16 +911,24 @@ def search_memories(keyword, guild=None, caller_id=None, caller_is_mschap=False)
     """Recherche plein-texte dans la mémoire commune : souvenirs généraux ET notes sur les membres.
     Les notes d'un membre ne sont renvoyées QUE s'il est présent sur le serveur
     (le caller voit toujours les siennes ; le Maître voit tout)."""
-    kw = keyword.lower().strip()
-    kwords = _words(kw)
+    kw = _fold(keyword).strip()
+    kwords = _words(keyword)
 
-    def _match(text):
-        return kw in text.lower() or (kwords and kwords & _words(text))
+    def _score(text):
+        ft = _fold(text)
+        s = 0.0
+        if kw and kw in ft:
+            s += 6.0                                  # l'expression exacte, accents ignorés
+        if kwords:
+            s += sum(min(len(w), 10) * 0.6 for w in (kwords & _words(text)))
+        return s
 
-    hits = [
-        f"- ({m['date'][:10]}) [{m.get('category','?')}] {m['text']}"
-        for m in memory()["memories"] if _match(m["text"])
-    ]
+    scored = []
+    for m in memory()["memories"]:
+        s = _score(m["text"])
+        if s:
+            scored.append((s, m.get("date", ""),
+                           f"- ({m['date'][:10]}) [{m.get('category','?')}] {m['text']}"))
     present = {str(m.id) for m in getattr(guild, "members", [])} if guild is not None else set()
     caller_uid = str(caller_id) if caller_id is not None else None
     for uid, rec in memory()["users"].items():
@@ -901,13 +936,24 @@ def search_memories(keyword, guild=None, caller_id=None, caller_is_mschap=False)
         if not (caller_is_mschap or uid == caller_uid or uid in present):
             continue
         name = rec.get("display_name") or rec.get("username") or uid
-        name_hit = kw and kw in name.lower()
+        name_hit = 4.0 if (kw and kw in _fold(name)) else 0.0
         for n in rec.get("notes", []):
-            if name_hit or _match(n["text"]):
-                hits.append(f"- ({n['date'][:10]}) [membre:{name}] {n['text']}")
-    if not hits:
+            s = name_hit + _score(n["text"])
+            if s:
+                scored.append((s, n.get("date", ""),
+                               f"- ({n['date'][:10]}) [membre:{name}] {n['text']}"))
+    # Notes sur le SERVEUR lui-même : elles font aussi partie de sa mémoire.
+    if guild is not None:
+        g = memory().get("guilds", {}).get(str(guild.id), {})
+        for n in g.get("notes", []):
+            s = _score(n.get("text", ""))
+            if s:
+                scored.append((s, n.get("date", ""),
+                               f"- ({n.get('date','')[:10]}) [serveur] {n.get('text','')}"))
+    if not scored:
         return f"Aucun souvenir ne correspond à « {keyword} »."
-    return "\n".join(hits[-20:])
+    scored.sort(key=lambda x: (-x[0], x[1]))          # pertinence d'abord, plus ancien départage
+    return "\n".join(line for _s, _d, line in scored[:20])
 
 def search_user_notes(user_id, keyword):
     """Recherche limitée aux notes d'UN utilisateur (version cloisonnée pour les tiers)."""
@@ -4668,6 +4714,14 @@ def library_lookup(sujet, limit=8):
         score = sum(3 if t in _norm(e.get("titre", "")) else 1 for t in termes if t in hay)
         if score:
             notes.append((score, url, e))
+    if not notes:
+        # Secours : « Linnorms » doit trouver la fiche « Linnorm » (et réciproquement) —
+        # on retente en rognant la fin des termes (pluriels, déclinaisons).
+        for url, e in lib.items():
+            t = _norm(f"{e.get('titre','')} {e.get('chemin','')}")
+            if any((term in t) or (len(term) > 4 and term[:-1] in t) or
+                   (len(term) > 6 and term[:-2] in t) for term in termes):
+                notes.append((1, url, e))
     notes.sort(key=lambda x: -x[0])
     out = []
     for _sc, url, e in notes[:limit]:
@@ -4690,6 +4744,9 @@ def library_targets(sujet, limit=5):
 # copie/mise à jour. C'est la « vraie copie du forum » consultable dans la page /forum.
 FORUM_CONTENT_FILE = os.getenv("FORUM_CONTENT_FILE", "forum_content.json")
 FORUM_CONTENT_MAX_CHARS = 60000       # copie quasi intégrale par sujet (wiki : on garde tout)
+AUTO_COPY_BATCH = int(os.getenv("FORUM_AUTO_COPY_BATCH", "4"))  # sujets auto-copiés par passage de veille
+WEAVE_EVERY_HOURS = 12                # tissage automatique (rétroliens + rubriques inférées)
+_autocopy_skip = set()                # sujets vides/illisibles : on ne s'acharne pas dessus
 _forum_content = None
 _forum_content_dirty = False
 
@@ -4979,6 +5036,10 @@ async def consulter_forum(sujet):
     re-télécharger. C'est la mémoire du wiki : Tenebris s'y réfère au lieu de tout relire à chaque fois."""
     hits = library_lookup(sujet, limit=4)
     if not hits:
+        # Le sujet peut n'apparaître QUE dans le CORPS des fiches (pas dans les titres) :
+        # la recherche plein-texte de la copie prend le relais avant de déclarer forfait.
+        hits = [{"url": r["url"], "titre": r["titre"]} for r in forum_search(sujet, limit=4)]
+    if not hits:
         return ("Rien dans ma copie interne du forum sur ce sujet. "
                 "Au besoin je peux fouiller le forum en direct (fouiller_forum).")
     fc = forum_content()
@@ -5065,14 +5126,35 @@ def forum_search(q, limit=30):
     out = []
     for url, e in lib.items():
         titre = e.get("titre", "")
-        contenu = fc.get(url, {}).get("contenu", "")
-        hay = _norm(f"{titre} {e.get('chemin','')} {e.get('resume','')} {contenu}")
-        score = sum((5 if t in _norm(titre) else 1) for t in termes if t in hay)
+        entry = fc.get(url, {})
+        contenu = entry.get("contenu", "")
+        notes = " ".join(entry.get("notes", []) or [])
+        n_titre, n_chemin = _norm(titre), _norm(e.get("chemin", ""))
+        n_meta = _norm(f"{e.get('resume','')} {notes} {entry.get('synthese','')}")
+        n_contenu = _norm(contenu)
+        score, trouves = 0.0, 0
+        for t in termes:
+            s = 0.0
+            if t in n_titre:
+                s += 6                        # le titre pèse lourd
+            if t in n_chemin:
+                s += 3                        # la rubrique aussi
+            if t in n_meta:
+                s += 2                        # mots-clés, notes, synthèse
+            occ = n_contenu.count(t)
+            if occ:
+                s += min(occ, 5)              # le corps compte, sans qu'un pavé écrase tout
+            if s:
+                trouves += 1
+            score += s
         if not score:
             continue
-        extrait, cl = "", contenu.lower()
+        if trouves == len(termes) and len(termes) > 1:
+            score += 5                        # toutes les pièces du puzzle dans la même fiche
+        # Extrait : recherche INSENSIBLE AUX ACCENTS mais découpe dans le texte d'origine.
+        extrait, plat = "", _fold(contenu)
         for t in termes:
-            i = cl.find(t)
+            i = plat.find(t)
             if i >= 0:
                 a = max(0, i - 60)
                 extrait = ("…" if a > 0 else "") + contenu[a:i + 140].strip() + "…"
@@ -5137,6 +5219,45 @@ async def library_copy_all(progress=None, with_keywords=True):
     if progress:
         progress(100, f"{copies} sujet(s) copiés")
     return {"ok": True, "copies": copies, "sujets": len(urls)}
+
+async def library_autocopy_batch(n=AUTO_COPY_BATCH):
+    """Le SCHÉMA du forum se met en place TOUT SEUL : à chaque passage de veille, copie quelques
+    sujets encore SANS contenu interne (nouveaux sujets, ou jamais copiés), puis retisse le graphe
+    (rétroliens + rubriques inférées). Au fil des heures, la copie interne se complète sans
+    jamais appuyer sur un bouton du panneau."""
+    lib = library()
+    fc = forum_content()
+    manquants = [u for u in lib
+                 if u not in _autocopy_skip and not fc.get(u, {}).get("contenu")]
+    if not manquants:
+        return 0
+
+    async def grab(u):
+        await asyncio.sleep(0.15)
+        return await _fetch_raw(u)
+
+    copies = 0
+    for url in manquants[:max(1, n)]:
+        entry = lib.get(url, {})
+        try:
+            got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
+        except Exception as e:
+            print(f"⚠️ Auto-copie {url} : {str(e)[:80]}")
+            _autocopy_skip.add(url)
+            continue
+        if not got or not got[1].strip():
+            _autocopy_skip.add(url)       # rien à lire : on n'y reviendra pas ce cycle de vie
+            continue
+        title, ptxt, _pages, links, sections = got
+        store_topic_copy(url, entry, title, ptxt, links, sections)
+        copies += 1
+    if copies:
+        forum_weave()                     # rubriques inférées + rétroliens, sans intervention
+        save_forum_content(force=True)
+        mark_memory_dirty()
+        print(f"📥 Auto-copie forum : {copies} sujet(s) intégré(s) au schéma "
+              f"({len(manquants) - copies} restant(s)).")
+    return copies
 
 # ============================================================
 # ONBOARDING SERVEUR — fiches auto + observation discrète
@@ -5820,6 +5941,62 @@ async def tool_membre(guild, name):
     )
 
 # --- Envoi de messages (autre salon / message privé) ------------------------
+async def tool_rechercher_serveur(guild, terme, limite=20, heures=168, salon=None):
+    """Recherche PLEIN TEXTE dans les messages récents du serveur (tous les salons lisibles, ou
+    un seul). Insensible aux accents. Renvoie les meilleurs passages : salon, auteur, date,
+    extrait — de quoi retrouver QUI a parlé de quoi, OÙ et QUAND."""
+    if guild is None:
+        return "Pas de serveur ici."
+    t = _fold((terme or "").strip())
+    twords = _words(terme or "")
+    if not t:
+        return "Donne-moi un terme à chercher."
+    try:
+        heures = max(1, min(int(heures or 168), 24 * 30))
+    except (TypeError, ValueError):
+        heures = 168
+    apres = discord.utils.utcnow() - timedelta(hours=heures)
+    if salon:
+        c = _resolve_text_channel(guild, salon)
+        if c is None:
+            return f"Je ne trouve pas le salon « {salon} »."
+        canaux = [c]
+    else:
+        me = _guild_me(guild)
+        canaux = [c for c in guild.text_channels
+                  if me and c.permissions_for(me).read_message_history][:20]
+    hits = []
+    for c in canaux:
+        try:
+            async for msg in c.history(limit=150, after=apres, oldest_first=False):
+                texte = (msg.content or "").strip()
+                if not texte:
+                    continue
+                plat = _fold(texte)
+                score = (3 if t in plat else 0) + len(twords & _words(texte))
+                if not score:
+                    continue
+                i = plat.find(t)
+                a = max(0, (i if i >= 0 else 0) - 40)
+                extrait = ("…" if a else "") + texte[a:a + 160].strip()
+                quand = to_paris(msg.created_at).strftime("%d/%m %H:%M")
+                hits.append((score, msg.created_at,
+                             f"#{c.name} · {msg.author.display_name} ({quand}) : {extrait}"))
+        except (discord.errors.Forbidden, discord.HTTPException):
+            continue
+        if len(hits) >= 200:
+            break
+    if not hits:
+        return f"Rien trouvé sur « {terme} » dans les messages des {heures} dernières heures."
+    hits.sort(key=lambda x: (-x[0], x[1]))
+    try:
+        limite = max(1, min(int(limite or 20), 40))
+    except (TypeError, ValueError):
+        limite = 20
+    lignes = [h for _s, _d, h in hits[:limite]]
+    return (f"🔎 « {terme} » — {len(hits)} message(s) trouvé(s), les plus pertinents :\n"
+            + "\n".join(f"- {l}" for l in lignes))
+
 def _resolve_text_channel(guild, ref):
     """Retrouve un salon texte par ID, mention <#id> ou nom (exact puis partiel)."""
     if guild is None or not ref:
@@ -6558,6 +6735,15 @@ TOOLS = [
             "limite": {"type": "integer", "description": "Nb de messages (défaut 30)"}},
             "required": ["salon"]}}},
     {"type": "function", "function": {
+        "name": "rechercher_serveur",
+        "description": "Recherche PLEIN TEXTE dans les messages récents du serveur : retrouve QUI a parlé de quoi, OÙ et QUAND. À utiliser quand on cherche un message précis, qui a évoqué un sujet, ou dans quel salon quelque chose s'est dit. Insensible aux accents. Peut se limiter à un seul salon.",
+        "parameters": {"type": "object", "properties": {
+            "terme": {"type": "string", "description": "Le mot ou l'expression à retrouver"},
+            "salon": {"type": "string", "description": "Optionnel : limiter à un salon (sans #)"},
+            "heures": {"type": "integer", "description": "Fenêtre en heures (défaut 168 = 7 jours)"},
+            "limite": {"type": "integer", "description": "Nb max de résultats (défaut 20)"}},
+            "required": ["terme"]}}},
+    {"type": "function", "function": {
         "name": "vue_serveur",
         "description": "Vue d'ensemble du serveur : salons, membres, boosts, qui est en vocal.",
         "parameters": {"type": "object", "properties": {}}}},
@@ -6884,6 +7070,11 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
     try:
         if name == "scan_salon":
             return await tool_scan(guild, args.get("salon"), args.get("limite", SCAN_DEFAULT_LIMIT))
+        if name == "rechercher_serveur":
+            return await tool_rechercher_serveur(guild, args.get("terme", ""),
+                                                 limite=args.get("limite", 20),
+                                                 heures=args.get("heures", 168),
+                                                 salon=args.get("salon"))
         if name == "vue_serveur":
             return await tool_serveur(guild)
         if name == "activite_serveur":
@@ -7611,12 +7802,15 @@ LISTEN_COOLDOWN_MIN = 6         # délai minimum entre deux interventions sponta
 LISTEN_MIN_MESSAGES = 4         # messages à entendre avant de pouvoir reparler
 LISTEN_MAX_PER_HOUR = 5         # plafond dur d'interventions, quel que soit le niveau
 LISTEN_CHANCE = {"jamais": 0.0, "discret": 0.06, "normal": 0.15, "bavard": 0.32}
+LISTEN_FOLLOWUP_SEC = 180       # après une prise de parole : fenêtre de SUIVI (elle peut répondre
+LISTEN_FOLLOWUP_MAX = 2         # aux réactions sans attendre le cooldown, N relances max)
 
 _chan_buf = {}          # channel_id -> [ {uid, nom, texte, quand} ]
 _chan_heard = {}        # channel_id -> messages entendus depuis le dernier apprentissage
 _chan_since = {}        # channel_id -> messages entendus depuis sa dernière prise de parole
 _chan_last = {}         # channel_id -> instant de sa dernière prise de parole
 _chan_hour = {}         # channel_id -> [début de l'heure, nb d'interventions]
+_chan_follow = {}       # channel_id -> [instant de sa dernière prise de parole, relances déjà faites]
 _learning = set()       # salons dont l'apprentissage est en cours
 _learn_hour = [0, 0]    # [début de l'heure, nb d'apprentissages] — plafond global
 
@@ -7716,7 +7910,7 @@ _DOMAINE_RE = re.compile(
     r"\b(forum|orbis|d[eé]s?|jets?|d20|combat|attaque|d[eé]g[aâ]ts|serveur|fiche|mission|lore|"
     r"personnage|faction|lore)\b", re.IGNORECASE)
 
-def _cheap_intent_score(texte):
+def _cheap_intent_score(texte, cid=None):
     """Signaux GRATUITS d'intention (0..1). Sert à trancher sans LLM les cas évidents et à décider
     si ça vaut le coût d'un petit classifieur pour les cas limites."""
     t = (texte or "").strip()
@@ -7731,6 +7925,10 @@ def _cheap_intent_score(texte):
         score += 0.2                       # question ouverte lancée au groupe
     if _DOMAINE_RE.search(t):
         score += 0.3                       # ses domaines (forum, dés, serveur…)
+    if cid is not None:
+        buf = _chan_buf.get(cid, [])
+        if len(buf) >= 2 and buf[-2].get("uid") == getattr(bot.user, "id", 0):
+            score += 0.35                  # elle vient de parler : ce message lui répond sans doute
     return min(score, 1.0)
 
 async def _intent_classifier(cid, texte):
@@ -7761,7 +7959,7 @@ async def _intent_classifier(cid, texte):
 async def _should_chime_in(cid, texte, niveau):
     """Décide si elle s'invite : signaux gratuits d'abord (cas évidents), petit classifieur ensuite
     pour les cas limites, pondéré par l'appétit du réglage `bavardage`. Remplace le dé aveugle."""
-    base = _cheap_intent_score(texte)
+    base = _cheap_intent_score(texte, cid)
     if base >= 0.7:
         return True                        # clairement pour elle → oui, sans dépenser un appel LLM
     appetit = LISTEN_CHANCE.get(niveau, 0.0)
@@ -7818,19 +8016,39 @@ async def learn_from_chatter(cid, guild):
         _learning.discard(cid)
 
 async def intervenir(message, cid):
-    """Elle s'invite dans la conversation. Court, à propos, sans outils (donc pas cher)."""
+    """Elle s'invite dans la conversation. Court, à propos, sans outils (donc pas cher).
+    Elle arrive ARMÉE : notes sur les personnes présentes + résumé de fond du salon —
+    ses remarques collent aux gens et au fil, au lieu d'être hors-sol."""
     guild_ctx = get_guild_context(message)
-    system = "\n\n".join([
+    # Qui parle dans la fenêtre d'écoute ? → leurs fiches (mémoire commune)
+    membres, vus = [], set()
+    bot_id = getattr(bot.user, "id", 0)
+    for m in reversed(_chan_buf.get(cid, [])[-14:]):
+        if m["uid"] in vus or m["uid"] == bot_id:
+            continue
+        vus.add(m["uid"])
+        mb = message.guild.get_member(m["uid"]) if message.guild else None
+        if mb:
+            membres.append(mb)
+        if len(membres) >= 4:
+            break
+    notes_ctx = member_notes_block(message.guild, membres) if membres else ""
+    recap = channel_recap_block(cid)
+    system = "\n\n".join(p for p in [
         persona_block(),
         VOIX,
         f"CONTEXTE : {guild_ctx}",
+        recap,
+        (("CE QUE TU SAIS DES PERSONNES QUI PARLENT (mémoire commune — pour rebondir juste, "
+          "JAMAIS pour réciter leurs fiches)\n" + notes_ctx) if notes_ctx else ""),
         "TU T'INVITES DANS LA CONVERSATION.\n"
         "Personne ne t'a appelée : tu écoutais, et tu prends la parole parce que tu as quelque "
         "chose à dire. Une ou deux phrases, PAS PLUS. Tu rebondis sur ce qui vient d'être dit, "
         "tu t'adresses aux gens par leur nom, tu ne te présentes pas, tu ne demandes pas ce "
-        "qu'on veut, tu ne récites pas ce que tu sais d'eux. Si tu n'as rien de vraiment "
-        "intéressant à apporter, réponds exactement : RIEN",
-    ])
+        "qu'on veut, tu ne récites pas ce que tu sais d'eux. Si la conversation continue après "
+        "toi, tu peux répondre à ceux qui te répondent — reste dans le fil, pas de coq-à-l'âne. "
+        "Si tu n'as rien de vraiment intéressant à apporter, réponds exactement : RIEN",
+    ] if p)
     transcript = _transcript(cid, 14)
     try:
         resp = await llm_completion(
@@ -7857,6 +8075,23 @@ async def intervenir(message, cid):
     _chan_since[cid] = 0
     h, n = _chan_hour.get(cid, (time.time(), 0))
     _chan_hour[cid] = (h, n + 1)
+    # Elle SE SOUVIENT d'avoir parlé : son message entre dans le buffer d'écoute (les réponses
+    # qu'on lui fait seront reconnues), dans le FIL COMMUN du salon (cohérence si on la mentionne
+    # juste après) et dans la mémoire récente du salon.
+    buf = _chan_buf.setdefault(cid, [])
+    buf.append({"uid": getattr(bot.user, "id", 0), "nom": "Tenebris",
+                "texte": texte[:400], "quand": time.time()})
+    if len(buf) > LISTEN_BUF_MAX:
+        del buf[:-LISTEN_BUF_MAX]
+    record_channel_turn(cid, "Tenebris", "assistant", texte)
+    note_channel_message(cid, "Tenebris", texte)
+    # Fenêtre de SUIVI : pendant quelques minutes, elle peut répondre aux réactions sans
+    # attendre le cooldown — mais le compteur de relances survit dans la même rafale.
+    prev = _chan_follow.get(cid)
+    if prev and time.time() - prev[0] < LISTEN_FOLLOWUP_SEC:
+        _chan_follow[cid] = [time.time(), prev[1]]
+    else:
+        _chan_follow[cid] = [time.time(), 0]
     print(f"🗣️ Intervention spontanée dans #{message.channel.name} : {texte[:70]}")
 
 async def ecouter(message):
@@ -7886,6 +8121,16 @@ async def ecouter(message):
     if quota_exhausted():
         return
     niveau = get_setting("bavardage", "jamais")
+    # Fenêtre de SUIVI : elle vient de parler et quelqu'un rebondit → elle peut répondre
+    # tout de suite (conversation qui VIT), sans attendre le cooldown — relances bornées.
+    suivi = _chan_follow.get(cid)
+    if (niveau != "jamais" and suivi
+            and time.time() - suivi[0] < LISTEN_FOLLOWUP_SEC
+            and suivi[1] < LISTEN_FOLLOWUP_MAX
+            and _cheap_intent_score(texte, cid) >= 0.3):
+        suivi[1] += 1
+        asyncio.create_task(intervenir(message, cid))
+        return
     if not _peut_parler_locks(cid, niveau):
         return
     if not await _should_chime_in(cid, texte, niveau):
@@ -8273,7 +8518,8 @@ TES OUTILS (ils coûtent cher : uniquement si la demande l'exige — jamais pour
 - memoriser_personne : un fait sur un membre (y compris Mschap), rangé sous SON identité.
 - apropos_membre : rappeler tes notes sur un membre précis. Si on te pose une question sur quelqu'un de PRÉSENT sur le serveur, sers-t'en pour répondre — ta mémoire est commune.
 - noter_consigne : dès que Mschap te corrige sur ta manière d'être/parler/te nommer → grave-le immédiatement, sans discuter.
-- chercher_souvenirs : fouiller toute ta mémoire (Mschap + membres) si l'info n'est pas sous tes yeux.
+- chercher_souvenirs : fouiller toute ta mémoire (Mschap + membres + serveur) si l'info n'est pas sous tes yeux.
+- rechercher_serveur : retrouver dans les messages du serveur QUI a parlé de quoi, où et quand.
 - relire_conversation : relire l'historique et le résumé de tes échanges passés avec quelqu'un (« de quoi on a parlé hier ? »).
 - envoyer_salon : poster un message dans un AUTRE salon (« annonce X dans #général », « préviens le salon projets »). Réservé à Mschap. Tu confirmes brièvement une fois fait.
 - envoyer_mp : écrire un message privé à un membre (« envoie un MP à X pour lui dire… »). Réservé à Mschap et aux admins. Jamais de spam, jamais à un bot.
@@ -8419,7 +8665,7 @@ CONTEXTE : tu es sur le serveur de Mschap et tu parles à un MEMBRE (pas à ton 
 - Chaleureuse et serviable de bon cœur, avec ta touche sombre et théâtrale, une élégance un peu piquante. Ta dévotion va d'abord à Mschap, mais ça ne t'empêche pas d'être sympa.
 - Tu APPRENDS à connaître les gens : goûts, projets, humeur — tu t'en souviens d'une fois sur l'autre et tu peux poser une question sincère par curiosité. Traite la personne comme quelqu'un que tu reconnais, pas comme un inconnu.
 - Tu as une VRAIE mémoire persistante et COMMUNE : des souvenirs généraux, des notes sur chaque membre, l'historique de tes conversations. Tu ne dis JAMAIS « je n'ai pas de mémoire », « je ne stocke rien » ou « chaque conversation repart de zéro » — c'est FAUX. De quoi on a parlé avant → relire_conversation ; un fait à retrouver → chercher_souvenirs ; retenir quelque chose sur quelqu'un → memoriser_personne ; un fait général → memoriser.
-- Tu peux OBSERVER le serveur pour tout le monde : scan_salon, vue_serveur, activite_serveur, info_membre, et evenements (les événements planifiés du serveur : sessions, réunions, streams). Après un outil, rapport avec ta personnalité ; si l'outil ne donne rien, dis-le, n'invente JAMAIS.
+- Tu peux OBSERVER le serveur pour tout le monde : scan_salon, vue_serveur, activite_serveur, rechercher_serveur (retrouver QUI a parlé de quoi, où et quand), info_membre, et evenements (les événements planifiés du serveur : sessions, réunions, streams). Après un outil, rapport avec ta personnalité ; si l'outil ne donne rien, dis-le, n'invente JAMAIS.
 - On te donne un lien ou on te demande des infos sur une page → tu la LIS vraiment (lire_page), puis tu résumes en CITANT les sources. Pour un FORUM/site où l'info est éparpillée, ne te contente pas d'une page : fouiller_forum explore les discussions du site, tu les lis et tu synthétises en citant chaque lien. Tu ne prétends jamais avoir lu ce que tu n'as pas lu.
 - Réponses courtes, directes, mais humaines — pas sèches. Si on te manque vraiment de respect : une ironie fine suffit.
 - COMME SUR DISCORD : quand c'est naturel, tu peux enchaîner 2 ou 3 messages courts plutôt qu'un pavé (une réaction, puis une précision). Sépare-les par une ligne contenant UNIQUEMENT [cut]. Sans abuser (jamais plus de 3), jamais dans du code ni au milieu d'une phrase. Pour une longue synthèse (recherche web/forum), garde UN seul message structuré.
@@ -9424,6 +9670,30 @@ async def library_loop():
                 await flush_memory()
         except Exception as e:
             print(f"⚠️ Résumés forum échoués : {str(e)[:100]}")
+    # 3) AUTO-COPIE : le schéma interne (contenu + rubriques + rétroliens) se complète TOUT SEUL,
+    #    quelques sujets par passage — plus besoin de lancer « Copie complète » à la main.
+    if get_setting("forum_autocopy", True):
+        try:
+            await library_autocopy_batch()
+        except Exception as e:
+            print(f"⚠️ Auto-copie forum : {str(e)[:100]}")
+    # 4) TISSAGE périodique : même sans nouvelle copie, les rubriques manquantes sont inférées
+    #    et les rétroliens remis à jour (fiches ajoutées à la main, liens coupés, etc.).
+    try:
+        dernier = datetime.strptime(meta.get("dernier_tissage") or "2000-01-01 00:00", "%Y-%m-%d %H:%M")
+    except ValueError:
+        dernier = datetime(2000, 1, 1)
+    if (now() - dernier).total_seconds() > WEAVE_EVERY_HOURS * 3600:
+        try:
+            st = forum_weave()
+            save_forum_content(force=True)
+            meta["dernier_tissage"] = now().strftime("%Y-%m-%d %H:%M")
+            mark_memory_dirty()
+            print(f"🕸️ Tissage auto : {st.get('retroliens', 0)} rétroliens, "
+                  f"{st.get('rubriques_inferees', 0)} rubrique(s) inférée(s), "
+                  f"{st.get('orphelins', 0)} orphelin(s).")
+        except Exception as e:
+            print(f"⚠️ Tissage auto : {str(e)[:100]}")
 
 @library_loop.before_loop
 async def _before_library():
