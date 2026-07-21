@@ -193,7 +193,8 @@ class ForumPlatform:
                 epingle INTEGER DEFAULT 0,
                 archive INTEGER DEFAULT 0,
                 vues INTEGER DEFAULT 0,
-                source_url TEXT DEFAULT ''
+                source_url TEXT DEFAULT '',
+                source_maj TEXT DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_topics_forum ON topics(forum_id, epingle DESC, maj_le DESC);
             CREATE TABLE IF NOT EXISTS posts(
@@ -238,10 +239,11 @@ class ForumPlatform:
             );
             """)
             # Migration douce : bases créées avant l'ajout de source_url.
-            try:
-                c.execute("ALTER TABLE topics ADD COLUMN source_url TEXT DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass
+            for col in ("source_url", "source_maj"):
+                try:
+                    c.execute(f"ALTER TABLE topics ADD COLUMN {col} TEXT DEFAULT ''")
+                except sqlite3.OperationalError:
+                    pass
             c.execute("CREATE INDEX IF NOT EXISTS idx_topics_source ON topics(source_url)")
             # FTS5 si disponible (recherche plein-texte performante), sinon repli LIKE.
             try:
@@ -874,7 +876,7 @@ class ForumPlatform:
     # ------------------------------------------------------------------
     # IMPORT D'UN FORUM EXTERNE (copie interne → plateforme)
     # ------------------------------------------------------------------
-    IMPORT_CATEGORY = "Archives d'Orbis Naturae"
+    IMPORT_CATEGORY = "Orbis Naturae"
     IMPORT_FALLBACK_FORUM = "Sans rubrique"
 
     def _ensure_path(self, chemin):
@@ -908,10 +910,12 @@ class ForumPlatform:
         return row["id"] if row else None
 
     def import_external_topic(self, source_url, titre, chemin, contenu,
-                              auteur_nom="Archives", verrouille=True):
+                              auteur_nom="Orbis Naturae", verrouille=True, source_maj=""):
         """Importe (ou MET À JOUR) une fiche du forum externe comme sujet.
-        Idempotent : la même source_url ne crée jamais de doublon. Le contenu
-        est posé BRUT (pas d'analyse ici) : appeler reindex_all() après le lot.
+        Idempotent : la même source_url ne crée jamais de doublon, et si la date
+        de copie (source_maj) n'a pas changé, on ne touche à rien — c'est ce qui
+        rend la synchro périodique quasi gratuite. Le contenu est posé BRUT :
+        appeler reindex_topic() sur les sujets créés/modifiés.
         Renvoie (topic_id, 'cree'|'maj'|'inchange')."""
         titre = (titre or "").strip()[:200] or "(sans titre)"
         contenu = (contenu or "").strip() or "(fiche vide)"
@@ -921,14 +925,21 @@ class ForumPlatform:
             t = _now()
             with self._lock, self._conn as c:
                 cur = c.execute(
-                    "INSERT INTO topics(forum_id, titre, slug, auteur_id, auteur_nom, "
-                    "cree_le, maj_le, verrouille, source_url) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO topics(forum_id, titre, slug, auteur_id, auteur_nom, cree_le, "
+                    "maj_le, verrouille, source_url, source_maj) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (fid, titre, _slugify(titre), "import", auteur_nom, t, t,
-                     1 if verrouille else 0, source_url))
+                     1 if verrouille else 0, source_url, source_maj or ""))
                 tid = cur.lastrowid
                 c.execute("INSERT INTO posts(topic_id, auteur_id, auteur_nom, contenu, cree_le) "
                           "VALUES (?,?,?,?,?)", (tid, "import", auteur_nom, contenu, t))
             return tid, "cree"
+        # Fiche inchangée depuis la dernière synchro ? On s'arrête là (rapide).
+        if source_maj:
+            with self._lock:
+                row = self._conn.execute("SELECT source_maj FROM topics WHERE id=?",
+                                         (tid,)).fetchone()
+            if row and row["source_maj"] == source_maj:
+                return tid, "inchange"
         # Sujet déjà importé : on rafraîchit titre, rubrique et contenu si besoin.
         with self._lock, self._conn as c:
             old = c.execute("SELECT t.titre, t.forum_id, p.id pid, p.contenu FROM topics t "
@@ -948,7 +959,24 @@ class ForumPlatform:
         if old and old["forum_id"] != fid:
             self.move_topic(tid, fid)
             changed = True
+        with self._lock, self._conn as c:
+            c.execute("UPDATE topics SET source_maj=? WHERE id=?", (source_maj or "", tid))
         return tid, ("maj" if changed else "inchange")
+
+    def reindex_topic(self, topic_id):
+        """Reconstruit mentions + liens wiki/auto d'UN sujet (après création ou
+        mise à jour par la synchro) — sans repasser toute la base au crible."""
+        with self._lock, self._conn as c:
+            c.execute("DELETE FROM mentions WHERE topic_id=?", (topic_id,))
+            c.execute("DELETE FROM liens WHERE type='auto' AND (source=? OR cible=?)",
+                      (topic_id, topic_id))
+            posts = c.execute("SELECT contenu FROM posts WHERE topic_id=? AND supprime=0",
+                              (topic_id,)).fetchall()
+        texte = "\n".join(p["contenu"] for p in posts)
+        self.index_entities(topic_id, extract_entities_heuristic(texte))
+        self._process_wiki_links(topic_id, texte)
+        self._auto_link(topic_id, texte)
+        self.link_by_shared_entities(topic_id)
 
     def import_links(self, mapping, liens_par_url):
         """Retisse les liens de la copie externe : mapping {source_url: topic_id},

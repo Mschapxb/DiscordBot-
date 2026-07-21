@@ -26,6 +26,7 @@ Ce module fournit :
 import json
 import asyncio
 import discord
+from discord.ext import tasks
 from aiohttp import web
 
 from forum_platform import ForumPlatform, ENTITY_TYPES, ENTITY_LABELS
@@ -125,13 +126,15 @@ def setup_forum(bot, llm_completion=None, is_maitre=None,
         except RuntimeError:
             pass
 
-    # ---- import des archives du forum externe -----------------------------
-    async def import_archives():
-        """Verse la copie interne du forum externe (forum_content + library)
-        dans la plateforme : arborescence reconstruite depuis les fils d'Ariane,
-        un sujet (verrouillé) par fiche, liens retissés, puis réindexation
-        complète (entités + liens auto + wiki). Idempotent : relançable pour
-        rattraper les fiches copiées depuis."""
+    # ---- synchro avec la bibliothèque du forum externe --------------------
+    SYNC_MINUTES = 15          # cadence de la synchro automatique
+
+    async def sync_bibliotheque():
+        """Verse la bibliothèque (copie interne d'orbis-naturae, remplie en fond
+        par la veille) dans la plateforme : arborescence depuis les fils
+        d'Ariane, un sujet par fiche, liens retissés. INCRÉMENTAL : grâce à la
+        date de copie (source_maj), une fiche inchangée coûte une simple lecture
+        — seuls les sujets créés/modifiés sont réindexés (entités, liens auto)."""
         fc = (forum_content_getter() if forum_content_getter else {}) or {}
         lib = (library_getter() if library_getter else {}) or {}
         urls = list(dict.fromkeys(list(fc) + list(lib)))
@@ -139,27 +142,52 @@ def setup_forum(bot, llm_completion=None, is_maitre=None,
             return None
 
         def _run():
-            mapping, liens_par_url = {}, {}
+            mapping, liens_par_url, changed = {}, {}, []
             stats = {"cree": 0, "maj": 0, "inchange": 0}
             for url in urls:
                 e, le = fc.get(url, {}), lib.get(url, {})
                 titre = e.get("titre") or le.get("titre") or ""
                 chemin = le.get("chemin") or e.get("chemin") or ""
                 contenu = (e.get("contenu") or "").strip()
+                maj = e.get("maj") or le.get("maj") or ""
                 if not contenu:
-                    # Fiche indexée mais pas encore copiée : on garde au moins le résumé,
-                    # la relance d'un fimport ultérieur remplacera par le texte complet.
+                    # Fiche cartographiée mais pas encore copiée intégralement :
+                    # on affiche au moins le résumé, la copie complète le remplacera.
                     resume = (le.get("resume") or "").strip()
-                    contenu = ("\U0001F4C4 (résumé seulement — la fiche n'a pas encore été "
-                               "copiée par la veille)\n\n" + resume) if resume else ""
-                tid, st = forum.import_external_topic(url, titre, chemin, contenu)
+                    contenu = ("\U0001F4C4 (résumé seulement — la copie complète "
+                               "remplacera cette fiche)\n\n" + resume) if resume else ""
+                tid, st = forum.import_external_topic(url, titre, chemin, contenu,
+                                                      source_maj=maj)
                 stats[st] += 1
                 mapping[url] = tid
+                if st != "inchange":
+                    changed.append(tid)
                 liens_par_url[url] = [l.get("url") for l in e.get("liens", []) if l.get("url")]
             stats["liens"] = forum.import_links(mapping, liens_par_url)
-            stats["reindex"] = forum.reindex_all()
+            for tid in changed:
+                forum.reindex_topic(tid)
+            stats["reindex"] = len(changed)
             return stats
         return await asyncio.to_thread(_run)
+
+    @tasks.loop(minutes=SYNC_MINUTES)
+    async def _forum_sync_loop():
+        try:
+            stats = await sync_bibliotheque()
+            if stats and (stats["cree"] or stats["maj"]):
+                print(f"⚑ Forum ↔ bibliothèque : {stats['cree']} créé(s), "
+                      f"{stats['maj']} mis à jour, {stats['liens']} lien(s).")
+        except Exception as e:
+            print(f"⚠️ Synchro forum en panne : {e}")
+
+    @_forum_sync_loop.before_loop
+    async def _forum_sync_wait():
+        await bot.wait_until_ready()
+
+    async def _forum_sync_start():
+        if not _forum_sync_loop.is_running():
+            _forum_sync_loop.start()
+    bot.add_listener(_forum_sync_start, "on_ready")
 
     # ======================================================================
     # COMMANDES DISCORD
@@ -372,22 +400,21 @@ def setup_forum(bot, llm_completion=None, is_maitre=None,
         forum.move_topic(topic_id, forum_id)
         await ctx.send(f"📦 Sujet n°{topic_id} déplacé vers le forum n°{forum_id}.")
 
-    @bot.command(name="fimport", help="Verse les archives du forum externe dans la plateforme (Maître)")
-    async def fimport(ctx):
+    @bot.command(name="fsync", aliases=["fimport"],
+                 help="Force la synchro immédiate de /forum avec la bibliothèque (Maître)")
+    async def fsync(ctx):
         if not maitre(ctx.author.id, ctx.author.name):
-            return await ctx.send("Seul mon Maître déclenche ce déversement.")
-        await ctx.send("\u23F3 Import des archives en cours — arborescence, sujets, "
-                       "liens, puis réindexation. Ça peut prendre un moment…")
+            return await ctx.send("Seul mon Maître bouscule la synchro (elle tourne "
+                                  "toute seule toutes les 15 min, sinon).")
         async with ctx.typing():
-            stats = await import_archives()
+            stats = await sync_bibliotheque()
         if stats is None:
-            return await ctx.send("La copie du forum externe est vide : lance d'abord "
-                                  "la veille (bibliothèque) pour qu'elle archive des fiches.")
+            return await ctx.send("La bibliothèque est vide : la veille n'a encore "
+                                  "rien cartographié.")
         await ctx.send(
-            f"\U0001F4E6 **Import terminé** — {stats['cree']} sujet(s) créé(s), "
+            f"⚑ **Synchro faite** — {stats['cree']} sujet(s) créé(s), "
             f"{stats['maj']} mis à jour, {stats['inchange']} inchangé(s), "
-            f"{stats['liens']} lien(s) retissé(s), {stats['reindex']} sujet(s) réindexé(s). "
-            f"Tout est sur /forum.")
+            f"{stats['liens']} lien(s), {stats['reindex']} réindexé(s).")
 
     @bot.command(name="fstats", help="Statistiques du forum interne")
     async def fstats(ctx):
@@ -454,11 +481,11 @@ def setup_forum(bot, llm_completion=None, is_maitre=None,
                     if act == "cat_new":
                         cid = forum.create_category(data.get("nom", ""), data.get("description", ""))
                         return web.json_response({"ok": True, "id": cid})
-                    if act == "import":
-                        stats = await import_archives()
+                    if act == "sync":
+                        stats = await sync_bibliotheque()
                         if stats is None:
                             return web.json_response(
-                                {"ok": False, "error": "copie du forum externe vide"}, status=400)
+                                {"ok": False, "error": "bibliothèque vide"}, status=400)
                         return web.json_response({"ok": True, **stats})
                     if act == "forum_new":
                         fid = forum.create_forum(int(data["categorie_id"]), data.get("nom", ""),
@@ -573,7 +600,7 @@ textarea{min-height:90px;resize:vertical}
 <header>
   <h1>⚑ Plateforme</h1>
   <input id="q" placeholder="Rechercher — mots, personnage:Nom, lieu:Nom, avec:&quot;Titre lié&quot;…">
-  <a href="/admin">← panneau</a><a href="/archives">📚 archives</a><a href="#" id="idxBtn">📇 index</a><a href="#" id="graphBtn">🕸 graphe</a>
+  <a href="/admin">← panneau</a><a href="#" id="idxBtn">📇 index</a><a href="#" id="graphBtn">🕸 graphe</a>
 </header>
 <main>
   <div id="tree"></div>
@@ -605,16 +632,15 @@ function loadTree(){ api('?action=tree').then(d=>{ TREE = d.tree||[];
     cat.forums.forEach(f=>rec(f, c));
     box.appendChild(c);
   });
-  box.insertAdjacentHTML('beforeend', `<button class="btn" id="catNew">+ catégorie</button> <button class="btn" id="forNew">+ forum</button> <button class="btn" id="impBtn">\u21EA importer les archives</button>`);
+  box.insertAdjacentHTML('beforeend', `<button class="btn" id="catNew">+ catégorie</button> <button class="btn" id="forNew">+ forum</button> <button class="btn" id="impBtn">\u27F3 synchroniser</button>`);
   document.getElementById('catNew').onclick = ()=>{ const n=prompt('Nom de la catégorie ?'); if(n) post({action:'cat_new',nom:n}).then(loadTree); };
   document.getElementById('forNew').onclick = ()=>{ const c=prompt('N° de catégorie ?'), n=prompt('Nom du forum ?'), p=prompt('N° du forum parent (vide si aucun) ?');
     if(c&&n) post({action:'forum_new',categorie_id:c,nom:n,parent_id:p||null}).then(r=>{ if(r.error) alert(r.error); loadTree(); }); };
   document.getElementById('impBtn').onclick = ()=>{
-    if(!confirm('Verser les archives du forum externe dans la plateforme ? (relançable sans doublon)')) return;
-    const btn=document.getElementById('impBtn'); btn.textContent='\u23F3 import en cours…'; btn.disabled=true;
-    post({action:'import'}).then(r=>{ btn.disabled=false; btn.textContent='\u21EA importer les archives';
+    const btn=document.getElementById('impBtn'); btn.textContent='\u23F3 synchro…'; btn.disabled=true;
+    post({action:'sync'}).then(r=>{ btn.disabled=false; btn.textContent='\u27F3 synchroniser';
       if(r.error) return alert(r.error);
-      alert(`Import terminé : ${r.cree} créés, ${r.maj} mis à jour, ${r.inchange} inchangés, ${r.liens} liens, ${r.reindex} réindexés.`);
+      alert(`Synchro : ${r.cree} créés, ${r.maj} mis à jour, ${r.inchange} inchangés, ${r.liens} liens.`);
       loadTree(); }); };
 });}
 
