@@ -419,7 +419,7 @@ def setup_forum(bot, llm_completion=None, is_maitre=None):
                 if not t:
                     return web.json_response({"error": "sujet inconnu"}, status=404)
                 for p in t["posts"]:
-                    p["html"] = forum.autolink_html(tid, p["contenu"])
+                    p["html"] = forum.autolink_html(tid, p["contenu"], url_base="/forum")
                 t["liens"] = forum.links_of(tid)
                 t["entites"] = forum.entities_of(tid)
                 t["suggestions"] = forum.related_topics(tid)
@@ -439,7 +439,9 @@ def setup_forum(bot, llm_completion=None, is_maitre=None):
                 return web.Response(text=forum.export_json(), content_type="application/json")
             return web.json_response({"error": "action inconnue"}, status=400)
 
-        app.router.add_get("/plateforme", page)
+        app.router.add_get("/forum", page)               # LA page forum du bot
+        app.router.add_get("/forum/", page)
+        app.router.add_get("/plateforme", page)          # alias conservé
         app.router.add_get("/plateforme/", page)
         app.router.add_get("/admin/api/plateforme", api)
         app.router.add_post("/admin/api/plateforme", api)
@@ -508,7 +510,7 @@ textarea{min-height:90px;resize:vertical}
 <header>
   <h1>⚑ Plateforme</h1>
   <input id="q" placeholder="Rechercher — mots, personnage:Nom, lieu:Nom, avec:&quot;Titre lié&quot;…">
-  <a href="/admin">← panneau</a><a href="#" id="idxBtn">📇 index</a><a href="#" id="graphBtn">🕸 graphe</a>
+  <a href="/admin">← panneau</a><a href="/archives">📚 archives</a><a href="#" id="idxBtn">📇 index</a><a href="#" id="graphBtn">🕸 graphe</a>
 </header>
 <main>
   <div id="tree"></div>

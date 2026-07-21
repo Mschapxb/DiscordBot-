@@ -11678,7 +11678,7 @@ h3{color:var(--txt);font-size:14px;margin:16px 0 8px;border-bottom:1px solid var
 <body>
 <header>
   <h1>🛰️ Serveur — ce que Tenebris a compris</h1>
-  <a href="/admin">← retour admin</a> <a href="/forum">📚 forum</a>
+  <a href="/admin">← retour admin</a> <a href="/forum">⚑ plateforme</a> <a href="/archives">📚 archives</a>
   <button onclick="analyser(this)">🔍 Analyser à fond</button>
 </header>
 <div class="wrap" id="wrap"><div class="empty">Chargement…</div></div>
@@ -11893,8 +11893,8 @@ async def admin_forum_page(request):
 
 def _register_admin_routes(app):
     register_forum_platform_routes(app, _is_authed, _auth_guard)  # /plateforme
-    app.router.add_get("/forum", admin_forum_page)
-    app.router.add_get("/forum/", admin_forum_page)
+    app.router.add_get("/archives", admin_forum_page)   # copie du forum EXTERNE (ex-/forum)
+    app.router.add_get("/archives/", admin_forum_page)
     app.router.add_get("/admin/api/forum", admin_forum_api)
     app.router.add_post("/admin/api/forum", admin_forum_api)
     app.router.add_get("/serveur", admin_serveur_page)
@@ -12439,7 +12439,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           résumé, et — depuis la <b>copie complète</b> — le <b>contenu intégral</b> du sujet, relisible
           hors ligne. Elle remplit la carte toute seule en fond ; la copie complète, elle, se lance à
           la demande. Le forum de référence est <b id="lib_forum">—</b>.
-          <a href="/forum" target="_blank" style="color:var(--acc);margin-left:6px">📚 Ouvrir /forum ↗</a>
+          <a href="/archives" target="_blank" style="color:var(--acc);margin-left:6px">📚 Ouvrir /archives ↗</a>
         </div>
         <div id="lib_stats" style="font-size:13px;margin-bottom:12px;color:var(--dim)">Chargement…</div>
         <div class="btnrow" style="flex-wrap:wrap;gap:8px">
