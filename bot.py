@@ -5051,8 +5051,16 @@ async def consulter_forum(sujet):
         # Le sujet peut n'apparaître QUE dans le CORPS des fiches (pas dans les titres) :
         # la recherche plein-texte de la copie prend le relais avant de déclarer forfait.
         hits = [{"url": r["url"], "titre": r["titre"]} for r in forum_search(sujet, limit=4)]
-    if not hits:
-        return ("Rien dans ma copie interne du forum sur ce sujet. "
+    # La PLATEFORME /forum complète la copie : recherche plein-texte FTS5 (accents
+    # ignorés, corps des messages inclus), entités du graphe (personnage:X, lieu:Y),
+    # et surtout les sujets écrits DIRECTEMENT sur /forum (absents de la copie externe).
+    try:
+        plateforme_hits = forum_pf.search(sujet, limit=4)
+    except Exception as _e:
+        print(f"⚠️ Recherche plateforme en panne : {_e}")
+        plateforme_hits = []
+    if not hits and not plateforme_hits:
+        return ("Rien dans ma copie interne du forum ni sur la plateforme à ce sujet. "
                 "Au besoin je peux fouiller le forum en direct (fouiller_forum).")
     fc = forum_content()
     blocs = []
@@ -5076,6 +5084,29 @@ async def consulter_forum(sujet):
         if liens:
             bloc += "\nLiée à : " + ", ".join(liens)
         bloc += f"\n(source : {u})"
+        blocs.append(bloc)
+    # Blocs de la plateforme /forum — en évitant de répéter une fiche déjà couverte
+    # par la copie (les sujets synchronisés gardent leur URL d'origine en source_url).
+    deja = {h.get("url") for h in hits if h.get("url")}
+    for r in plateforme_hits:
+        try:
+            t = forum_pf.get_topic(r["id"], count_view=False)
+        except Exception:
+            t = None
+        if not t or (t.get("source_url") and t["source_url"] in deja):
+            continue
+        corps = "\n".join(p["contenu"] for p in t.get("posts", []))[:3500].strip()
+        if not corps:
+            continue
+        bloc = f"=== {t['titre']} ==="
+        chemin_p = " › ".join(t.get("chemin", [])[:-1])
+        if chemin_p:
+            bloc += f"\nRubrique : {chemin_p}"
+        liens_p = [l["titre"] for l in forum_pf.links_of(t["id"])][:8]
+        if liens_p:
+            bloc += "\nLiée à : " + ", ".join(liens_p)
+        bloc += "\n" + corps
+        bloc += f"\n(source : plateforme /forum#t{t['id']})"
         blocs.append(bloc)
     if not blocs:
         return ("Ma copie interne n'a pas encore de contenu sur ce sujet — lance une « Copie "
@@ -6862,7 +6893,7 @@ TOOLS = [
             "required": ["urls"]}}},
     {"type": "function", "function": {
         "name": "consulter_forum",
-        "description": "TA MÉMOIRE DU FORUM — à essayer EN PREMIER pour toute question de lore/univers du projet (Orbis Naturae). Répond depuis ta COPIE INTERNE déjà lue (fiches réécrites, notes clés, liens entre articles), INSTANTANÉMENT et sans rien re-télécharger. Utilise-le pour le lore connu (personnages, lieux, factions, créatures…). Ne passe à fouiller_forum (lecture en direct, plus lente) QUE si ta copie ne suffit pas, est vide sur le sujet, ou qu'on veut du TRÈS récent. Cite les fiches que tu utilises.",
+        "description": "TA MÉMOIRE DU FORUM — à essayer EN PREMIER pour toute question de lore/univers du projet (Orbis Naturae). Répond depuis ta COPIE INTERNE déjà lue (fiches réécrites, notes clés, liens entre articles) ET depuis la plateforme /forum (recherche plein-texte + graphe de connaissances, y compris les sujets écrits directement sur la plateforme par les membres), INSTANTANÉMENT et sans rien re-télécharger. Utilise-le pour le lore connu (personnages, lieux, factions, créatures…). Ne passe à fouiller_forum (lecture en direct, plus lente) QUE si ta copie ne suffit pas, est vide sur le sujet, ou qu'on veut du TRÈS récent. Cite les fiches que tu utilises.",
         "parameters": {"type": "object", "properties": {
             "sujet": {"type": "string", "description": "Ce que tu cherches dans ta copie (ex : 'Linnorms', 'Empire Skaldien', 'Malaso')"}},
             "required": ["sujet"]}}},
