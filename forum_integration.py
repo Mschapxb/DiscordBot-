@@ -91,9 +91,13 @@ def _chunk(text, size=1900):
 # ============================================================
 # MISE EN PLACE
 # ============================================================
-def setup_forum(bot, llm_completion=None, is_maitre=None):
+def setup_forum(bot, llm_completion=None, is_maitre=None,
+                forum_content_getter=None, library_getter=None):
     """Instancie la plateforme, enregistre les commandes Discord, et renvoie
-    (forum, register_routes) — register_routes est à appeler avec l'app aiohttp."""
+    (forum, register_routes) — register_routes est à appeler avec l'app aiohttp.
+    forum_content_getter / library_getter : les fonctions forum_content() et
+    library() de bot.py, pour peupler la plateforme depuis la copie du forum
+    externe (commande ²T fimport et bouton d'import de la page /forum)."""
     forum = ForumPlatform()
     if llm_completion:
         forum.set_llm_extractor(_make_llm_extractor(llm_completion))
@@ -120,6 +124,42 @@ def setup_forum(bot, llm_completion=None, is_maitre=None):
             asyncio.get_running_loop().create_task(forum.analyze_post_async(topic_id, contenu))
         except RuntimeError:
             pass
+
+    # ---- import des archives du forum externe -----------------------------
+    async def import_archives():
+        """Verse la copie interne du forum externe (forum_content + library)
+        dans la plateforme : arborescence reconstruite depuis les fils d'Ariane,
+        un sujet (verrouillé) par fiche, liens retissés, puis réindexation
+        complète (entités + liens auto + wiki). Idempotent : relançable pour
+        rattraper les fiches copiées depuis."""
+        fc = (forum_content_getter() if forum_content_getter else {}) or {}
+        lib = (library_getter() if library_getter else {}) or {}
+        urls = list(dict.fromkeys(list(fc) + list(lib)))
+        if not urls:
+            return None
+
+        def _run():
+            mapping, liens_par_url = {}, {}
+            stats = {"cree": 0, "maj": 0, "inchange": 0}
+            for url in urls:
+                e, le = fc.get(url, {}), lib.get(url, {})
+                titre = e.get("titre") or le.get("titre") or ""
+                chemin = le.get("chemin") or e.get("chemin") or ""
+                contenu = (e.get("contenu") or "").strip()
+                if not contenu:
+                    # Fiche indexée mais pas encore copiée : on garde au moins le résumé,
+                    # la relance d'un fimport ultérieur remplacera par le texte complet.
+                    resume = (le.get("resume") or "").strip()
+                    contenu = ("\U0001F4C4 (résumé seulement — la fiche n'a pas encore été "
+                               "copiée par la veille)\n\n" + resume) if resume else ""
+                tid, st = forum.import_external_topic(url, titre, chemin, contenu)
+                stats[st] += 1
+                mapping[url] = tid
+                liens_par_url[url] = [l.get("url") for l in e.get("liens", []) if l.get("url")]
+            stats["liens"] = forum.import_links(mapping, liens_par_url)
+            stats["reindex"] = forum.reindex_all()
+            return stats
+        return await asyncio.to_thread(_run)
 
     # ======================================================================
     # COMMANDES DISCORD
@@ -332,6 +372,23 @@ def setup_forum(bot, llm_completion=None, is_maitre=None):
         forum.move_topic(topic_id, forum_id)
         await ctx.send(f"📦 Sujet n°{topic_id} déplacé vers le forum n°{forum_id}.")
 
+    @bot.command(name="fimport", help="Verse les archives du forum externe dans la plateforme (Maître)")
+    async def fimport(ctx):
+        if not maitre(ctx.author.id, ctx.author.name):
+            return await ctx.send("Seul mon Maître déclenche ce déversement.")
+        await ctx.send("\u23F3 Import des archives en cours — arborescence, sujets, "
+                       "liens, puis réindexation. Ça peut prendre un moment…")
+        async with ctx.typing():
+            stats = await import_archives()
+        if stats is None:
+            return await ctx.send("La copie du forum externe est vide : lance d'abord "
+                                  "la veille (bibliothèque) pour qu'elle archive des fiches.")
+        await ctx.send(
+            f"\U0001F4E6 **Import terminé** — {stats['cree']} sujet(s) créé(s), "
+            f"{stats['maj']} mis à jour, {stats['inchange']} inchangé(s), "
+            f"{stats['liens']} lien(s) retissé(s), {stats['reindex']} sujet(s) réindexé(s). "
+            f"Tout est sur /forum.")
+
     @bot.command(name="fstats", help="Statistiques du forum interne")
     async def fstats(ctx):
         s = forum.stats()
@@ -397,6 +454,12 @@ def setup_forum(bot, llm_completion=None, is_maitre=None):
                     if act == "cat_new":
                         cid = forum.create_category(data.get("nom", ""), data.get("description", ""))
                         return web.json_response({"ok": True, "id": cid})
+                    if act == "import":
+                        stats = await import_archives()
+                        if stats is None:
+                            return web.json_response(
+                                {"ok": False, "error": "copie du forum externe vide"}, status=400)
+                        return web.json_response({"ok": True, **stats})
                     if act == "forum_new":
                         fid = forum.create_forum(int(data["categorie_id"]), data.get("nom", ""),
                                                  data.get("description", ""),
@@ -542,10 +605,17 @@ function loadTree(){ api('?action=tree').then(d=>{ TREE = d.tree||[];
     cat.forums.forEach(f=>rec(f, c));
     box.appendChild(c);
   });
-  box.insertAdjacentHTML('beforeend', `<button class="btn" id="catNew">+ catégorie</button> <button class="btn" id="forNew">+ forum</button>`);
+  box.insertAdjacentHTML('beforeend', `<button class="btn" id="catNew">+ catégorie</button> <button class="btn" id="forNew">+ forum</button> <button class="btn" id="impBtn">\u21EA importer les archives</button>`);
   document.getElementById('catNew').onclick = ()=>{ const n=prompt('Nom de la catégorie ?'); if(n) post({action:'cat_new',nom:n}).then(loadTree); };
   document.getElementById('forNew').onclick = ()=>{ const c=prompt('N° de catégorie ?'), n=prompt('Nom du forum ?'), p=prompt('N° du forum parent (vide si aucun) ?');
     if(c&&n) post({action:'forum_new',categorie_id:c,nom:n,parent_id:p||null}).then(r=>{ if(r.error) alert(r.error); loadTree(); }); };
+  document.getElementById('impBtn').onclick = ()=>{
+    if(!confirm('Verser les archives du forum externe dans la plateforme ? (relançable sans doublon)')) return;
+    const btn=document.getElementById('impBtn'); btn.textContent='\u23F3 import en cours…'; btn.disabled=true;
+    post({action:'import'}).then(r=>{ btn.disabled=false; btn.textContent='\u21EA importer les archives';
+      if(r.error) return alert(r.error);
+      alert(`Import terminé : ${r.cree} créés, ${r.maj} mis à jour, ${r.inchange} inchangés, ${r.liens} liens, ${r.reindex} réindexés.`);
+      loadTree(); }); };
 });}
 
 function openForum(f){ api('?action=topics&forum='+f.id).then(d=>{

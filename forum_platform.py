@@ -192,7 +192,8 @@ class ForumPlatform:
                 verrouille INTEGER DEFAULT 0,
                 epingle INTEGER DEFAULT 0,
                 archive INTEGER DEFAULT 0,
-                vues INTEGER DEFAULT 0
+                vues INTEGER DEFAULT 0,
+                source_url TEXT DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_topics_forum ON topics(forum_id, epingle DESC, maj_le DESC);
             CREATE TABLE IF NOT EXISTS posts(
@@ -236,6 +237,12 @@ class ForumPlatform:
                 PRIMARY KEY(forum_id, role_id)
             );
             """)
+            # Migration douce : bases créées avant l'ajout de source_url.
+            try:
+                c.execute("ALTER TABLE topics ADD COLUMN source_url TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            c.execute("CREATE INDEX IF NOT EXISTS idx_topics_source ON topics(source_url)")
             # FTS5 si disponible (recherche plein-texte performante), sinon repli LIKE.
             try:
                 c.executescript("""
@@ -863,6 +870,99 @@ class ForumPlatform:
                 "JOIN mentions m ON m.entity_id=e.id GROUP BY e.id "
                 "HAVING nb >= 1 ORDER BY nb DESC, e.nom").fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # IMPORT D'UN FORUM EXTERNE (copie interne → plateforme)
+    # ------------------------------------------------------------------
+    IMPORT_CATEGORY = "Archives d'Orbis Naturae"
+    IMPORT_FALLBACK_FORUM = "Sans rubrique"
+
+    def _ensure_path(self, chemin):
+        """« Rubrique › Sous-forum › … » → crée (ou retrouve) catégorie + forums
+        emboîtés. Le 1er élément devient la catégorie ; sans chemin, tout va dans
+        IMPORT_CATEGORY / IMPORT_FALLBACK_FORUM. Renvoie l'id du forum final."""
+        parts = [p.strip() for p in (chemin or "").split("›") if p.strip()]
+        if not parts:
+            parts = [self.IMPORT_CATEGORY, self.IMPORT_FALLBACK_FORUM]
+        elif len(parts) == 1:
+            parts = [self.IMPORT_CATEGORY] + parts
+        cat_nom, forums = parts[0], parts[1:]
+        with self._lock, self._conn as c:
+            row = c.execute("SELECT id FROM categories WHERE nom=?", (cat_nom,)).fetchone()
+        cid = row["id"] if row else self.create_category(cat_nom)
+        fid, parent = None, None
+        for nom in forums[:6]:
+            with self._lock:
+                q = ("SELECT id FROM forums WHERE categorie_id=? AND nom=? AND parent_id IS ?"
+                     if parent is None else
+                     "SELECT id FROM forums WHERE categorie_id=? AND nom=? AND parent_id=?")
+                row = self._conn.execute(q, (cid, nom, parent)).fetchone()
+            fid = row["id"] if row else self.create_forum(cid, nom, parent_id=parent)
+            parent = fid
+        return fid
+
+    def topic_by_source(self, source_url):
+        with self._lock:
+            row = self._conn.execute("SELECT id FROM topics WHERE source_url=?",
+                                     (source_url,)).fetchone()
+        return row["id"] if row else None
+
+    def import_external_topic(self, source_url, titre, chemin, contenu,
+                              auteur_nom="Archives", verrouille=True):
+        """Importe (ou MET À JOUR) une fiche du forum externe comme sujet.
+        Idempotent : la même source_url ne crée jamais de doublon. Le contenu
+        est posé BRUT (pas d'analyse ici) : appeler reindex_all() après le lot.
+        Renvoie (topic_id, 'cree'|'maj'|'inchange')."""
+        titre = (titre or "").strip()[:200] or "(sans titre)"
+        contenu = (contenu or "").strip() or "(fiche vide)"
+        tid = self.topic_by_source(source_url)
+        if tid is None:
+            fid = self._ensure_path(chemin)
+            t = _now()
+            with self._lock, self._conn as c:
+                cur = c.execute(
+                    "INSERT INTO topics(forum_id, titre, slug, auteur_id, auteur_nom, "
+                    "cree_le, maj_le, verrouille, source_url) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (fid, titre, _slugify(titre), "import", auteur_nom, t, t,
+                     1 if verrouille else 0, source_url))
+                tid = cur.lastrowid
+                c.execute("INSERT INTO posts(topic_id, auteur_id, auteur_nom, contenu, cree_le) "
+                          "VALUES (?,?,?,?,?)", (tid, "import", auteur_nom, contenu, t))
+            return tid, "cree"
+        # Sujet déjà importé : on rafraîchit titre, rubrique et contenu si besoin.
+        with self._lock, self._conn as c:
+            old = c.execute("SELECT t.titre, t.forum_id, p.id pid, p.contenu FROM topics t "
+                            "JOIN posts p ON p.topic_id=t.id WHERE t.id=? "
+                            "ORDER BY p.id LIMIT 1", (tid,)).fetchone()
+        changed = False
+        if old and old["contenu"] != contenu:
+            with self._lock, self._conn as c:
+                c.execute("UPDATE posts SET contenu=?, modifie_le=? WHERE id=?",
+                          (contenu, _now(), old["pid"]))
+                c.execute("UPDATE topics SET maj_le=? WHERE id=?", (_now(), tid))
+            changed = True
+        if old and old["titre"] != titre:
+            self.rename("topics", tid, nom=titre)
+            changed = True
+        fid = self._ensure_path(chemin)
+        if old and old["forum_id"] != fid:
+            self.move_topic(tid, fid)
+            changed = True
+        return tid, ("maj" if changed else "inchange")
+
+    def import_links(self, mapping, liens_par_url):
+        """Retisse les liens de la copie externe : mapping {source_url: topic_id},
+        liens_par_url {source_url: [url_cible, …]}. Renvoie le nb de liens créés."""
+        n = 0
+        for src, cibles in (liens_par_url or {}).items():
+            a = mapping.get(src)
+            if not a:
+                continue
+            for cible in cibles:
+                b = mapping.get(cible)
+                if b and self.add_link(a, b, "manuel"):
+                    n += 1
+        return n
 
     # ------------------------------------------------------------------
     # STATISTIQUES & MAINTENANCE

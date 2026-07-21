@@ -8883,7 +8883,8 @@ bot = commands.Bot(command_prefix="²T ", intents=intents, help_command=None, al
 # recherche avancée. Commandes « ²T f… » + page /plateforme (session admin).
 from forum_integration import setup_forum
 forum_pf, register_forum_platform_routes = setup_forum(
-    bot, llm_completion=llm_completion, is_maitre=is_mschap)
+    bot, llm_completion=llm_completion, is_maitre=is_mschap,
+    forum_content_getter=forum_content, library_getter=library)
 
 conversations = {}
 summaries = {}             # user_id -> résumé condensé des échanges plus anciens
