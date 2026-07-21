@@ -8875,6 +8875,16 @@ intents.voice_states = True  # savoir qui est en vocal (et l'y rejoindre)
 _allowed = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
 bot = commands.Bot(command_prefix="²T ", intents=intents, help_command=None, allowed_mentions=_allowed)
 
+# ============================================================
+# PLATEFORME FORUM INTERNE (forum_platform.py + forum_integration.py)
+# ============================================================
+# Le vrai forum façon Forumactif, interne au bot : catégories → forums →
+# sous-forums → sujets → réponses, graphe de connaissances, liens wiki,
+# recherche avancée. Commandes « ²T f… » + page /plateforme (session admin).
+from forum_integration import setup_forum
+forum_pf, register_forum_platform_routes = setup_forum(
+    bot, llm_completion=llm_completion, is_maitre=is_mschap)
+
 conversations = {}
 summaries = {}             # user_id -> résumé condensé des échanges plus anciens
 _summarizing = set()       # user_ids dont la condensation est en cours (anti double-lancement)
@@ -11882,6 +11892,7 @@ async def admin_forum_page(request):
     return web.Response(text=FORUM_HTML, content_type="text/html")
 
 def _register_admin_routes(app):
+    register_forum_platform_routes(app, _is_authed, _auth_guard)  # /plateforme
     app.router.add_get("/forum", admin_forum_page)
     app.router.add_get("/forum/", admin_forum_page)
     app.router.add_get("/admin/api/forum", admin_forum_api)
