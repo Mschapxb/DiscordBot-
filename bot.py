@@ -3569,6 +3569,16 @@ FORUM_MAX_FETCHES = 120        # budget réseau (index profond + sujets + fiches
 FORUM_MAX_TOPICS = 10          # nb de discussions principales dont on garde le texte
 FORUM_TOPIC_PAGES = 5          # pages SUIVANTES lues par discussion (les forums paginent !)
 FORUM_MAX_SUBFORUMS = 6        # nb de sous-forums explorés pour trouver des sujets
+FORUM_MEMBER_SEARCH_TERMS = 3  # nb de termes-signature re-cherchés pour recenser les membres d'une faction
+FORUM_MEMBER_MAX_READ = 8      # nb de fiches de membres/affiliés lues lors du recensement
+FORUM_ROSTER_SCAN_MAX = 32     # nb de fiches de personnages dont on LIT le corps pour un recensement
+                               # (le moteur du forum est incomplet : on scanne nous-mêmes le texte)
+# Mots de faction GÉNÉRIQUES : jamais discriminants à eux seuls (mille fiches parlent d'« un culte »
+# ou de « membres »). Le vrai signal, c'est le NOM PROPRE de la faction (Yshma, Skaldiens…).
+_GENERIC_FACTION = {"culte", "cultes", "membre", "membres", "faction", "factions", "ordre",
+                    "ordres", "guilde", "guildes", "secte", "sectes", "groupe", "groupes",
+                    "clan", "clans", "maison", "empire", "royaume", "armee", "armée",
+                    "confrerie", "confrérie", "organisation", "compagnie", "culteste"}
 FORUM_TEXT_PER_PAGE = 8000     # texte gardé par DISCUSSION principale (toutes pages réunies)
 FORUM_RELATED_TEXT = 2200      # texte gardé par fiche LIÉE (on en lit plusieurs : Tasglev, Tsita…)
 FORUM_ROOT_TEXT = 600          # texte gardé pour la page d'accueil (contexte)
@@ -4127,6 +4137,49 @@ def _proper_nouns(text, exclude_words, top=6):
         ranked = sorted(counts, key=lambda w: -counts[w])
     return ranked[:top]
 
+# Phrases-titres à DEUX mots capitalisés : « Capuche Noire », « Grands Activistes », « Œil Divin »…
+# Ce sont les MARQUES d'une faction — ce que portent les fiches de ses membres, même quand elles
+# ne citent jamais le nom de la faction elle-même.
+_ROLE_PHRASE_RE = re.compile(r"\b([A-ZÀ-Ý][a-zà-ÿ'’-]{2,15}\s+[A-ZÀ-Ý][a-zà-ÿ'’-]{2,15})\b")
+_ROLE_ARTICLES = {"les", "le", "la", "des", "du", "un", "une", "ce", "ces", "cette", "leur",
+                  "nos", "vos", "ses", "mon", "ma", "mes", "de", "et", "ou", "dans", "sur"}
+_ROLE_NOISE = {"messages", "date", "légionarius", "legionarius", "accueil", "créer", "forum",
+               "page", "dernière", "édition", "sujets", "similaires", "citer", "répondre",
+               "message", "profil", "invité", "connexion", "inscription"}
+# Vocabulaire d'APPARTENANCE : un rôle cité PRÈS de ces mots est presque sûrement une marque de
+# membre (« On les reconnaît… », « Les Capuches Noires recrutent… »). C'est ce qui distingue un
+# rôle-de-membre (« Capuche Noire ») d'un simple lieu (« Empire Skaldien »).
+_MEMBER_CTX_RE = re.compile(
+    r"membre|cultiste|adepte|adher|adhér|recrut|rejoin|affili|\brang\b|\bordre\b|division|"
+    r"groupe|fr[èe]re|initi|discipl|fid[èe]le|serviteur|pr[êe]tre|acolyte|apôtre|apotre",
+    re.IGNORECASE)
+
+def _singularize_phrase(p):
+    return " ".join(w[:-1] if len(w) > 4 and w.lower().endswith("s") else w for w in p.split())
+
+def _signature_terms(text, exclude_words, top=5):
+    """Termes DISTINCTIFS d'une faction (noms de rôles, titres, ordres) à RE-CHERCHER pour
+    dénicher ses membres : c'est ce que portent les fiches de personnages affiliés, même quand
+    elles ne nomment jamais la faction. Ex. depuis « Le culte compte des Capuches Noires et des
+    Bandeaux » → on ressort « Capuche Noire » et on cherche QUI, sur le forum, en est une.
+    Les rôles cités PRÈS du vocabulaire d'appartenance sont priorisés (vs les simples lieux)."""
+    text = text or ""
+    scores = {}
+    for m in _ROLE_PHRASE_RE.finditer(text):
+        phrase = re.sub(r"\s+", " ", m.group(1)).strip()
+        words = phrase.lower().split()
+        if (words[0] in _ROLE_ARTICLES
+                or any(w in _ROLE_NOISE for w in words)
+                or any(w in exclude_words for w in words)):
+            continue
+        s = _singularize_phrase(phrase)
+        window = text[max(0, m.start() - 160): m.end() + 160]
+        boost = 3 if _MEMBER_CTX_RE.search(window) else 0
+        key = s.lower()
+        scores[key] = (max(scores.get(key, (0, s))[0], 0) + 1 + boost, s)
+    ranked = sorted(scores.values(), key=lambda v: (-v[0], -len(v[1])))
+    return [s for _sc, s in ranked][:top]
+
 # ============================================================
 # INDEX DU FORUM — la clé d'une VRAIE recherche
 # ============================================================
@@ -4458,6 +4511,91 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
             if s_name:
                 zones.setdefault(s_url, s_name)
         read += 1
+
+    # 4ter) RECENSEMENT DES MEMBRES — quand on demande QUI compose une faction (« liste les membres
+    #       du culte »), on ne peut PAS se fier au moteur de recherche du forum : sur Forumactif il
+    #       est incomplet pour les invités (il rate des sujets qui contiennent pourtant le terme —
+    #       vérifié : « Yshma » ne lui renvoie que la fiche du culte, jamais celles de ses membres).
+    #       La SEULE méthode fiable : LIRE le corps des fiches de personnages et y chercher le nom du
+    #       sujet. On priorise celles dont le TITRE porte un indice (rôle du culte, racine du nom) pour
+    #       tomber vite sur les bonnes, puis on confirme dans le texte. IGNORÉ en strict.
+    hub_text = "\n".join(main_text)
+    _roster_intent = bool(re.search(
+        r"membre|liste|lister|recens|effectif|tous les|toutes les|qui sont|qui compos|composent|"
+        r"affili|adepte|adher|adhér|rejoint|\brang\b|\bordre\b|serviteur|discipl|initi[ée]|"
+        r"appartien|fai(?:t|sant) partie|dans le culte|du culte",
+        (sujet + " " + hub_text[:2500]).lower()))
+    if not strict and _roster_intent and fetches < FORUM_MAX_FETCHES:
+        # Termes distinctifs à repérer : le NOM propre du sujet (Yshma → racine « yshm ») et les
+        # noms de RÔLES de la faction (Bandeau, Capuche, activiste, l'œil…). Une fiche dont le titre
+        # les porte est une cible prioritaire ; une fiche dont le CORPS cite le nom du sujet est un
+        # membre quasi-certain.
+        # Le terme DISCRIMINANT doit être le nom PROPRE de la faction (« Yshma »), pas un mot
+        # générique (« culte », « membre ») qui apparaît dans mille fiches sans rapport.
+        distinct = ({w for w in kw if len(w) >= 5 and w not in _GENERIC_FACTION}
+                    or {w for w in kw if len(w) >= 5} or set(kw))
+        deity_roots = {w[:4] for w in distinct if len(w) >= 4}  # « yshm »
+        role_words = {"bandeau", "bande", "bandé", "capuche", "activiste", "cultiste", "adepte",
+                      "acolyte", "pretre", "prêtre", "initie", "initié", "fidele", "fidèle",
+                      "oeil", "œil", "purifi", "impur"}
+        for term in _signature_terms(hub_text, kw):
+            role_words |= set(_norm(term).split())
+
+        def _roster_score(u):
+            hay = _norm((index.get(u, "") if index else "") + " " + u)
+            s = sum(1 for rw in role_words if rw and rw in hay)
+            s += sum(2 for dr in deity_roots if dr and dr in hay)   # « yshm » ⊂ « yshmir »
+            # Une fiche de PERSONNAGE (d'après sa rubrique) prime sur un sujet de lore/géo : c'est
+            # là que vivent les membres. Ce boost fait remonter TOUTES les fiches avant le décor.
+            chemin = _norm(" ".join(paths.get(u, []) if paths else []))
+            if re.search(r"personnage|h[ée]ros|incarn|fiche", chemin):
+                s += 3
+            return s
+
+        # Candidats = tous les sujets connus (index + ceux déjà repérés), non encore lus, triés pour
+        # que les fiches au titre parlant passent en tête. Sans index (petit forum), on se rabat sur
+        # les sujets récoltés pendant la fouille.
+        pool = set(index.keys()) if index else set()
+        pool |= set(topics.keys())
+        candidates = sorted((u for u in pool if u not in lus),
+                            key=lambda u: -_roster_score(u))
+
+        # Vocabulaire d'AFFILIATION : porter un RÔLE de la faction (« Capuche noire », « activiste »,
+        # « l'élu »…) distingue un MEMBRE d'un simple ENNEMI qui la combat. Une fiche qui cite Yshma
+        # ET porte un de ces rôles est un membre ; une fiche qui ne fait que citer le culte (un
+        # inquisiteur qui le pourfend) est écartée. Construit à partir des rôles génériques + des
+        # marques propres au sujet (extraites de sa fiche).
+        affil_words = {"bandeau", "capuche noire", "capuches noires", "activiste", "cultiste",
+                       "adepte", "acolyte", "l'élu", "l elu", "oeil d'yshm", "œil d'yshm"}
+        for term in _signature_terms(hub_text, kw):
+            affil_words.add(_norm(term))
+        affil_words = {a for a in affil_words if a}
+
+        membres, scanned, mentions = 0, 0, 0
+        for u in candidates:
+            if scanned >= FORUM_ROSTER_SCAN_MAX or fetches >= FORUM_MAX_FETCHES:
+                break
+            page = await grab(u)
+            scanned += 1
+            if not page or page.get("error"):
+                continue
+            body = _html_to_text(_clean_forum_html(page["html"]))
+            nbody = _norm(body)
+            if _kw_hits(distinct, nbody) < 1:
+                continue                          # la fiche ne nomme même pas le sujet → hors-jeu
+            porte_role = any(a in nbody for a in affil_words)
+            if not porte_role:
+                mentions += 1                     # cite le culte mais sans s'en réclamer (ennemi, mention)
+                continue
+            title = _page_title(page["html"]) or (index.get(u, "") if index else "") or _slug_title(u)
+            lus.add(u)
+            main_text.append(body)
+            context_blocks.append(
+                f"=== SOURCE (MEMBRE de « {sujet} » — sa fiche le nomme ET porte un rôle du culte) : "
+                f"{u} ({title}) ===\n{_smart_truncate(body, FORUM_RELATED_TEXT)}")
+            membres += 1
+        print(f"👥 Recensement : {scanned} fiche(s) scannée(s) → {membres} membre(s), "
+              f"{mentions} simple(s) mention(s) écartée(s).")
 
     # 4bis) LA ZONE : on ouvre la ou les sections où vit le sujet pour connaître ses
     #       sujets VOISINS. C'est là que se trouve le plus évident (le Collège de la
