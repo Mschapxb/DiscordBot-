@@ -3501,6 +3501,12 @@ WEB_WRITE_DIRECTIVE = (
     "À partir UNIQUEMENT du contenu ci-dessous (n'invente rien), rédige une synthèse DÉTAILLÉE, "
     "PRÉCISE et STRUCTURÉE : plusieurs paragraphes ou points clairs, avec les noms, chiffres et "
     "détails importants. Développe, ne te limite pas à deux phrases.\n"
+    "MAIS SI L'UTILISATEUR A DEMANDÉ UN FORMAT PRÉCIS — « juste la liste », « seulement les "
+    "personnages et les liens », « rien d'autre », un tableau, des noms seuls — tu RESPECTES SON "
+    "format AVANT TOUT : tu ne donnes QUE ce qu'il a demandé, sans blabla ni sections en trop. "
+    "Pour une demande de type « liste les X et les liens vers leurs posts », tu réponds par une "
+    "liste : un élément par ligne, chaque nom suivi de son lien (l'URL « SOURCE: » qui le "
+    "documente). Ce qui est cité sans qu'aucune source ne le détaille, tu le signales à part.\n"
     "FAIS LES LIENS : certaines sources sont les fiches d'entités citées dans le sujet principal "
     "(personnages, lieux, factions). Sers-t'en pour EXPLIQUER ces noms et les relier au sujet.\n"
     "INTERDICTION DE DEVINER — C'EST LA RÈGLE LA PLUS IMPORTANTE : pour chaque nom que tu cites, "
@@ -3563,7 +3569,7 @@ FORUM_MAX_FETCHES = 120        # budget réseau (index profond + sujets + fiches
 FORUM_MAX_TOPICS = 10          # nb de discussions principales dont on garde le texte
 FORUM_TOPIC_PAGES = 5          # pages SUIVANTES lues par discussion (les forums paginent !)
 FORUM_MAX_SUBFORUMS = 6        # nb de sous-forums explorés pour trouver des sujets
-FORUM_TEXT_PER_PAGE = 5000     # texte gardé par DISCUSSION principale (toutes pages réunies)
+FORUM_TEXT_PER_PAGE = 8000     # texte gardé par DISCUSSION principale (toutes pages réunies)
 FORUM_RELATED_TEXT = 2200      # texte gardé par fiche LIÉE (on en lit plusieurs : Tasglev, Tsita…)
 FORUM_ROOT_TEXT = 600          # texte gardé pour la page d'accueil (contexte)
 # --- ARCHIVAGE (copie interne /forum) : on lit le sujet EN ENTIER, pas un extrait -------------
@@ -3620,6 +3626,28 @@ class _Retryable(Exception):
 
 FETCH_ATTEMPTS = 3       # on ne renonce jamais au premier échec réseau
 
+# --- Mode « reader-first » : quand une IP de datacenter (Render) se fait bloquer -------------
+# Le vrai piège d'une fouille en production : si l'hôte renvoie 403 à CHAQUE page, on gaspillait
+# 3 tentatives directes (+ attentes) par page avant de basculer sur le reader-proxy — sur 100+
+# pages, la fouille expirait avant d'avoir rien lu. Dès qu'un hôte se révèle bloqué ET que le
+# reader marche, on le MÉMORISE : tout le reste du crawl passe alors DIRECTEMENT par le reader,
+# vite et sans tentatives vouées à l'échec. Marque valable 15 min (l'hôte peut se débloquer).
+_reader_first_hosts = {}          # host -> instant (monotonic) où on l'a marqué bloqué
+READER_FIRST_TTL = 900
+
+def _host_of(url):
+    from urllib.parse import urlparse
+    return (urlparse(url).hostname or "").lower()
+
+def _is_reader_first(host):
+    t = _reader_first_hosts.get(host)
+    return bool(t) and (time.monotonic() - t) < READER_FIRST_TTL
+
+def _mark_reader_first(host):
+    if host and not _is_reader_first(host):
+        _reader_first_hosts[host] = time.monotonic()
+        print(f"🛟 Hôte {host} bloqué en direct → bascule tout le crawl sur le reader-proxy.")
+
 def _www_variant(url):
     """https://forum.x.com → https://www.forum.x.com (et inversement).
     Un échec DNS vient souvent de là."""
@@ -3636,21 +3664,31 @@ async def _fetch_via_reader(url, sess):
     if not FORUM_READER_FALLBACK:
         return None
     proxied = FORUM_READER_PROXY + url
-    try:
-        # X-Return-Format: html → on récupère le HTML nettoyé (avec ses <a href>), pas du markdown.
-        async with sess.get(proxied, timeout=aiohttp.ClientTimeout(total=30),
-                            headers={"X-Return-Format": "html"}, allow_redirects=True) as r:
-            if r.status != 200:
+    # Le reader gratuit (Jina) limite le débit : sous une fouille profonde il renvoie des 429.
+    # On ne renonce pas au premier — un court backoff suffit souvent à passer.
+    for attempt in range(1, 3):
+        try:
+            # X-Return-Format: html → on récupère le HTML nettoyé (avec ses <a href>), pas du markdown.
+            async with sess.get(proxied, timeout=aiohttp.ClientTimeout(total=35),
+                                headers={"X-Return-Format": "html"}, allow_redirects=True) as r:
+                if r.status == 429 and attempt < 2:
+                    await asyncio.sleep(2.5 + random.uniform(0, 1.5))
+                    continue
+                if r.status != 200:
+                    return None
+                raw = await r.content.read(WEB_FETCH_MAX_BYTES)
+            html = raw.decode("utf-8", errors="replace")
+            if len(html) < 200:            # réponse vide/inutile
                 return None
-            raw = await r.content.read(WEB_FETCH_MAX_BYTES)
-        html = raw.decode("utf-8", errors="replace")
-        if len(html) < 200:            # réponse vide/inutile
+            print(f"🛟 Forum relu via reader-proxy : {url}")
+            return {"url": url, "html": html}
+        except Exception as e:
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+                continue
+            print(f"⚠️ Reader-proxy échoué ({str(e)[:70]})")
             return None
-        print(f"🛟 Forum relu via reader-proxy : {url}")
-        return {"url": url, "html": html}
-    except Exception as e:
-        print(f"⚠️ Reader-proxy échoué ({str(e)[:70]})")
-        return None
+    return None
 
 
 async def _fetch_raw(url, session=None):
@@ -3667,8 +3705,20 @@ async def _fetch_raw(url, session=None):
     last_error = "échec inconnu"
     tried_www = False
     target = safe
+    host = _host_of(safe)
     try:
-        for attempt in range(1, FETCH_ATTEMPTS + 1):
+        # Hôte déjà connu comme bloqué en direct : on va DIRECTEMENT au reader-proxy, sans
+        # perdre de temps en tentatives directes vouées au 403. C'est ce qui permet à une
+        # fouille profonde d'aboutir depuis une IP bloquée au lieu d'expirer.
+        if _is_reader_first(host):
+            via = await _fetch_via_reader(safe, sess)
+            if via:
+                return via
+            # Le reader a flanché : on retire la marque et on retente le direct normalement.
+            _reader_first_hosts.pop(host, None)
+        # Sur un hôte déjà marqué, une seule tentative directe suffit (inutile d'insister).
+        max_attempts = 1 if _is_reader_first(host) else FETCH_ATTEMPTS
+        for attempt in range(1, max_attempts + 1):
             try:
                 async with sess.get(target, timeout=aiohttp.ClientTimeout(total=25),
                                     allow_redirects=True) as r:
@@ -3702,17 +3752,21 @@ async def _fetch_raw(url, session=None):
             except Exception as e:                      # noqa: BLE001 (on veut vraiment tout attraper)
                 last_error = str(e)[:100]
 
-            if attempt < FETCH_ATTEMPTS:
+            if attempt < max_attempts:
                 delai = 1.0 * attempt + random.uniform(0, 0.6)   # 1s, 2s… + jitter
                 print(f"🔁 Échec ({last_error}) — nouvelle tentative dans {delai:.1f}s "
-                      f"[{attempt}/{FETCH_ATTEMPTS}]")
+                      f"[{attempt}/{max_attempts}]")
                 await asyncio.sleep(delai)
         # Toutes les tentatives directes ont échoué (souvent 403 anti-bot depuis l'IP datacenter) :
         # dernier recours via le reader-proxy, qui charge la page depuis SA propre IP.
         via = await _fetch_via_reader(safe, sess)
         if via:
+            # Direct KO mais reader OK : l'hôte nous bloque → on bascule tout le crawl sur le
+            # reader pour les pages suivantes (plus de tentatives directes vouées à l'échec).
+            if "anti-robot" in last_error or "403" in last_error or "429" in last_error:
+                _mark_reader_first(host)
             return via
-        return {"url": target, "error": f"{last_error} — après {FETCH_ATTEMPTS} tentatives"}
+        return {"url": target, "error": f"{last_error} — après {max_attempts} tentative(s)"}
     finally:
         if own:
             await sess.close()
@@ -4439,7 +4493,9 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
     #    s'avère hors-sujet. Un simple filtre par mots-clés était trop bête pour ça.
     #    IGNORÉ en strict : le second rebond suit des liens vers d'AUTRES sections — interdit ici.
     if read and fetches < FORUM_MAX_FETCHES and not strict:
-        extrait = "\n".join(main_text)[:3000]
+        # Fenêtre LARGE : les entités liées (membres d'un culte, personnages cités…) apparaissent
+        # souvent au fil d'un long sujet — un extrait trop court les tronquait avant de les voir.
+        extrait = "\n".join(main_text)[:7000]
         subject_terms = [t for t in kw if len(t) >= 4]
 
         # a) Les pistes, avec leur CHEMIN BRUT dans l'arborescence — aucun verdict :
@@ -4456,7 +4512,7 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
             seen_names.add(nom.lower())
             candidates.append({"nom": nom, "titre": anchor or "", "url": full,
                                "chemin": _chemin(full)})
-        for name in _proper_nouns(extrait, kw, top=14):
+        for name in _proper_nouns(extrait, kw, top=22):
             if name.lower() in seen_names:
                 continue
             seen_names.add(name.lower())
