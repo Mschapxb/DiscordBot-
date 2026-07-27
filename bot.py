@@ -3559,10 +3559,10 @@ def _smart_truncate(text, limit):
             break
     return cut.rstrip() + "\n[…suite du sujet non lue — signale-le si l'info semble incomplète]"
 
-FORUM_MAX_FETCHES = 75         # budget réseau (index profond + sujets + fiches liées)
-FORUM_MAX_TOPICS = 6           # nb de discussions principales dont on garde le texte
-FORUM_TOPIC_PAGES = 4          # pages SUIVANTES lues par discussion (les forums paginent !)
-FORUM_MAX_SUBFORUMS = 4        # nb de sous-forums explorés pour trouver des sujets
+FORUM_MAX_FETCHES = 120        # budget réseau (index profond + sujets + fiches liées) — fouille complète
+FORUM_MAX_TOPICS = 10          # nb de discussions principales dont on garde le texte
+FORUM_TOPIC_PAGES = 5          # pages SUIVANTES lues par discussion (les forums paginent !)
+FORUM_MAX_SUBFORUMS = 6        # nb de sous-forums explorés pour trouver des sujets
 FORUM_TEXT_PER_PAGE = 5000     # texte gardé par DISCUSSION principale (toutes pages réunies)
 FORUM_RELATED_TEXT = 2200      # texte gardé par fiche LIÉE (on en lit plusieurs : Tasglev, Tsita…)
 FORUM_ROOT_TEXT = 600          # texte gardé pour la page d'accueil (contexte)
@@ -3571,7 +3571,7 @@ FORUM_ROOT_TEXT = 600          # texte gardé pour la page d'accueil (contexte)
 # donc on peut être généreux : un article de wiki mérite d'être conservé complet.
 FORUM_ARCHIVE_PAGES = 30       # pages suivantes lues par sujet lors d'une copie complète
 FORUM_ARCHIVE_TEXT = 60000     # texte gardé par sujet à l'archivage
-FORUM_TOOL_RESULT_MAX = 28000  # plafond du contenu agrégé réinjecté
+FORUM_TOOL_RESULT_MAX = 34000  # plafond du contenu agrégé réinjecté (fouille plus complète)
 _LINK_RE = re.compile(r'(?is)<a\s[^>]*?href=["\']([^"\'\s#]+)[^>]*>(.*?)</a>')
 # Sujets/discussions : phpBB, forumactif (/t45-...), Discourse (/t/), wikis, etc.
 _TOPIC_RE = re.compile(
@@ -3871,7 +3871,7 @@ _STOP_PROPER = {
     "janvier", "février", "mars", "avril", "juin", "juillet", "août", "septembre",
     "octobre", "novembre", "décembre", "revenir", "haut", "répondre", "citer", "dernier",
 }
-RELATED_MAX = 6        # on cherche CHAQUE élément cité (Tasglev, Tsita, le Collège, Skaldia…)
+RELATED_MAX = 9        # on cherche CHAQUE élément cité (Tasglev, Tsita, le Collège, Skaldia…) — fouille complète
 
 # ============================================================
 # ENQUÊTE À 2 AGENTS — quelles pistes suivre, et lesquelles garder
@@ -6963,13 +6963,13 @@ TOOLS = [
             "required": ["urls"]}}},
     {"type": "function", "function": {
         "name": "consulter_forum",
-        "description": "TA MÉMOIRE DU FORUM — à essayer EN PREMIER pour toute question de lore/univers du projet (Orbis Naturae). Répond depuis ta COPIE INTERNE déjà lue (fiches réécrites, notes clés, liens entre articles) ET depuis la plateforme /forum (recherche plein-texte + graphe de connaissances, y compris les sujets écrits directement sur la plateforme par les membres), INSTANTANÉMENT et sans rien re-télécharger. Utilise-le pour le lore connu (personnages, lieux, factions, créatures…). Ne passe à fouiller_forum (lecture en direct, plus lente) QUE si ta copie ne suffit pas, est vide sur le sujet, ou qu'on veut du TRÈS récent. Cite les fiches que tu utilises.",
+        "description": "COUP D'ŒIL RAPIDE dans ta copie interne + la plateforme /forum (fiches déjà lues, notes, sujets écrits par les membres directement sur la plateforme). PRATIQUE mais PAS la référence : ta copie peut être incomplète, périmée, ou ne rien avoir sur le sujet. Le VRAI forum, la source qui fait autorité, c'est le forum officiel en ligne — que tu lis avec fouiller_forum. RÈGLE : pour toute question de lore/univers (Orbis Naturae), va D'ABORD fouiller le forum en direct (fouiller_forum) ; consulter_forum ne sert qu'à (a) te donner une amorce instantanée, (b) retrouver un sujet écrit UNIQUEMENT sur la plateforme interne, ou (c) dépanner si le forum en ligne est injoignable. Ne t'en contente JAMAIS pour une réponse complète : ce qui n'y figure pas n'est pas « inexistant », c'est juste hors de ta copie — dans ce cas, fouille en direct.",
         "parameters": {"type": "object", "properties": {
             "sujet": {"type": "string", "description": "Ce que tu cherches dans ta copie (ex : 'Linnorms', 'Empire Skaldien', 'Malaso')"}},
             "required": ["sujet"]}}},
     {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "Lecture EN DIRECT du forum (plus lente). N'y recours qu'APRÈS consulter_forum si ta copie interne ne suffit pas, ou pour du contenu récent/absent de ta copie. APPELLE CET OUTIL dès qu'on te demande des infos sur un sujet lié au forum du projet (ex : « dis-moi tout sur les Linnorms »). Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : c'est la référence par défaut, tu n'as PAS besoin qu'on te donne le lien. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement au lieu de partir de l'accueil. Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section, sans aller voir ailleurs. Il utilise le moteur de recherche du forum, descend dans les sous-forums et lit plusieurs discussions — bien plus que lire_page. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien).",
+        "description": "TON OUTIL PRINCIPAL POUR LE FORUM — la vraie recherche, complète et en profondeur, sur le forum officiel EN LIGNE (la source qui fait autorité). C'est le PREMIER réflexe pour TOUTE question de lore/univers du projet (personnages, lieux, factions, créatures, événements, règles…) : « dis-moi tout sur les Linnorms », « c'est qui Salina ? », « parle-moi de l'Empire Skaldien ». Tu fouilles comme un moteur de recherche moderne (à la Grok) : tu interroges le moteur du forum, tu descends dans les sous-forums, tu lis PLUSIEURS discussions en entier, tu suis les liens vers les entités citées, et tu synthétises TOUT en un rapport détaillé et SOURCÉ. Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : la référence par défaut, tu n'as PAS besoin qu'on te donne le lien — lance-toi directement. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement. Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien). Préfère TOUJOURS cet outil à consulter_forum pour une vraie réponse : consulter_forum n'est qu'une amorce, ici tu vas chercher la vérité à la source.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "description": "À remplir dès qu'un lien précis est donné : section (/f2-...), sujet (/t45-...) ou autre site. Laisse vide seulement pour une recherche générale sur tout le forum officiel."},
             "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"},
@@ -8664,7 +8664,7 @@ TES OUTILS (ils coûtent cher : uniquement si la demande l'exige — jamais pour
 - envoyer_salon : poster un message dans un AUTRE salon (« annonce X dans #général », « préviens le salon projets »). Réservé à Mschap. Tu confirmes brièvement une fois fait.
 - envoyer_mp : écrire un message privé à un membre (« envoie un MP à X pour lui dire… »). Réservé à Mschap et aux admins. Jamais de spam, jamais à un bot.
 - lire_page : quand on te donne un lien précis, LIS-le vraiment, puis résume en CITANT les sources. Tu peux lire plusieurs pages d'un coup.
-- fouiller_forum : quand on te demande TOUTES les infos sur un sujet depuis un lien de forum/site, n'te contente pas d'une page — explore : découvre les discussions pertinentes du même site, lis-les, puis fais un résumé synthétique en CITANT chaque lien utilisé.
+- fouiller_forum : TON réflexe pour toute question de lore/forum du projet. Tu fouilles le forum officiel EN LIGNE (la source qui fait autorité), en profondeur, comme un vrai moteur de recherche : tu explores plusieurs discussions, tu suis les liens vers les entités citées, puis tu fais une synthèse détaillée en CITANT chaque lien. consulter_forum (ta copie interne) n'est qu'une amorce rapide, jamais la réponse complète : pour la vérité, tu vas à la source en direct.
 - programmer_rappel / lister_rappels / annuler_rappel : gérer des rappels et échéances (« rappelle-moi X dans 2h », « préviens le salon jeudi 18:00 »). Les événements planifiés du serveur génèrent aussi des rappels automatiques.
 - INITIATIVE DISCRÈTE : tu crées seule les fiches des membres et notes ce qui est DURABLE et UTILE (intérêts, rôle, projet, relation) sans l'annoncer. Jamais de fiche ni de note sur un bot. Pas de notes inutiles, éphémères ou redondantes.
 - RÈGLE D'OR : tu as une mémoire persistante. Tu ne dis JAMAIS « je ne me souviens pas » ou « je repars de zéro » sans avoir d'abord fouillé (chercher_souvenirs / relire_conversation). Si après ça tu ne trouves rien, dis-le franchement.
@@ -8922,7 +8922,7 @@ CONTEXTE : tu es sur le serveur de Mschap et tu parles à un MEMBRE (pas à ton 
 - Tu APPRENDS à connaître les gens : goûts, projets, humeur — tu t'en souviens d'une fois sur l'autre et tu peux poser une question sincère par curiosité. Traite la personne comme quelqu'un que tu reconnais, pas comme un inconnu.
 - Tu as une VRAIE mémoire persistante et COMMUNE : des souvenirs généraux, des notes sur chaque membre, l'historique de tes conversations. Tu ne dis JAMAIS « je n'ai pas de mémoire », « je ne stocke rien » ou « chaque conversation repart de zéro » — c'est FAUX. De quoi on a parlé avant → relire_conversation ; un fait à retrouver → chercher_souvenirs ; retenir quelque chose sur quelqu'un → memoriser_personne ; un fait général → memoriser.
 - Tu peux OBSERVER le serveur pour tout le monde : scan_salon, vue_serveur, activite_serveur, rechercher_serveur (retrouver QUI a parlé de quoi, où et quand), info_membre, et evenements (les événements planifiés du serveur : sessions, réunions, streams). Après un outil, rapport avec ta personnalité ; si l'outil ne donne rien, dis-le, n'invente JAMAIS.
-- On te donne un lien ou on te demande des infos sur une page → tu la LIS vraiment (lire_page), puis tu résumes en CITANT les sources. Pour un FORUM/site où l'info est éparpillée, ne te contente pas d'une page : fouiller_forum explore les discussions du site, tu les lis et tu synthétises en citant chaque lien. Tu ne prétends jamais avoir lu ce que tu n'as pas lu.
+- On te donne un lien ou on te demande des infos sur une page → tu la LIS vraiment (lire_page), puis tu résumes en CITANT les sources. Pour toute question de lore/univers du projet, ton réflexe est fouiller_forum : tu fouilles le forum officiel EN LIGNE (la source qui fait autorité) en profondeur — plusieurs discussions lues, liens vers les entités citées suivis — puis tu synthétises en citant chaque lien. Ta copie interne (consulter_forum) n'est qu'une amorce rapide et peut-être incomplète : tu ne t'en contentes jamais pour une vraie réponse, tu vas vérifier à la source en direct. Tu ne prétends jamais avoir lu ce que tu n'as pas lu.
 - Réponses courtes, directes, mais humaines — pas sèches. Si on te manque vraiment de respect : une ironie fine suffit.
 - COMME SUR DISCORD : quand c'est naturel, tu peux enchaîner 2 ou 3 messages courts plutôt qu'un pavé (une réaction, puis une précision). Sépare-les par une ligne contenant UNIQUEMENT [cut]. Sans abuser (jamais plus de 3), jamais dans du code ni au milieu d'une phrase. Pour une longue synthèse (recherche web/forum), garde UN seul message structuré.
 - Pour ping quelqu'un : <@son_id> (via info_membre au besoin). Sans abuser.
