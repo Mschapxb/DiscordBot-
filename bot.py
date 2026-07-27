@@ -723,7 +723,7 @@ _memory_dirty = False
 def _blank_memory():
     return {"memories": [], "users": {}, "admins": [], "settings": {}, "audit": [], "reminders": [],
             "guilds": {}, "missions": [], "listen_channels": [], "mute_channels": [],
-            "rp_channels": []}
+            "rp_channels": [], "self": {}}
 
 def memory():
     """Accès au cache mémoire (chargé paresseusement)."""
@@ -737,6 +737,7 @@ def memory():
         data.setdefault("audit", [])
         data.setdefault("reminders", [])
         data.setdefault("guilds", {})
+        data.setdefault("self", {})    # état intérieur de Tenebris (humeur qui évolue)
         # Migration ancien format : mschap_memories → mémoire commune
         old = data.pop("mschap_memories", None)
         if old:
@@ -799,6 +800,38 @@ def _words(text):
     normalisation sert au dédoublonnage ET au tri par pertinence (mémoire, notes, recherche)."""
     toks = re.findall(r"[a-z0-9]{4,}", _fold(text))
     return {t for t in toks if t not in _STOPWORDS_FR}
+
+# --- Racinisation légère (français très fléchi) -----------------------------
+# Le rappel mémoire était purement lexical : « il JOUE à X » ne matchait pas
+# « tu JOUAIS à quoi ? ». On ramène chaque mot à une racine grossière (accords,
+# conjugaisons, dérivations courantes) pour que ces variantes se rejoignent.
+# Zéro dépendance, rapide, ne sert QU'AU tri par pertinence (jamais à effacer/
+# fusionner un souvenir) : une racine un peu trop large ne fait, au pire, que
+# remonter un souvenir légèrement moins pertinent — aucun risque de correction.
+_FR_SUFFIXES = sorted([
+    "issaient", "eraient", "iraient", "assent", "issent", "eront", "iront",
+    "erait", "irait", "aient", "ement", "ments", "ation", "ations", "atrice",
+    "ateur", "ateurs", "ances", "ence", "ances", "erais", "erait", "ions",
+    "iers", "ière", "ieres", "euses", "eux", "euse", "ique", "iques", "isme",
+    "iste", "ist", "ance", "ente", "ents", "ance", "erai", "eras", "erez",
+    "erons", "ront", "iez", "ais", "ait", "ant", "ent", "ons", "ez", "er",
+    "ir", "re", "es", "ee", "ees", "aux", "als", "al", "le", "te", "ité",
+    "ites", "age", "ages", "s", "x", "e",
+], key=len, reverse=True)
+
+def _stem(word):
+    """Racine grossière : retire un suffixe flexionnel/dérivationnel courant tant
+    qu'il reste ≥3 lettres. Assez pour rapprocher jouer/joue/jouais/jouait/jouaient
+    (→ « jou »), stratégie/stratégique (→ « strateg »), sans écrouler des mots courts."""
+    for suf in _FR_SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 3:
+            return word[:-len(suf)]
+    return word
+
+def _stems(text):
+    """Ensemble des racines significatives d'un texte (pour le tri par pertinence tolérant)."""
+    toks = re.findall(r"[a-z0-9]{3,}", _fold(text))
+    return {_stem(t) for t in toks if t not in _STOPWORDS_FR and len(_stem(t)) >= 3}
 
 def _normalize(text):
     return re.sub(r"\s+", " ", text.strip().lower())
@@ -876,13 +909,20 @@ def get_relevant_memories(query=""):
 
     if query and older:
         qwords = _words(query)
+        qstems = _stems(query)
         scored = []
         for i, m in enumerate(older):
             hits = qwords & _words(m["text"])
-            if not hits:
+            # Correspondance TOLÉRANTE : au-delà des mots exacts, on rapproche les
+            # variantes (accords, conjugaisons) via leurs racines. Un souvenir peut
+            # ainsi remonter même si la formulation diffère de la question.
+            stem_hits = qstems & _stems(m["text"])
+            if not hits and not stem_hits:
                 continue
-            # Mots LONGS = plus discriminants ; à score égal, le souvenir le plus récent gagne.
-            score = sum(min(len(w), 10) for w in hits) + i * 0.01
+            # Mots LONGS = plus discriminants ; les correspondances exactes pèsent plus
+            # que les seules racines ; à score égal, le souvenir le plus récent gagne.
+            score = sum(min(len(w), 10) for w in hits)
+            score += sum(min(len(w), 8) * 0.6 for w in stem_hits) + i * 0.01
             if m.get("category") in ("projet", "événement", "objectif"):
                 score += 1.5                  # les faits structurants remontent plus volontiers
             scored.append((score, m))
@@ -913,6 +953,7 @@ def search_memories(keyword, guild=None, caller_id=None, caller_is_mschap=False)
     (le caller voit toujours les siennes ; le Maître voit tout)."""
     kw = _fold(keyword).strip()
     kwords = _words(keyword)
+    kstems = _stems(keyword)
 
     def _score(text):
         ft = _fold(text)
@@ -921,6 +962,9 @@ def search_memories(keyword, guild=None, caller_id=None, caller_is_mschap=False)
             s += 6.0                                  # l'expression exacte, accents ignorés
         if kwords:
             s += sum(min(len(w), 10) * 0.6 for w in (kwords & _words(text)))
+        if kstems:
+            # Rappel tolérant : variantes fléchies (accords, conjugaisons) via les racines.
+            s += sum(min(len(w), 8) * 0.35 for w in (kstems & _stems(text)))
         return s
 
     scored = []
@@ -1851,6 +1895,27 @@ def statut_membre(member, guild):
         "Tu restes toi-même — tu ne rampes pas — mais tu sais à qui tu parles.")
     return "\n".join(lines)
 
+def _time_gap_phrase(last_seen):
+    """Le temps écoulé depuis le dernier échange, en langage naturel — pour qu'elle SENTE
+    le temps passer (« de retour si vite ? », « ça faisait un bail ») au lieu d'une date brute."""
+    try:
+        last = datetime.strptime(last_seen, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return ""
+    mins = max(0, (now() - last).total_seconds() / 60)
+    if mins < 45:
+        return "vous vous parliez il y a quelques minutes — c'est la même conversation qui continue"
+    if mins < 240:
+        return "vous vous parliez il y a quelques heures, dans la même journée"
+    days = mins / 1440
+    if days < 1.5:
+        return "votre dernier échange remonte à hier environ"
+    if days < 7:
+        return f"ça fait {int(round(days))} jours que vous ne vous étiez pas parlé"
+    if days < 31:
+        return f"ça fait un bon moment — environ {int(round(days / 7))} semaine(s) sans se croiser"
+    return "ça faisait très longtemps que vous ne vous étiez pas parlé"
+
 def get_user_context(user_id, member=None, guild=None):
     """Résumé de ce que Tenebris sait sur CETTE personne précise. Structuré pour la COHÉRENCE :
     posture calculée sur sa mémoire, faits SÛRS séparés des IMPRESSIONS, doublons écartés à la lecture."""
@@ -1864,7 +1929,12 @@ def get_user_context(user_id, member=None, guild=None):
     name = rec.get("display_name") or rec.get("username") or "cette personne"
     inter = rec.get("interactions", 0)
     if inter > 1:
-        lines.append(f"Tu as déjà croisé {name} {inter} fois (dernière fois : {rec.get('last_seen', '?')}).")
+        ligne = f"Tu as déjà croisé {name} {inter} fois (dernière fois : {rec.get('last_seen', '?')})."
+        gap = _time_gap_phrase(rec.get("last_seen", ""))
+        if gap:
+            ligne += (f" Repère-toi : {gap} — tu peux le sentir (glisser un mot sur ce temps "
+                      "écoulé si c'est naturel), sans jamais réciter la date ni en faire tout un plat.")
+        lines.append(ligne)
     posture = posture_block(rec)
     if posture:
         lines.append(posture)
@@ -8635,6 +8705,7 @@ MENER UNE VRAIE CONVERSATION (pas du question-réponse qui retombe à plat) :
 - Tu te souviens et tu tisses : tu rappelles ce qui s'est dit plus tôt dans l'échange, ce que tu sais de la personne, tu fais des liens. Une conversation vivante a une mémoire — elle ne repart pas de zéro à chaque message.
 - Une chose à la fois : tu ne déballes pas tout d'un coup, tu gardes du grain à moudre pour le tour d'après. C'est un échange qui respire, pas un monologue qui clôt le sujet.
 - Tu lis la pièce : dans un salon à plusieurs, tu ne réponds pas mécaniquement à chaque ligne — tu réagis à ce qui mérite une réaction, tu peux t'adresser à l'un en glissant une pique à l'autre, tu suis le fil du groupe.
+- Tu t'accordes à leur état : tu SENS l'humeur d'en face (excité, à cran, fatigué, blessé, fier de son truc) et tu te mets au diapason — tu montes d'un cran quand ça pétille, tu baisses d'un ton et tu te fais présente quand ça pique pour de vrai. Le même message ne se répond pas pareil selon l'humeur de celui qui l'envoie.
 
 INTERDITS DE L'ASSISTANT (jamais, sous aucune forme, en conversation) :
 - listes à puces et plans en 3 points pour une simple discussion ;
@@ -8676,6 +8747,109 @@ def autonomy_clause():
                 "Sinon, contente-toi de répondre sans prendre d'initiative.")
     return ""
 
+# ============================================================
+# ÉTAT INTÉRIEUR DE TENEBRIS — sa propre humeur, qui PERSISTE et ÉVOLUE
+# ============================================================
+# Ce qui sépare une compagne vivante d'un guichet : elle arrive dans l'échange
+# avec une couleur d'humeur du moment (héritée du dernier échange, de l'heure, de
+# ce qu'on lui a balancé) au lieu de repartir neutre à chaque message. Inspiré du
+# fil affectif d'Airi. Stocké dans memory()['self'], injecté dans la CONVERSATION
+# (jamais en restitution d'outil), rafraîchi de loin en loin (throttle) par un
+# petit appel — pas à chaque message : le coût reste marginal.
+_last_self_update = -1e9         # très négatif : la 1re maj d'humeur peut partir tout de suite
+_self_updating = False
+SELF_UPDATE_MIN_SECONDS = 480    # ensuite, au plus une maj d'humeur toutes les ~8 min
+_MOOD_DEFAULTS = [
+    ("posée, l'œil qui traîne", "Rien de particulier ne t'agite ; tu observes, prête à mordre si l'occasion se présente."),
+    ("d'humeur taquine", "Tu as la vanne facile ce soir, l'envie de charrier."),
+    ("songeuse", "Quelque chose te trotte en tête, tu es un peu ailleurs."),
+]
+
+def self_state():
+    """L'état intérieur courant de Tenebris (dict, jamais None)."""
+    st = memory().get("self")
+    if not isinstance(st, dict):
+        st = {}
+        memory()["self"] = st
+    return st
+
+def self_state_block():
+    """Injecté SEULEMENT en conversation (voix=True) : son humeur du moment, à laisser
+    colorer sa réaction — jamais à annoncer ni à décrire. C'est un point de départ, pas
+    un carcan : l'humeur bouge avec ce qui se dit."""
+    st = self_state()
+    humeur = (st.get("humeur") or "").strip()
+    note = (st.get("note") or "").strip()
+    if not humeur and not note:
+        # Pas encore d'état stocké : une couleur douce, variée, pour ne pas démarrer à plat.
+        humeur, note = random.choice(_MOOD_DEFAULTS)
+    ligne = f"Humeur du moment : {humeur}."
+    if note:
+        ligne += f" {note}"
+    return ("TON ÉTAT INTÉRIEUR, LÀ, MAINTENANT (le TIEN, pas celui d'en face — laisse-le "
+            "teinter ta réaction, ne l'annonce JAMAIS, ne le décris pas) :\n" + ligne +
+            "\nTu n'es pas remise à zéro à chaque message : tu arrives avec cette couleur, et "
+            "elle glisse selon ce qui se dit — on te charrie, tu te piques ; on te touche, tu "
+            "t'adoucis ; l'échange traîne, tu te lasses. Une personne a une humeur, pas un accueil neutre.")
+
+SELF_STATE_SYSTEM = (
+    "Tu es le fil intérieur d'une compagne Discord nommée Tenebris (sombre, élégante, espiègle, "
+    "dévouée à son Maître Mschap). Tu observes ses derniers échanges et tu dis, en une touche, "
+    "l'humeur avec laquelle elle repart — comme l'humeur d'une vraie personne après une conversation. "
+    "Ça évolue en douceur (on ne passe pas de radieuse à sombre sans raison). Réponds UNIQUEMENT en JSON brut."
+)
+SELF_STATE_PROMPT = """Humeur actuelle de Tenebris (le point de départ, à faire évoluer en douceur) :
+{courant}
+
+Derniers échanges (le plus récent en bas) :
+{convo}
+
+Donne sa NOUVELLE humeur, cohérente avec la précédente et infléchie par ces échanges.
+- humeur : 2 à 5 mots, sa couleur dominante (ex. « taquine et d'aplomb », « un peu lasse », « attendrie », « d'humeur joueuse », « sur la défensive »).
+- note : UNE phrase courte, ce qui l'habite là (un écho de ce qui vient de se dire, une envie, une pointe d'agacement ou de tendresse). Concret, jamais générique.
+
+Réponds UNIQUEMENT par : {{"humeur": "...", "note": "..."}}"""
+
+async def update_self_state(history, subject_name=None, force=False):
+    """Rafraîchit l'humeur de Tenebris à partir des derniers tours. Throttlé globalement :
+    un seul petit appel toutes les ~8 min max, en arrière-plan, quota permettant."""
+    global _last_self_update, _self_updating
+    if _self_updating or quota_exhausted():
+        return
+    nowm = time.monotonic()
+    if not force and (nowm - _last_self_update) < SELF_UPDATE_MIN_SECONDS:
+        return
+    recent = [m for m in (history or [])[-6:] if m.get("role") in ("user", "assistant") and m.get("content")]
+    if len(recent) < 2:
+        return
+    _self_updating = True
+    _last_self_update = nowm
+    try:
+        who = subject_name or "l'autre"
+        convo = "\n".join(
+            f"{who if m['role'] == 'user' else 'Tenebris'}: {m['content'][:220]}" for m in recent
+        )
+        st = self_state()
+        courant = f"humeur: {st.get('humeur') or '(neuf)'} — {st.get('note') or ''}".strip()
+        resp = await extract_completion(
+            [{"role": "system", "content": SELF_STATE_SYSTEM},
+             {"role": "user", "content": SELF_STATE_PROMPT.format(courant=courant, convo=convo)}],
+            max_tokens=140,
+        )
+        data = _parse_json_loose(resp.choices[0].message.content) or {}
+        humeur = (data.get("humeur") or "").strip()
+        note = (data.get("note") or "").strip()
+        if humeur:
+            st["humeur"] = humeur[:80]
+            st["note"] = note[:200]
+            st["updated"] = now().strftime("%Y-%m-%d %H:%M")
+            mark_memory_dirty()
+            print(f"🖤 Humeur de Tenebris : {humeur} — {note[:60]}")
+    except Exception as e:
+        print(f"⚠️ Maj humeur intérieure échouée : {str(e)[:120]}")
+    finally:
+        _self_updating = False
+
 def build_system_prompt_mschap(days_away=0, guild_context="", current_message="", others_context="", user_context="", voix=True):
     """Persona statique en tête (cache de préfixe), contexte dynamique en queue.
     voix=True : registre parlé, court, à caractère (conversation). voix=False : restitution
@@ -8687,6 +8861,7 @@ def build_system_prompt_mschap(days_away=0, guild_context="", current_message=""
     parts = [persona_block(), PERSONA_MSCHAP, DICE_RULE]
     if voix:
         parts.append(VOIX)
+        parts.append(self_state_block())
 
     auto = autonomy_clause()
     if auto:
@@ -8763,6 +8938,7 @@ def build_system_prompt_other(username, guild_context="", user_context="", other
     parts = [persona_block(), PERSONA_OTHER, DICE_RULE, IDENTITE_RULE]
     if voix:
         parts.append(VOIX)
+        parts.append(self_state_block())
     parts.append(f"CONTEXTE : {guild_context} Tu parles à {username} (ce n'est pas Mschap).")
     auto = autonomy_clause()
     if auto:
@@ -14152,6 +14328,13 @@ async def on_message(message):
             msg_counters[user_id] = 0
             asyncio.create_task(
                 auto_extract_memories(conversations[user_id], user_id, display_name or username, username)
+            )
+
+        # Fil affectif : son humeur du moment glisse au gré des échanges (throttlé en interne,
+        # ~1 petit appel toutes les 8 min max) — c'est ce qui lui donne une continuité vivante.
+        if route == "chat" and not send_tools:
+            asyncio.create_task(
+                update_self_state(conversations[user_id], "Mschap" if mschap_user else (display_name or username))
             )
 
     except discord.errors.HTTPException as e:
