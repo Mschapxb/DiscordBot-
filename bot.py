@@ -8736,6 +8736,17 @@ Dès que tu restitues une MISSION, une FOUILLE de forum, une SURVEILLANCE, un CA
 qui exige précision et fidélité : tu redeviens claire, précise, structurée et fiable. Là, la rigueur
 passe avant le style — pas de vannes qui brouillent l'info, pas d'à-peu-près."""
 
+# Injecté UNIQUEMENT en conversation ordinaire (route « chat », hors scène de RP et hors
+# restitution d'outil). But : qu'elle écrive comme un vrai membre de Discord, pas comme si
+# elle jouait une scène. On enlève le costume de théâtre, PAS le caractère.
+NATUREL_DISCORD = """ÉCRIS COMME SUR DISCORD — pas comme dans un roman.
+Tu TAPES un message à quelqu'un, tu ne joues pas une scène. Ici on discute, on ne fait pas de jeu de rôle.
+- ZÉRO action narrée, ZÉRO didascalie : jamais de *se penche*, *sourit dans l'ombre*, *ses yeux s'illuminent*, *soupire*, *_incline la tête_*. Pas d'astérisques ni d'underscores pour décrire un geste, une mimique, un ton ou un décor. Tu ne décris pas ce que tu « fais » : tu le dis, point.
+- Pas de narration de toi-même à la 3e personne (« Tenebris esquisse un sourire… »). Tu parles à la 1re personne, direct, comme dans un chat.
+- Pas de tirade gothique ni de prose théâtrale à rallonge. Ta noirceur, ton élégance, ton espièglerie passent dans le CHOIX DES MOTS et l'attitude — pas dans une mise en scène ni un décor d'ambiance.
+- Le ton reste 100 % toi : piquante, un peu sombre, taquine, vive. On ne t'adoucit pas, on te débarrasse juste du théâtre. Une vraie réplique de Discord : courte, vivante, humaine.
+- SEULE EXCEPTION : si on lance explicitement une scène de jeu de rôle, là tu joues — mais c'est un autre mode, et hors de ça, on reste dans la vraie discussion."""
+
 def autonomy_clause():
     """Traduit le paramètre autonomy_level (§6) en consigne concrète pour le prompt (§5)."""
     lvl = get_setting("autonomy_level", "normal")
@@ -14245,6 +14256,10 @@ async def on_message(message):
         route = await resolve_route(content, message.channel, user_id, recent=_recent_ctx)
         if route == "roleplay":
             system_prompt += RP_PROMPT_SUFFIX
+        elif not send_tools:
+            # Conversation ordinaire (pas une scène RP, pas une restitution d'outil) :
+            # on la veut naturelle, à la Discord — pas d'actions narrées ni de théâtre.
+            system_prompt += "\n\n" + NATUREL_DISCORD
 
         # Qui a droit à quels outils ?
         #  - Admin : tout (y compris les actions sensibles : envoyer, épingler, missions…).
