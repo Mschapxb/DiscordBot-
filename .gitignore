@@ -2,3 +2,7 @@
 .env
 history.json
 memory.json
+
+# Python bytecode (généré, ne jamais versionner)
+__pycache__/
+*.pyc
