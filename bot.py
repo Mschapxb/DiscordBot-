@@ -3371,55 +3371,71 @@ async def _mission_forum(m, force=False, progress=None):
         m["erreurs"] = 0
 
         if progress:
-            progress(35, "Repérage des sujets…")
-        # Tous les sujets listés sur cette page (section, index, « derniers messages »…)
-        trouves = {}
-        for full, anchor in _extract_links(page["html"], page["url"]):
-            if _same_host(m["url"], full) and _TOPIC_RE.search(full):
-                titre = (anchor or "").strip() or _slug_title(full)
-                if titre and len(titre) > 3:
-                    trouves[full.split("#")[0]] = titre[:200]
+            progress(35, "Repérage des sujets et des réponses…")
+        # Tous les sujets de la page AVEC l'ID de leur dernier message (pour repérer les réponses).
+        info = _forum_listing_scan(page["html"], page["url"])
 
-        connus = set(m.get("connus", []))
-        nouveaux = [(u, t) for u, t in trouves.items() if u not in connus]
+        # `connus` : { tid : id_du_dernier_message_vu }. Migration depuis l'ancien format (liste d'URLs).
+        connus = m.get("connus", {})
+        if isinstance(connus, list):
+            connus = {tid: 0 for u in connus for tid in [_topic_id(u)] if tid}
 
-        # Premier passage : on enregistre l'existant SANS rien annoncer (sinon 200 messages).
+        # Premier passage : on enregistre l'existant (sujets ET leur dernier message) SANS rien
+        # annoncer — sinon on inonderait le salon des 200 sujets déjà là.
         if not m.get("amorcee"):
-            m["connus"] = list(trouves)[:MISSION_KNOWN_CAP]
+            m["connus"] = {tid: rec["last_pid"] for tid, rec in list(info.items())[:MISSION_KNOWN_CAP]}
             m["amorcee"] = True
             m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
             mark_memory_dirty()
-            print(f"👁️ Mission « {m['nom']} » amorcée : {len(trouves)} sujets connus, "
-                  f"j'annoncerai les suivants.")
+            print(f"👁️ Mission « {m['nom']} » amorcée : {len(info)} sujets connus (sujets + réponses suivis).")
             if progress:
-                progress(100, f"Amorcée — {len(trouves)} sujets notés")
+                progress(100, f"Amorcée — {len(info)} sujets notés")
             return 0
 
-        if not nouveaux:
+        # Nouveautés : un sujet JAMAIS vu (nouveau sujet) OU un sujet connu dont le dernier
+        # message a un ID plus grand qu'avant (nouvelle réponse).
+        evenements = []   # (type, tid, rec)  — type ∈ {"sujet", "reponse"}
+        for tid, rec in info.items():
+            if tid not in connus:
+                evenements.append(("sujet", tid, rec))
+            elif rec["last_pid"] and rec["last_pid"] > connus.get(tid, 0):
+                evenements.append(("reponse", tid, rec))
+
+        if not evenements:
             m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
             if progress:
                 progress(100, "Rien de neuf")
             return 0
 
         annonces = 0
-        a_publier = nouveaux[:MISSION_MAX_NEW]
-        for _n, (u, titre) in enumerate(a_publier, 1):
+        a_publier = evenements[:MISSION_MAX_NEW]
+        for _n, (type_, tid, rec) in enumerate(a_publier, 1):
+            est_reponse = (type_ == "reponse")
             if progress:
                 progress(40 + int(55 * _n / max(1, len(a_publier))),
-                         f"Nouveau sujet {_n}/{len(a_publier)}…")
-            extrait, auteur = "", ""
-            got = await _read_topic_fully(_make_grab(session), u, titre)
+                         f"{'Nouvelle réponse' if est_reponse else 'Nouveau sujet'} {_n}/{len(a_publier)}…")
+            # Extrait : la fin du fil pour une réponse (le message récent), le début pour un sujet.
+            extrait, titre_reel = "", ""
+            got = await _read_topic_fully(_make_grab(session), rec["url"], rec["titre"])
             if got:
                 _t, txt, _p, _l, _s = got
-                extrait = _smart_truncate(txt, 400)
+                titre_reel = (_t or "").strip()
+                extrait = _smart_truncate(txt[-1400:] if est_reponse else txt, 400)
+            # Le titre de la page est le plus fiable ; sinon le libellé du lien, sinon le slug de l'URL
+            # (sur l'accueil, le libellé capté est parfois une DATE — on l'évite).
+            titre = titre_reel or rec["titre"] or _slug_title(rec["url"])
+            if re.match(r"^\w{3}\s+\d{1,2}\s+\w+\s+\d{4}", titre):   # « Jeu 30 Nov 2023 … » = une date
+                titre = titre_reel or _slug_title(rec["url"])
+            lien = rec["last_url"] if (est_reponse and rec["last_url"]) else rec["url"]
+            defaut = "Nouvelle réponse dans ce sujet." if est_reponse else "Nouveau sujet sur le forum."
             embed = discord.Embed(
                 title=titre[:250],
-                url=u,
-                description=extrait or "Nouveau sujet sur le forum.",
+                url=lien,
+                description=(("💬 **Nouvelle réponse**\n" if est_reponse else "") + extrait) or defaut,
                 color=COULEURS["sombre"],
                 timestamp=datetime.now(PARIS_TZ),
             )
-            embed.set_author(name=f"Nouveau sur le forum — {m['nom']}")
+            embed.set_author(name=f"{'Nouvelle réponse' if est_reponse else 'Nouveau sujet'} — {m['nom']}")
             e = guild_emoji(channel.guild)
             if e is not None:
                 try:
@@ -3436,13 +3452,23 @@ async def _mission_forum(m, force=False, progress=None):
             except discord.errors.HTTPException as e:
                 print(f"⚠️ Mission « {m['nom']} » : {str(e)[:80]}")
 
-        m["connus"] = (list(trouves) + m.get("connus", []))[:MISSION_KNOWN_CAP]
+        # On met à jour le dernier message vu pour CHAQUE sujet de la page (annoncé ou non, pour ne
+        # pas ré-annoncer au prochain passage), puis on borne la taille de la mémoire.
+        for tid, rec in info.items():
+            connus[tid] = max(rec["last_pid"], connus.get(tid, 0))
+        if len(connus) > MISSION_KNOWN_CAP:
+            connus = dict(sorted(connus.items(), key=lambda kv: -int(kv[0]))[:MISSION_KNOWN_CAP])
+        m["connus"] = connus
         m["dernier_check"] = now().strftime("%Y-%m-%d %H:%M")
         if annonces:
+            nb_rep = sum(1 for t, _tid, _r in a_publier[:annonces] if t == "reponse")
+            nb_suj = annonces - nb_rep
             m["dernier_trouve"] = now().strftime("%Y-%m-%d %H:%M")
             m["envois"] = m.get("envois", 0) + annonces
-            audit_log("mission", f"{m['nom']} — {annonces} nouveau(x) sujet(s)", actor="IA")
-            print(f"📰 Mission « {m['nom']} » : {annonces} nouveauté(s) annoncée(s)")
+            audit_log("mission", f"{m['nom']} — {annonces} nouveauté(s) "
+                      f"({nb_suj} sujet(s), {nb_rep} réponse(s))", actor="IA")
+            print(f"📰 Mission « {m['nom']} » : {annonces} nouveauté(s) annoncée(s) "
+                  f"(sujets + réponses).")
         mark_memory_dirty()
         if progress:
             progress(100, f"{annonces} nouveauté(s) annoncée(s)" if annonces else "Rien de neuf")
@@ -3603,6 +3629,52 @@ _FORUM_SECTION_ID_RE = re.compile(r"/(f|c)(\d+)(?:p\d+)?-", re.IGNORECASE)
 def _section_id(url):
     m = _FORUM_SECTION_ID_RE.search(url or "")
     return f"{m.group(1).lower()}{m.group(2)}" if m else None
+
+# --- Veille : suivre l'ACTIVITÉ d'un sujet (nouvelles réponses), pas seulement son existence ------
+# Sur Forumactif, chaque ligne de sujet expose un permalien « dernier message » : /t<id>-slug#<postid>.
+# Le #<postid> est l'ID du DERNIER message du sujet. S'il augmente d'un passage de veille à l'autre,
+# c'est qu'une RÉPONSE a été postée — même si le sujet était déjà connu.
+_TOPIC_ID_RE = re.compile(r"/t(\d+)(?:p\d+)?[-/]", re.IGNORECASE)
+_LASTPOST_RE = re.compile(r'href="([^"#]*/t\d+(?:p\d+)?[-/][^"#]*)#(\d+)"', re.IGNORECASE)
+
+def _topic_id(url):
+    """L'identifiant numérique STABLE d'un sujet (indépendant de la pagination /t42p25-…)."""
+    m = _TOPIC_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+def _forum_listing_scan(html, base_url):
+    """Depuis une page de listing (accueil, section, « messages récents »), renvoie
+    { tid : {'url', 'titre', 'last_pid', 'last_url'} } : le sujet, son intitulé, et l'ID +
+    permalien de son DERNIER message. C'est ce qui permet de repérer les nouvelles RÉPONSES."""
+    from urllib.parse import urljoin
+    info = {}
+    # a) Intitulés, via les liens de sujet (on garde le libellé le plus complet).
+    for full, anchor in _extract_links(html, base_url):
+        if not (_same_host(base_url, full) and _TOPIC_RE.search(full)):
+            continue
+        tid = _topic_id(full)
+        if not tid:
+            continue
+        rec = info.setdefault(tid, {"url": full.split("#")[0], "titre": "",
+                                    "last_pid": 0, "last_url": ""})
+        titre = (anchor or "").strip()
+        if titre and len(titre) > len(rec["titre"]):
+            rec["titre"] = titre[:200]
+    # b) Dernier message par sujet, via les permaliens #<postid>.
+    for m in _LASTPOST_RE.finditer(html or ""):
+        rel, pid = m.group(1), int(m.group(2))
+        tid = _topic_id(rel)
+        if not tid:
+            continue
+        rec = info.setdefault(tid, {"url": urljoin(base_url, rel).split("#")[0],
+                                    "titre": "", "last_pid": 0, "last_url": ""})
+        if pid > rec["last_pid"]:
+            rec["last_pid"] = pid
+            rec["last_url"] = urljoin(base_url, rel) + "#" + str(pid)
+    for rec in info.values():
+        if not rec["titre"]:
+            rec["titre"] = _slug_title(rec["url"])
+    return info
 
 def _host(u):
     from urllib.parse import urlparse
@@ -7242,7 +7314,7 @@ TOOLS = [
             "choix": {"type": "string", "description": "youtube | soundcloud — vide pour consulter"}}}}},
     {"type": "function", "function": {
         "name": "surveiller_forum",
-        "description": "Te charge d'une MISSION de veille : surveiller le forum et annoncer ses NOUVEAUX sujets dans un salon. À utiliser pour « surveille le forum », « préviens-moi des nouveaux posts », « tiens #annonces au courant du forum ». Le forum par défaut est le forum officiel Orbis Naturae (https://orbis-naturae.forumactif.com/) : ne renseigne 'url' que pour un autre site. Réservé aux admins.",
+        "description": "Te charge d'une MISSION de veille : surveiller le forum et annoncer dans un salon ses NOUVEAUX sujets ET les NOUVELLES RÉPONSES aux sujets existants (même déjà annoncés). À utiliser pour « surveille le forum », « préviens-moi des nouveaux posts et des réponses », « tiens #annonces au courant du forum ». Le forum par défaut est le forum officiel Orbis Naturae (https://orbis-naturae.forumactif.com/) : ne renseigne 'url' que pour un autre site. Réservé aux admins.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "description": "Facultatif. Par défaut le forum officiel Orbis Naturae. À remplir seulement pour surveiller un autre site/rubrique."},
             "salon": {"type": "string", "description": "Salon où publier les nouveautés"},
