@@ -7495,6 +7495,26 @@ PUBLIC_TOOLS = [t for t in TOOLS if t["function"]["name"] in PUBLIC_TOOL_NAMES]
 # forum_orbis est désactivée (option par serveur, cf. get_guild_setting).
 ORBIS_TOOL_NAMES = {"fouiller_forum", "consulter_forum", "surveiller_forum",
                     "lister_missions", "arreter_mission"}
+# Outils de CONSULTATION du forum : retirés en plus, tour par tour, quand RIEN
+# dans le message ne pointe vers le forum (déduction déterministe joueur vs forum).
+FORUM_LOOKUP_TOOLS = {"fouiller_forum", "consulter_forum"}
+
+# Signaux EXPLICITES qui autorisent l'aller-au-forum : mot « forum/Orbis », un
+# lien du forum, ou un vocabulaire d'univers/RP. Sans ça, une question « c'est qui
+# Untel ? » porte sur un MEMBRE Discord → on ne touche pas au forum.
+_FORUM_SIGNAL_RE = re.compile(
+    r"(?<!\w)(forum|forumactif|orbis[\s-]*naturae|orbis|lore|univers|l['’]univers|"
+    r"jeu\s*de\s*r[oô]le|roleplay|\brp\b|wiki|personnage|factions?|cr[ée]atures?|"
+    r"in[\s-]?game)(?!\w)", re.IGNORECASE)
+
+def forum_signal(content):
+    """Vrai si le message pointe EXPLICITEMENT vers le forum (mot-clé, lien, vocabulaire
+    d'univers). C'est ce qui décide si Tenebris a le droit d'aller fouiller le forum."""
+    if not content:
+        return False
+    if re.search(r"orbis-naturae|forumactif|/[tf]\d", content, re.IGNORECASE):
+        return True
+    return bool(_FORUM_SIGNAL_RE.search(content))
 
 def filter_tools_for_guild(tools, orbis_on):
     """Retire les outils Orbis quand le forum n'est pas actif sur ce serveur."""
@@ -7503,18 +7523,24 @@ def filter_tools_for_guild(tools, orbis_on):
     return [t for t in tools if t["function"]["name"] not in ORBIS_TOOL_NAMES]
 
 # Directive injectée quand le forum Orbis est ACTIF : « qui est X ? » → forum d'abord.
+# Injectée quand le message POINTE vers le forum (signal détecté) : là, elle fouille.
 FORUM_FIRST_DIRECTIVE = (
-    "\n\nFORUM ORBIS NATURAE — quand y aller (et quand NE PAS y aller). Le forum Orbis Naturae est "
-    "dispo ici, mais tu ne le fouilles PAS à chaque question sur une personne. Règle :\n"
-    "• Tu vas sur le forum (fouiller_forum) UNIQUEMENT si on te le signale explicitement : on dit "
-    "« sur le forum », « dans Orbis Naturae », « le lore / l'univers / le RP », on te donne un LIEN "
-    "(orbis-naturae.forumactif.com, /t… /f…), ou on parle clairement d'un élément d'univers "
-    "(personnage joué, lieu, faction, créature, événement du lore).\n"
-    "• Sinon, une simple question « c'est qui Mael34 ? », « tu connais Untel ? » porte sur un MEMBRE "
-    "Discord : tu réponds avec ta mémoire interne (apropos_membre / tes notes), tu ne touches PAS au "
-    "forum.\n"
-    "• Dans le doute, si rien ne pointe vers le forum, traite la question comme portant sur le membre "
-    "Discord. Tu ne pars sur le forum que si la demande le dit."
+    "\n\nCETTE question porte sur le forum / l'univers Orbis Naturae. Va chercher à la SOURCE : "
+    "fouiller_forum (le forum officiel en ligne). Tu lis vraiment ce que tu trouves et tu SOURCES "
+    "(liens). Si le forum ne renvoie RIEN sur le sujet, tu le dis franchement — « j'ai rien trouvé "
+    "sur X sur le forum » — et tu n'inventes JAMAIS : pas de fausse citation, pas de faux lien de "
+    "topic, pas de contenu supposé. Rien trouvé = rien trouvé."
+)
+
+# Injectée quand RIEN ne pointe vers le forum : la question porte sur un membre / le
+# serveur, pas sur l'univers. Les outils de consultation du forum sont retirés ce tour.
+FORUM_INTERNAL_DIRECTIVE = (
+    "\n\nCETTE question NE porte PAS sur le forum. Un nom comme « c'est qui Mael34 ? », « tu connais "
+    "Untel ? » désigne un MEMBRE Discord, pas un personnage du forum : tu réponds avec ta mémoire "
+    "interne (tes notes sur ce membre). Si tu ne connais pas cette personne, tu le dis simplement "
+    "(« je connais pas ce membre », « j'ai rien sur lui ») — tu ne vas PAS sur le forum et tu "
+    "n'inventes rien. On n'ouvre le forum que si on te le demande explicitement (« sur le forum », "
+    "un lien, « Orbis Naturae », l'univers/le RP)."
 )
 
 # Directive injectée quand le forum Orbis est DÉSACTIVÉ sur ce serveur.
@@ -14806,7 +14832,17 @@ async def on_message(message):
         orbis_on = get_guild_setting(getattr(message.guild, "id", None), "forum_orbis", False)
         tools_for_user = filter_tools_for_guild(tools_for_user, orbis_on)
         if orbis_on:
-            system_prompt += FORUM_FIRST_DIRECTIVE
+            # Déduction DÉTERMINISTE joueur vs forum : on n'autorise la fouille du forum
+            # QUE si le message le signale (mot-clé, lien, univers/RP). Sinon on RETIRE les
+            # outils de consultation du forum — elle ne peut plus fouiller ni inventer, elle
+            # répond depuis sa mémoire interne (ou dit qu'elle ne connaît pas ce membre).
+            if forum_signal(content):
+                system_prompt += FORUM_FIRST_DIRECTIVE
+            else:
+                if tools_for_user:
+                    tools_for_user = [t for t in tools_for_user
+                                      if t["function"]["name"] not in FORUM_LOOKUP_TOOLS]
+                system_prompt += FORUM_INTERNAL_DIRECTIVE
         else:
             system_prompt += ORBIS_OFF_DIRECTIVE
 
