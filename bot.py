@@ -30,6 +30,13 @@ import yt_dlp
 import aiohttp                 # déjà fourni par discord.py — serveur keep-alive + self-ping
 from aiohttp import web
 
+# Fonctions de texte PURES extraites dans leur propre module (cf. textutils.py) :
+# normalisation, racinisation, similarité/dédoublonnage, découpe Discord, JSON tolérant.
+from textutils import (
+    DEDUP_SIMILARITY, _fold, _words, _stem, _stems, _normalize,
+    _too_similar, _similarity, smart_split, _parse_json_loose,
+)
+
 load_dotenv()
 
 # ============================================================
@@ -128,7 +135,7 @@ MAX_USER_NOTES = 10          # LIMITE DURE : 10 notes personnelles max par perso
                              # ménage (clean_all_memory). Au-delà, _trim_notes sacrifie d'abord
                              # les moins précieuses (faibles + vieilles + jamais revues), en
                              # protégeant les notes écrites à la main (author != IA).
-DEDUP_SIMILARITY = 0.8       # seuil de similarité pour éviter les quasi-doublons (dédoublonnage strict)
+# DEDUP_SIMILARITY est défini dans textutils.py (importé plus haut) — seuil de quasi-doublon.
 CONSOLIDATE_SIMILARITY = 0.5 # seuil « proches mais pas identiques » : notes candidates à une FUSION
                              # sémantique par le LLM (regrouper des infos qui se recoupent en une
                              # seule note plus riche). Plus bas que DEDUP_SIMILARITY exprès.
@@ -775,85 +782,10 @@ def flush_memory_sync():
     except OSError as e:
         print(f"⚠️ Sauvegarde finale échouée: {e}")
 
-# --- Similarité / dédoublonnage --------------------------------------------
-_STOPWORDS_FR = {
-    "avec", "cette", "cettes", "dans", "elle", "elles", "etre", "être", "fait", "faire",
-    "mais", "meme", "même", "nous", "pour", "quand", "quel", "quelle", "quels", "quelles",
-    "sans", "sont", "leur", "leurs", "tout", "toute", "tous", "toutes", "vous", "avoir",
-    "plus", "moins", "tres", "très", "aussi", "comme", "alors", "donc", "ainsi", "chez",
-    "entre", "sous", "cela", "ceci", "etait", "était", "avait", "peut", "veut", "bien",
-    "encore", "juste", "vraiment", "parce",
-}
-
-def _fold(text):
-    """Minuscules SANS accents, longueur PRÉSERVÉE caractère à caractère (é→e) : permet de
-    retrouver la POSITION exacte d'un terme dans le texte d'origine (pour les extraits)."""
-    out = []
-    for ch in (text or "").lower():
-        d = unicodedata.normalize("NFD", ch)
-        base = next((c for c in d if unicodedata.category(c) != "Mn"), " ")
-        out.append(base if base.isprintable() else " ")
-    return "".join(out)
-
-def _words(text):
-    """Mots significatifs, insensibles aux ACCENTS et débarrassés des mots-outils : la même
-    normalisation sert au dédoublonnage ET au tri par pertinence (mémoire, notes, recherche)."""
-    toks = re.findall(r"[a-z0-9]{4,}", _fold(text))
-    return {t for t in toks if t not in _STOPWORDS_FR}
-
-# --- Racinisation légère (français très fléchi) -----------------------------
-# Le rappel mémoire était purement lexical : « il JOUE à X » ne matchait pas
-# « tu JOUAIS à quoi ? ». On ramène chaque mot à une racine grossière (accords,
-# conjugaisons, dérivations courantes) pour que ces variantes se rejoignent.
-# Zéro dépendance, rapide, ne sert QU'AU tri par pertinence (jamais à effacer/
-# fusionner un souvenir) : une racine un peu trop large ne fait, au pire, que
-# remonter un souvenir légèrement moins pertinent — aucun risque de correction.
-_FR_SUFFIXES = sorted([
-    "issaient", "eraient", "iraient", "assent", "issent", "eront", "iront",
-    "erait", "irait", "aient", "ement", "ments", "ation", "ations", "atrice",
-    "ateur", "ateurs", "ances", "ence", "ances", "erais", "erait", "ions",
-    "iers", "ière", "ieres", "euses", "eux", "euse", "ique", "iques", "isme",
-    "iste", "ist", "ance", "ente", "ents", "ance", "erai", "eras", "erez",
-    "erons", "ront", "iez", "ais", "ait", "ant", "ent", "ons", "ez", "er",
-    "ir", "re", "es", "ee", "ees", "aux", "als", "al", "le", "te", "ité",
-    "ites", "age", "ages", "s", "x", "e",
-], key=len, reverse=True)
-
-def _stem(word):
-    """Racine grossière : retire un suffixe flexionnel/dérivationnel courant tant
-    qu'il reste ≥3 lettres. Assez pour rapprocher jouer/joue/jouais/jouait/jouaient
-    (→ « jou »), stratégie/stratégique (→ « strateg »), sans écrouler des mots courts."""
-    for suf in _FR_SUFFIXES:
-        if word.endswith(suf) and len(word) - len(suf) >= 3:
-            return word[:-len(suf)]
-    return word
-
-def _stems(text):
-    """Ensemble des racines significatives d'un texte (pour le tri par pertinence tolérant)."""
-    toks = re.findall(r"[a-z0-9]{3,}", _fold(text))
-    return {_stem(t) for t in toks if t not in _STOPWORDS_FR and len(_stem(t)) >= 3}
-
-def _normalize(text):
-    return re.sub(r"\s+", " ", text.strip().lower())
-
-def _too_similar(a, b, thresh=DEDUP_SIMILARITY):
-    """Vrai si deux souvenirs disent en substance la même chose."""
-    if _normalize(a) == _normalize(b):
-        return True
-    wa, wb = _words(a), _words(b)
-    if not wa or not wb:
-        return False
-    return len(wa & wb) / len(wa | wb) >= thresh
-
-def _similarity(a, b):
-    """Ratio de similarité (0 à 1) entre deux textes, sur le chevauchement des mots.
-    Sert à retrouver DE QUELLE note parle un signalement « c'est faux »."""
-    if _normalize(a) == _normalize(b):
-        return 1.0
-    wa, wb = _words(a), _words(b)
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / len(wa | wb)
+# --- Similarité / dédoublonnage / racinisation ------------------------------
+# _fold, _words, _stem, _stems, _normalize, _too_similar, _similarity vivent
+# désormais dans textutils.py (importés en tête de fichier). Fonctions PURES,
+# testables isolément.
 
 # --- Mémoire commune (faits généraux + consignes du Maître) -----------------
 def add_memory(text, category="général", guild_id=None):
@@ -1039,9 +971,8 @@ def _user_record(uid):
     rec.setdefault("notes", [])
     rec.setdefault("display_name", "")
     # --- Fiche structurée PAR SERVEUR (multi-serveur) : rec["profiles"][bucket] ---
+    # (profil, tags et relations sont désormais cloisonnés par serveur, cf. _user_profile)
     rec.setdefault("profiles", {})
-    rec.setdefault("tags", [])
-    rec.setdefault("relations", {})                 # {nom_ou_uid: courte description du lien}
     return rec
 
 def _blank_profile():
@@ -1053,6 +984,8 @@ def _blank_profile():
         "mood": "",             # humeur dominante
         "style": "",            # manière de parler
         "summary": "",          # résumé automatique de qui est la personne
+        "tags": [],             # étiquettes courtes (par serveur, cloisonné)
+        "relations": {},        # {nom_ou_uid: lien} — liens tissés SUR CE serveur
         "updated": "",          # date de dernière mise à jour de la fiche
     }
 
@@ -1088,9 +1021,18 @@ def _user_profile(rec, guild_id=None, create=True):
     """Profil structuré d'un membre SUR CE SERVEUR. Migre l'ancien profil global
     unique vers le bucket hérité "" au premier accès."""
     profiles = rec.setdefault("profiles", {})
-    legacy = rec.pop("profile", None)             # migration douce (une seule fois)
-    if isinstance(legacy, dict) and legacy and "" not in profiles:
-        profiles[""] = legacy
+    # Migration douce (une seule fois) : l'ancien profil + les anciens tags/relations
+    # GLOBAUX rejoignent le bucket hérité "".
+    legacy = rec.pop("profile", None)
+    ltags = rec.pop("tags", None)
+    lrels = rec.pop("relations", None)
+    if (isinstance(legacy, dict) and legacy) or ltags or lrels:
+        base = legacy if isinstance(legacy, dict) else {}
+        if ltags:
+            base.setdefault("tags", ltags)
+        if isinstance(lrels, dict) and lrels:
+            base.setdefault("relations", lrels)
+        profiles.setdefault("", base)
     key = _profile_key(guild_id)
     prof = profiles.get(key)
     if not isinstance(prof, dict):
@@ -1110,6 +1052,14 @@ def _all_profiles(rec):
     if isinstance(legacy, dict):
         profs.append(legacy)
     return [p for p in profs if isinstance(p, dict)]
+
+def _user_relations(rec, guild_id=None):
+    """Relations tissées avec ce membre SUR CE serveur (cloisonné)."""
+    return _user_profile(rec, guild_id, create=False).get("relations") or {}
+
+def _user_tags(rec, guild_id=None):
+    """Étiquettes du membre SUR CE serveur (cloisonné)."""
+    return _user_profile(rec, guild_id, create=False).get("tags") or []
 
 def update_user_profile(user_id, prof, guild_id=None):
     """Met à jour la fiche structurée d'une personne SUR UN SERVEUR à partir d'un dict
@@ -1131,20 +1081,21 @@ def update_user_profile(user_id, prof, guild_id=None):
             p[field] = val[:400] if field == "summary" else val[:120]
             changed = True
     if prof.get("tags"):
-        merged = _merge_list(rec.get("tags", []), prof["tags"], cap=MAX_TAGS)
-        if merged != rec.get("tags"):
-            rec["tags"] = merged
+        merged = _merge_list(p.get("tags", []), prof["tags"], cap=MAX_TAGS)
+        if merged != p.get("tags"):
+            p["tags"] = merged
             changed = True
     rels = prof.get("relations")
     if isinstance(rels, dict):
+        p.setdefault("relations", {})
         for who, desc in rels.items():
             who, desc = str(who).strip(), str(desc).strip()
             if who and desc:
-                rec["relations"][who] = desc[:120]
+                p["relations"][who] = desc[:120]
                 changed = True
         # borne le nombre de relations conservées
-        if len(rec["relations"]) > MAX_RELATIONS:
-            rec["relations"] = dict(list(rec["relations"].items())[-MAX_RELATIONS:])
+        if len(p["relations"]) > MAX_RELATIONS:
+            p["relations"] = dict(list(p["relations"].items())[-MAX_RELATIONS:])
     if changed:
         p["updated"] = now().strftime("%Y-%m-%d %H:%M")
         mark_memory_dirty()
@@ -1192,8 +1143,8 @@ def profile_prompt_block(user_id, guild_id=None):
         bits.append("Humeur dominante : " + p["mood"])
     if p.get("style"):
         bits.append("Sa façon de parler : " + p["style"] + " — cale-toi dessus.")
-    if rec.get("relations"):
-        liens = "; ".join(f"{k} ({v})" for k, v in list(rec["relations"].items())[:6])
+    if p.get("relations"):
+        liens = "; ".join(f"{k} ({v})" for k, v in list(p["relations"].items())[:6])
         bits.append("Liens connus : " + liens)
     return "\n".join(bits)
 
@@ -2059,7 +2010,7 @@ def member_notes_block(guild, members):
         textes = [_note_ctx_text(n) for n in notes]
         textes = [t for t in textes if t]
         liens = ""
-        rel = rec.get("relations") or {}
+        rel = _user_relations(rec, guild.id)          # relations DE CE serveur
         if isinstance(rel, dict) and rel:
             liens = " | liens : " + ", ".join(f"{k} ({v})" for k, v in list(rel.items())[:4])
         if textes:
@@ -5920,24 +5871,7 @@ Réponds UNIQUEMENT par :
 {{"notes": [{{"category": "évolution|ambiance|thème|règle|observation", "importance": "faible|normale|haute", "text": "..."}}],
   "summary": "..."}}"""
 
-def _parse_json_loose(raw):
-    """Parse du JSON même si le modèle l'entoure de texte ou de balises ```."""
-    if not raw:
-        return None
-    s = re.sub(r"```(json)?", "", raw).replace("```", "").strip()
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        pass
-    # repli : on isole le premier tableau ou objet complet
-    for opener, closer in (("[", "]"), ("{", "}")):
-        i, j = s.find(opener), s.rfind(closer)
-        if 0 <= i < j:
-            try:
-                return json.loads(s[i:j + 1])
-            except json.JSONDecodeError:
-                continue
-    return None
+# _parse_json_loose vit dans textutils.py (importé en tête de fichier).
 
 def _guild_me(guild):
     """Le membre-bot du serveur, avec repli si le cache est vide."""
@@ -6389,7 +6323,7 @@ async def tool_lister_membres(guild, limite=200, complet=False):
             resume = " ; ".join(textes[:notes_par_membre])
             ligne = f"- {entete} : {resume}"
             if complet:
-                rel = rec.get("relations") or {}
+                rel = _user_relations(rec, guild.id)          # relations DE CE serveur
                 if isinstance(rel, dict) and rel:
                     ligne += " | liens : " + ", ".join(f"{k} ({v})" for k, v in list(rel.items())[:4])
             connus.append(ligne)
@@ -7570,12 +7504,17 @@ def filter_tools_for_guild(tools, orbis_on):
 
 # Directive injectée quand le forum Orbis est ACTIF : « qui est X ? » → forum d'abord.
 FORUM_FIRST_DIRECTIVE = (
-    "\n\nPRIORITÉ FORUM (Orbis Naturae). Quand on te demande QUI EST quelqu'un, ou de parler d'un "
-    "personnage, d'un lieu, d'une faction, d'une créature ou de tout élément d'univers : ton TOUT "
-    "PREMIER réflexe est fouiller_forum — le forum officiel en ligne, la source qui fait autorité. "
-    "Tu ne te rabats sur tes notes internes d'un MEMBRE Discord (apropos_membre / ta mémoire) QUE si "
-    "le forum ne renvoie rien, OU s'il est manifeste qu'on parle de la personne réelle derrière "
-    "l'écran et non de son personnage. Forum d'abord, mémoire interne ensuite."
+    "\n\nFORUM ORBIS NATURAE — quand y aller (et quand NE PAS y aller). Le forum Orbis Naturae est "
+    "dispo ici, mais tu ne le fouilles PAS à chaque question sur une personne. Règle :\n"
+    "• Tu vas sur le forum (fouiller_forum) UNIQUEMENT si on te le signale explicitement : on dit "
+    "« sur le forum », « dans Orbis Naturae », « le lore / l'univers / le RP », on te donne un LIEN "
+    "(orbis-naturae.forumactif.com, /t… /f…), ou on parle clairement d'un élément d'univers "
+    "(personnage joué, lieu, faction, créature, événement du lore).\n"
+    "• Sinon, une simple question « c'est qui Mael34 ? », « tu connais Untel ? » porte sur un MEMBRE "
+    "Discord : tu réponds avec ta mémoire interne (apropos_membre / tes notes), tu ne touches PAS au "
+    "forum.\n"
+    "• Dans le doute, si rien ne pointe vers le forum, traite la question comme portant sur le membre "
+    "Discord. Tu ne pars sur le forum que si la demande le dit."
 )
 
 # Directive injectée quand le forum Orbis est DÉSACTIVÉ sur ce serveur.
@@ -9993,23 +9932,7 @@ async def condense_history(user_id, subject):
     finally:
         _summarizing.discard(user_id)
 
-def smart_split(text, limit=2000):
-    if len(text) <= limit:
-        return [text]
-    chunks, current = [], ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > limit:
-            if current:
-                chunks.append(current)
-            while len(line) > limit:
-                chunks.append(line[:limit])
-                line = line[limit:]
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        chunks.append(current)
-    return chunks
+# smart_split vit dans textutils.py (importé en tête de fichier).
 
 MSG_SPLIT_TOKEN = "[cut]"      # séparateur que le modèle place entre deux messages humains
 MAX_HUMAN_MESSAGES = 4         # plafond pour éviter le mitraillage de messages
@@ -10737,8 +10660,8 @@ async def admin_thread(request):
         "first_interaction": rec.get("first_interaction", ""),
         "last_seen": rec.get("last_seen", ""),
         "profile": _user_profile(rec, sel, create=False) if rec else _blank_profile(),
-        "tags": rec.get("tags", []),
-        "relations": rec.get("relations", {}),
+        "tags": _user_tags(rec, sel) if rec else [],
+        "relations": _user_relations(rec, sel) if rec else {},
         "notes": notes,
         "summary": summaries.get(uid, ""),
         "messages": conversations.get(uid, []),
@@ -10815,6 +10738,7 @@ async def admin_overview(request):
         return guard
     mem = memory()
     users = mem["users"]
+    sel = _req_guild(request)          # '' = tous serveurs ; sinon on scope au serveur
     maintenant = now()
     active_7d = 0
     tag_counts, rel_edges = {}, 0
@@ -10825,10 +10749,14 @@ async def admin_overview(request):
                 active_7d += 1
         except (ValueError, TypeError):
             pass
-        for t in rec.get("tags", []):
-            tag_counts[t] = tag_counts.get(t, 0) + 1
-        rel_edges += len(rec.get("relations", {}))
-    total_notes = sum(len(r.get("notes", [])) for r in users.values())
+        # Tags/relations : du serveur choisi, ou agrégés sur tous les buckets.
+        profs = [_user_profile(rec, sel, create=False)] if sel else _all_profiles(rec)
+        for pr in profs:
+            for t in pr.get("tags", []):
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+            rel_edges += len(pr.get("relations", {}))
+    total_notes = sum(len(_notes_here(r.get("notes", []), sel) if sel else r.get("notes", []))
+                      for r in users.values())
     total_msgs = sum(len(t) for t in conversations.values())
     top_tags = sorted(tag_counts.items(), key=lambda kv: -kv[1])[:12]
     # Catégories de la mémoire commune
@@ -10856,6 +10784,14 @@ async def admin_graph(request):
     if guard:
         return guard
     users = memory()["users"]
+    sel = _req_guild(request)          # relations du serveur choisi, ou fusionnées si ''
+    def rels_of(rec):
+        if sel:
+            return _user_relations(rec, sel)
+        out = {}
+        for pr in _all_profiles(rec):
+            out.update(pr.get("relations", {}))
+        return out
     # Index nom/username -> uid pour relier les liens déclarés à de vraies fiches.
     name_index = {}
     for uid, rec in users.items():
@@ -10864,7 +10800,7 @@ async def admin_graph(request):
                 name_index[key.lower()] = uid
     nodes, edges, seen_edge = [], [], set()
     for uid, rec in users.items():
-        if not (rec.get("relations") or rec.get("notes") or rec.get("interactions")):
+        if not (rels_of(rec) or rec.get("notes") or rec.get("interactions")):
             continue
         nodes.append({
             "id": str(uid),
@@ -10874,7 +10810,7 @@ async def admin_graph(request):
         })
     node_ids = {n["id"] for n in nodes}
     for uid, rec in users.items():
-        for who, desc in rec.get("relations", {}).items():
+        for who, desc in rels_of(rec).items():
             target = name_index.get(str(who).lower())
             if target and target in node_ids and target != uid:
                 pair = tuple(sorted((str(uid), target)))
@@ -10908,8 +10844,8 @@ async def admin_search(request):
         prof_hay = rec.get("username", "")
         for p in _all_profiles(rec):              # recherche sur TOUS les serveurs
             prof_hay += " " + " ".join([p.get("summary", "")] + p.get("interests", []) +
-                                       p.get("liked_topics", []) + p.get("sensitive_topics", []))
-        prof_hay += " " + " ".join(rec.get("tags", []))
+                                       p.get("liked_topics", []) + p.get("sensitive_topics", []) +
+                                       p.get("tags", []))
         if hit(name) or hit(prof_hay):
             results.append({"kind": "fiche", "uid": str(uid), "who": name,
                             "date": rec.get("last_seen", ""),
@@ -13468,7 +13404,7 @@ $$('.tab').forEach(t => t.onclick = () => switchView(t.dataset.v));
 
 /* ---------- Tableau de bord ---------- */
 async function loadDash(){
-  const {status, body} = await jget('/admin/api/overview');
+  const {status, body} = await jget(gq('/admin/api/overview'));
   if(status!==200){ if(status===401) showLogin(); return; }
   const cards = [
     ['Personnes', body.users], ['Serveurs', body.guilds], ['Souvenirs', body.memories],
@@ -13487,7 +13423,7 @@ async function loadDash(){
 }
 
 async function loadGraph(){
-  const {status, body} = await jget('/admin/api/graph');
+  const {status, body} = await jget(gq('/admin/api/graph'));
   const svg = $('#graph');
   if(status!==200){ svg.innerHTML=''; return; }
   const W = svg.clientWidth || 800, H = 420, cx = W/2, cy = H/2;
