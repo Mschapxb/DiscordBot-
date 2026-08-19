@@ -856,21 +856,28 @@ def _similarity(a, b):
     return len(wa & wb) / len(wa | wb)
 
 # --- Mémoire commune (faits généraux + consignes du Maître) -----------------
-def add_memory(text, category="général"):
+def add_memory(text, category="général", guild_id=None):
+    """Souvenir général / consigne. Le champ `guild` cloisonne le souvenir sur son
+    serveur d'origine (multi-serveur) ; les souvenirs hérités (sans guild) reviennent
+    au serveur d'attache (cf. _note_visible_on)."""
     text = text.strip()
     if not text:
         return False
+    gtag = str(guild_id) if guild_id else ""
     mems = memory()["memories"]
     for m in mems:
-        if _too_similar(m["text"], text):
+        # Un doublon n'est un doublon que SUR LE MÊME serveur (le même fait peut
+        # coexister sur deux serveurs avec des origines différentes).
+        if _too_similar(m["text"], text) and (m.get("guild") or "") == gtag:
             return False
     mems.append({
         "date": now().strftime("%Y-%m-%d %H:%M"),
         "category": category,
         "text": text,
+        "guild": gtag,
     })
     mark_memory_dirty()
-    print(f"🧠 Souvenir [{category}]: {text}")
+    print(f"🧠 Souvenir [{category}]{('@'+gtag) if gtag else ''}: {text}")
     return True
 
 # --- Consignes : ordres permanents de Mschap sur le comportement de Tenebris -
@@ -887,19 +894,21 @@ def _is_directive(m):
         return True
     return bool(_DIRECTIVE_RE.search(m.get("text", "")))
 
-def get_directives():
-    """Toutes les consignes actives — toujours en contexte, jamais filtrées par pertinence."""
+def get_directives(guild_id=None):
+    """Consignes actives SUR CE SERVEUR — toujours en contexte, jamais filtrées par pertinence.
+    (Multi-serveur : une consigne n'agit que sur son serveur d'origine.)"""
     seen, out = set(), []
     for m in memory()["memories"]:
-        if _is_directive(m) and m["text"] not in seen:
+        if _is_directive(m) and m["text"] not in seen and _note_visible_on(m, guild_id):
             seen.add(m["text"])
             out.append(m["text"])
     return "\n".join(f"- {t}" for t in out)
 
-def get_relevant_memories(query=""):
+def get_relevant_memories(query="", guild_id=None):
     """Sélectionne les souvenirs FACTUELS: les plus récents + ceux pertinents pour le message actuel.
-    Les consignes sont exclues d'ici : elles ont leur propre bloc prioritaire."""
-    mems = [m for m in memory()["memories"] if not _is_directive(m)]
+    Les consignes sont exclues d'ici : elles ont leur propre bloc prioritaire.
+    Cloisonné par serveur (multi-serveur)."""
+    mems = [m for m in memory()["memories"] if not _is_directive(m) and _note_visible_on(m, guild_id)]
     if not mems:
         return "Aucun souvenir enregistré pour l'instant."
 
@@ -1029,11 +1038,8 @@ def _user_record(uid):
     rec = users[uid]
     rec.setdefault("notes", [])
     rec.setdefault("display_name", "")
-    # --- Fiche structurée (points 3, 4, 9 du cahier des charges) ---
-    rec.setdefault("profile", _blank_profile())
-    prof = rec["profile"]
-    for k, v in _blank_profile().items():          # migration douce des anciennes fiches
-        prof.setdefault(k, v)
+    # --- Fiche structurée PAR SERVEUR (multi-serveur) : rec["profiles"][bucket] ---
+    rec.setdefault("profiles", {})
     rec.setdefault("tags", [])
     rec.setdefault("relations", {})                 # {nom_ou_uid: courte description du lien}
     return rec
@@ -1066,13 +1072,52 @@ def _merge_list(existing, incoming, cap=PROFILE_LIST_MAX):
             out.append(s)
     return out[-cap:]
 
-def update_user_profile(user_id, prof):
-    """Met à jour la fiche structurée d'une personne à partir d'un dict partiel.
-    Appelée par l'extraction auto : n'écrase jamais brutalement, elle enrichit."""
+# --- Profils PAR SERVEUR (multi-serveur) ------------------------------------
+# Un membre a désormais un profil (intérêts, résumé, style…) DISTINCT par serveur,
+# rangé dans rec["profiles"][bucket]. Le serveur d'attache, les MP et l'inconnu
+# partagent le bucket hérité "" (qui récupère l'ancien profil global unique).
+def _profile_key(guild_id):
+    if not guild_id:
+        return ""
+    home = get_setting("home_guild_id")
+    if home and str(guild_id) == str(home):
+        return ""
+    return str(guild_id)
+
+def _user_profile(rec, guild_id=None, create=True):
+    """Profil structuré d'un membre SUR CE SERVEUR. Migre l'ancien profil global
+    unique vers le bucket hérité "" au premier accès."""
+    profiles = rec.setdefault("profiles", {})
+    legacy = rec.pop("profile", None)             # migration douce (une seule fois)
+    if isinstance(legacy, dict) and legacy and "" not in profiles:
+        profiles[""] = legacy
+    key = _profile_key(guild_id)
+    prof = profiles.get(key)
+    if not isinstance(prof, dict):
+        if not create:
+            return dict(_blank_profile())
+        prof = _blank_profile()
+        profiles[key] = prof
+    else:
+        for k, v in _blank_profile().items():
+            prof.setdefault(k, v)
+    return prof
+
+def _all_profiles(rec):
+    """Tous les buckets de profil d'un membre (recherche / persona globale)."""
+    profs = list((rec.get("profiles") or {}).values())
+    legacy = rec.get("profile")
+    if isinstance(legacy, dict):
+        profs.append(legacy)
+    return [p for p in profs if isinstance(p, dict)]
+
+def update_user_profile(user_id, prof, guild_id=None):
+    """Met à jour la fiche structurée d'une personne SUR UN SERVEUR à partir d'un dict
+    partiel. Appelée par l'extraction auto : n'écrase jamais brutalement, elle enrichit."""
     if not isinstance(prof, dict):
         return False
     rec = _user_record(str(user_id))
-    p = rec["profile"]
+    p = _user_profile(rec, guild_id)
     changed = False
     for field in ("interests", "liked_topics", "sensitive_topics"):
         if prof.get(field):
@@ -1127,13 +1172,13 @@ def _note_ctx_text(note, limit=None):
         t = t[:cap].rstrip() + "…"
     return t
 
-def profile_prompt_block(user_id):
-    """Rend la fiche sous une forme compacte, injectable dans le prompt système,
-    pour que Tenebris ADAPTE son ton (points 1 et 6) sans réciter la fiche."""
+def profile_prompt_block(user_id, guild_id=None):
+    """Rend la fiche (DU SERVEUR courant) sous une forme compacte, injectable dans le
+    prompt système, pour que Tenebris ADAPTE son ton (points 1 et 6) sans réciter la fiche."""
     rec = memory()["users"].get(str(user_id))
     if not rec:
         return ""
-    p = rec.get("profile", {})
+    p = _user_profile(rec, guild_id, create=False)
     bits = []
     if p.get("summary"):
         bits.append(p["summary"])
@@ -1965,7 +2010,7 @@ def get_user_context(user_id, member=None, guild=None):
     posture = posture_block(rec)
     if posture:
         lines.append(posture)
-    prof_block = profile_prompt_block(user_id)
+    prof_block = profile_prompt_block(user_id, _gid)
     if prof_block:
         lines.append(prof_block)
 
@@ -7568,7 +7613,7 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             fait = args.get("fait", "").strip()
             if not fait:
                 return "Rien à mémoriser."
-            if add_memory(fait, args.get("categorie", "général")):
+            if add_memory(fait, args.get("categorie", "général"), guild_id=getattr(guild, "id", None)):
                 return f"✅ Mémorisé: {fait}"
             return "Déjà en mémoire."
         if name == "chercher_souvenirs":
@@ -7619,7 +7664,7 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             consigne = args.get("consigne", "").strip()
             if not consigne:
                 return "Consigne vide."
-            if add_memory(consigne, DIRECTIVE_CATEGORY):
+            if add_memory(consigne, DIRECTIVE_CATEGORY, guild_id=getattr(guild, "id", None)):
                 schedule_directive_reconcile("noter_consigne")
                 return f"✅ Consigne gravée, je m'y tiendrai: {consigne}"
             return "Cette consigne est déjà gravée."
@@ -8952,7 +8997,8 @@ async def evolve_persona():
     users = memory().get("users", {})
     obs = []
     for rec in list(users.values())[:40]:
-        prof = rec.get("profile", {}) or {}
+        _profs = _all_profiles(rec)
+        prof = _profs[0] if _profs else {}
         who = rec.get("username") or rec.get("display_name") or "?"
         bits = []
         for k in ("interets", "sujets_aimes", "sujets_sensibles", "style", "humeur"):
@@ -9227,7 +9273,7 @@ async def update_self_state(history, subject_name=None, force=False):
     finally:
         _self_updating = False
 
-def build_system_prompt_mschap(days_away=0, guild_context="", current_message="", others_context="", user_context="", voix=True):
+def build_system_prompt_mschap(days_away=0, guild_context="", current_message="", others_context="", user_context="", voix=True, guild_id=None):
     """Persona statique en tête (cache de préfixe), contexte dynamique en queue.
     voix=True : registre parlé, court, à caractère (conversation). voix=False : restitution
     d'un outil, on la laisse être précise et structurée."""
@@ -9244,7 +9290,7 @@ def build_system_prompt_mschap(days_away=0, guild_context="", current_message=""
     if auto:
         parts.append(auto)
 
-    directives = get_directives()
+    directives = get_directives(guild_id)
     if directives:
         parts.append(
             "CONSIGNES PERMANENTES DE MSCHAP — PRIORITÉ ABSOLUE\n"
@@ -9261,7 +9307,7 @@ def build_system_prompt_mschap(days_away=0, guild_context="", current_message=""
 
     parts.append(
         "CE QUE TU SAIS (mémoire commune — sers-t'en naturellement, sans réciter ni dire « d'après mes souvenirs ». "
-        "Tu SAIS, c'est tout. Pour le reste : chercher_souvenirs.)\n" + get_relevant_memories(current_message)
+        "Tu SAIS, c'est tout. Pour le reste : chercher_souvenirs.)\n" + get_relevant_memories(current_message, guild_id)
     )
     if user_context:
         parts.append("CE QUE TU SAIS SUR MSCHAP (ses notes, sous son identité)\n" + user_context)
@@ -9311,7 +9357,7 @@ IDENTITE_RULE = (
     "tu le dis franchement."
 )
 
-def build_system_prompt_other(username, guild_context="", user_context="", others_context="", current_message="", voix=True):
+def build_system_prompt_other(username, guild_context="", user_context="", others_context="", current_message="", voix=True, guild_id=None):
     parts = [persona_block(), PERSONA_OTHER, DICE_RULE, IDENTITE_RULE]
     if voix:
         parts.append(VOIX)
@@ -9320,7 +9366,7 @@ def build_system_prompt_other(username, guild_context="", user_context="", other
     auto = autonomy_clause()
     if auto:
         parts.append(auto)
-    mems = get_relevant_memories(current_message)
+    mems = get_relevant_memories(current_message, guild_id)
     if mems and "Aucun souvenir" not in mems:
         parts.append(
             "CE QUE TU SAIS (mémoire commune — sers-t'en naturellement, sans réciter)\n" + mems
@@ -9399,7 +9445,7 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
             directive_clause = ""
             cats = "projet|perso|préférence|événement|objectif"
         known = "\n".join(f"- {m['text']}" for m in known_items) or "(aucun)"
-        profile_str = profile_prompt_block(user_id) or "(fiche vide)"
+        profile_str = profile_prompt_block(user_id, guild_id) or "(fiche vide)"
 
         response = await extract_completion(
             [
@@ -9425,7 +9471,7 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
                 continue
             if is_mschap_target and f.get("category") == DIRECTIVE_CATEGORY:
                 # Consigne du Maître → mémoire commune (comportement de Tenebris)
-                if add_memory(f["text"], DIRECTIVE_CATEGORY):
+                if add_memory(f["text"], DIRECTIVE_CATEGORY, guild_id=guild_id):
                     added += 1
                     dir_added = True
             else:
@@ -9442,7 +9488,7 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
 
         if dir_added:
             schedule_directive_reconcile("extraction auto")   # consignes qui se superposent → ménage auto
-        prof_changed = update_user_profile(user_id, prof) if prof else False
+        prof_changed = update_user_profile(user_id, prof, guild_id) if prof else False
         if added or prof_changed:
             extra = " + fiche enrichie" if prof_changed else ""
             print(f"🧠 Extraction auto ({subject}): {added} nouveau(x) fait(s){extra}")
@@ -10519,8 +10565,11 @@ async def admin_user_detail(request):
             texte = (data.get("texte") or "").strip()
             if not texte:
                 return web.json_response({"error": "note vide"}, status=400)
-            # note écrite à la main → author = admin, donc jamais oubliée automatiquement
-            add_user_note(uid, texte, importance=data.get("importance", "haute"), author="admin")
+            # note écrite à la main → author = admin, donc jamais oubliée automatiquement.
+            # Taguée au serveur sélectionné dans le panneau (multi-serveur).
+            gsel = str(data.get("guild") or "").strip()
+            add_user_note(uid, texte, importance=data.get("importance", "haute"), author="admin",
+                          guild_id=(gsel or None))
             await flush_memory()
             return web.json_response({"ok": True})
         return web.json_response({"error": "action inconnue"}, status=400)
@@ -10529,12 +10578,18 @@ async def admin_user_detail(request):
     rec = memory()["users"].get(uid)
     if not rec:
         return web.json_response({"error": "utilisateur inconnu"}, status=404)
+    sel = _req_guild(request)
     thread = conversations.get(int(uid) if uid.isdigit() else uid, [])
     lieu = known_location(int(uid)) if uid.isdigit() else {}
     notes = []
     for i, n in enumerate(rec.get("notes", [])):
+        # Filtre serveur : on n'affiche que les notes du serveur choisi (index RÉEL
+        # conservé pour que la suppression vise la bonne note). '' = tous serveurs.
+        if sel and not _note_visible_on(n, sel):
+            continue
         notes.append({
             "index": i,
+            "guild": (n.get("guild") if isinstance(n, dict) else "") or "",
             "text": _note_text(n),
             "importance": n.get("importance", "normale"),
             "category": n.get("category", ""),
@@ -10564,21 +10619,66 @@ async def admin_user_detail(request):
         "lieu_serveur": lieu.get("serveur", ""),
         "notes": notes,
         "notes_total": len(rec.get("notes", [])),
+        "notes_ici": len(notes),
+        "selected": sel,
+        "profile": _user_profile(rec, sel, create=False),   # profil DU serveur choisi
     })
+
+def _req_guild(request):
+    """Serveur sélectionné dans le panneau (query ?guild=). '' ou 'all' = tous serveurs."""
+    g = (request.rel_url.query.get("guild") or "").strip()
+    return "" if g in ("", "all", "tous") else g
+
+def _admin_guild_options():
+    """Liste des serveurs connus (fiches + serveurs en direct) pour le sélecteur du panneau,
+    avec l'état de l'option forum_orbis et le repère du serveur d'attache."""
+    home = str(get_setting("home_guild_id") or "")
+    live = {str(g.id): g for g in bot.guilds} if bot else {}
+    seen, opts = set(), []
+    for gid, grec in memory().get("guilds", {}).items():
+        seen.add(str(gid))
+        opts.append({
+            "gid": str(gid),
+            "name": grec.get("name") or str(gid),
+            "present": str(gid) in live,
+            "forum_orbis": bool(get_guild_setting(gid, "forum_orbis", False)),
+            "home": str(gid) == home,
+        })
+    for gid, g in live.items():
+        if gid not in seen:
+            opts.append({"gid": gid, "name": g.name, "present": True,
+                         "forum_orbis": bool(get_guild_setting(gid, "forum_orbis", False)),
+                         "home": gid == home})
+    opts.sort(key=lambda x: (not x["present"], x["name"].lower()))
+    return opts
 
 async def admin_state(request):
     guard = _auth_guard(request)
     if guard:
         return guard
     users = memory()["users"]
+    sel = _req_guild(request)
+    # Filtre serveur : on ne garde que les membres PRÉSENTS sur le serveur choisi
+    # (ou qui y ont des notes/un profil). '' = tous serveurs confondus.
+    present_ids = None
+    if sel:
+        g = bot.get_guild(int(sel)) if (bot and sel.isdigit()) else None
+        present_ids = {str(m.id) for m in getattr(g, "members", [])} if g else set()
     uids = {k for k in conversations.keys() if isinstance(k, int)} | {int(u) for u in users.keys() if str(u).isdigit()}
     items = []
     for uid in uids:
         rec = users.get(str(uid), {})
+        if sel:
+            here_notes = _notes_here(rec.get("notes", []), sel)
+            in_guild = (str(uid) in present_ids) or bool(here_notes) or bool((rec.get("profiles") or {}).get(_profile_key(sel)))
+            if not in_guild:
+                continue
         thread = conversations.get(uid, [])
         last = thread[-1]["content"] if thread else ""
         lieu = known_location(uid)
+        notes_here = len(_notes_here(rec.get("notes", []), sel)) if sel else len(rec.get("notes", []))
         items.append({
+            "notes_ici": notes_here,
             "uid": str(uid),
             "name": rec.get("display_name") or rec.get("username") or str(uid),
             "username": rec.get("username", ""),
@@ -10598,7 +10698,12 @@ async def admin_state(request):
             "lieu_vivant": uid in _user_channels,
         })
     items.sort(key=lambda x: (x["last_seen"] or "", x["messages"]), reverse=True)
-    return web.json_response({"users": items, "paused_count": len(_PAUSED)})
+    return web.json_response({
+        "users": items, "paused_count": len(_PAUSED),
+        "guilds": _admin_guild_options(),   # pour le sélecteur de serveur
+        "selected": sel,
+        "home_guild": str(get_setting("home_guild_id") or ""),
+    })
 
 async def admin_thread(request):
     guard = _auth_guard(request)
@@ -10609,10 +10714,12 @@ async def admin_thread(request):
     except ValueError:
         return web.json_response({"error": "uid invalide"}, status=400)
     rec = memory()["users"].get(str(uid), {})
+    sel = _req_guild(request)
     notes = [{"i": i, "date": n.get("date", ""), "modified": n.get("modified", ""),
               "text": n.get("text", ""), "category": n.get("category", "observation"),
               "importance": n.get("importance", "normale"), "author": n.get("author", "IA")}
-             for i, n in enumerate(rec.get("notes", []))]
+             for i, n in enumerate(rec.get("notes", []))
+             if not sel or _note_visible_on(n, sel)]
     lieu = known_location(uid)
     return web.json_response({
         "uid": str(uid),
@@ -10629,7 +10736,7 @@ async def admin_thread(request):
         "interactions": rec.get("interactions", 0),
         "first_interaction": rec.get("first_interaction", ""),
         "last_seen": rec.get("last_seen", ""),
-        "profile": rec.get("profile", _blank_profile()),
+        "profile": _user_profile(rec, sel, create=False) if rec else _blank_profile(),
         "tags": rec.get("tags", []),
         "relations": rec.get("relations", {}),
         "notes": notes,
@@ -10798,10 +10905,11 @@ async def admin_search(request):
                             "date": m.get("date", ""), "text": m["text"], "index": i})
     for uid, rec in memory()["users"].items():
         name = rec.get("username") or rec.get("display_name") or uid
-        p = rec.get("profile", {})
-        prof_hay = " ".join([p.get("summary", "")] + p.get("interests", []) +
-                            p.get("liked_topics", []) + p.get("sensitive_topics", []) +
-                            rec.get("tags", []))
+        prof_hay = rec.get("username", "")
+        for p in _all_profiles(rec):              # recherche sur TOUS les serveurs
+            prof_hay += " " + " ".join([p.get("summary", "")] + p.get("interests", []) +
+                                       p.get("liked_topics", []) + p.get("sensitive_topics", []))
+        prof_hay += " " + " ".join(rec.get("tags", []))
         if hit(name) or hit(prof_hay):
             results.append({"kind": "fiche", "uid": str(uid), "who": name,
                             "date": rec.get("last_seen", ""),
@@ -10817,11 +10925,14 @@ async def admin_memories(request):
     guard = _auth_guard(request)
     if guard:
         return guard
+    sel = _req_guild(request)
     items = [{"i": i, "date": m.get("date", ""), "category": m.get("category", "général"),
-              "text": m.get("text", ""), "directive": _is_directive(m)}
-             for i, m in enumerate(memory()["memories"])]
+              "text": m.get("text", ""), "directive": _is_directive(m),
+              "guild": (m.get("guild") or "")}
+             for i, m in enumerate(memory()["memories"])
+             if not sel or _note_visible_on(m, sel)]   # filtre serveur ('' = tous)
     items.reverse()
-    return web.json_response({"memories": items})
+    return web.json_response({"memories": items, "selected": sel})
 
 async def admin_note(request):
     """Ajoute / édite / supprime une note d'un utilisateur, avec métadonnées et audit (§3/§8)."""
@@ -10842,8 +10953,10 @@ async def admin_note(request):
         text = str(data.get("text") or "").strip()
         if not text:
             return web.json_response({"error": "texte vide"}, status=400)
+        gsel = str(data.get("guild") or "").strip()
         ok = add_user_note(uid, text, category=str(data.get("category") or "observation"),
-                           importance=str(data.get("importance") or "normale"), author="admin")
+                           importance=str(data.get("importance") or "normale"), author="admin",
+                           guild_id=(gsel or None))
         await flush_memory()
         audit_log("note_ajout", f"{name}: {text[:120]}")
         return web.json_response({"ok": ok, "added": ok})
@@ -10897,8 +11010,9 @@ async def admin_memory(request):
     text = str(data.get("text") or "").strip()
     if not text:
         return web.json_response({"error": "texte vide"}, status=400)
-    if idx is None:  # ajout
-        add_memory(text, str(data.get("category") or "manuel"))
+    if idx is None:  # ajout — tagué au serveur sélectionné dans le panneau
+        gsel = str(data.get("guild") or "").strip()
+        add_memory(text, str(data.get("category") or "manuel"), guild_id=(gsel or None))
         await flush_memory()
         audit_log("memoire_ajout", text[:120])
         return web.json_response({"ok": True, "added": True})
@@ -11210,6 +11324,35 @@ async def admin_guild_note(request):
     await flush_memory()
     audit_log("note_serveur_edit", f"{rec.get('name')}: {text[:120]}")
     return web.json_response({"ok": True})
+
+async def admin_guild_settings(request):
+    """Lit/écrit les OPTIONS PAR SERVEUR (forum_orbis…) depuis le panneau."""
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    if request.method == "POST":
+        data = await _read_json(request)
+        gid = str(data.get("gid") or "").strip()
+        if not gid.isdigit():
+            return web.json_response({"error": "gid invalide"}, status=400)
+        key = str(data.get("key") or "")
+        if key not in DEFAULT_GUILD_SETTINGS:
+            return web.json_response({"error": "option inconnue"}, status=400)
+        val = data.get("value")
+        if isinstance(DEFAULT_GUILD_SETTINGS[key], bool):
+            val = bool(val)
+        set_guild_setting(gid, key, val)
+        await flush_memory()
+        audit_log("option_serveur", f"{key}={val} sur {gid}")
+        return web.json_response({"ok": True, "settings": get_guild_settings(gid),
+                                  "home_guild": str(get_setting("home_guild_id") or "")})
+    gid = _req_guild(request)
+    return web.json_response({
+        "defaults": DEFAULT_GUILD_SETTINGS,
+        "settings": get_guild_settings(gid) if gid else {},
+        "gid": gid,
+        "home_guild": str(get_setting("home_guild_id") or ""),
+    })
 
 async def admin_observe(request):
     """Lance une observation immédiate d'un serveur. Elle part en TÂCHE DE FOND :
@@ -12511,6 +12654,8 @@ def _register_admin_routes(app):
     app.router.add_post("/admin/api/restore", admin_restore)
     app.router.add_get("/admin/api/guilds", admin_guilds)
     app.router.add_post("/admin/api/guild_note", admin_guild_note)
+    app.router.add_get("/admin/api/guild_settings", admin_guild_settings)
+    app.router.add_post("/admin/api/guild_settings", admin_guild_settings)
     app.router.add_post("/admin/api/observe", admin_observe)
     app.router.add_get("/admin/api/persona", admin_persona)
     app.router.add_post("/admin/api/persona", admin_persona)
@@ -12741,6 +12886,14 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <button class="tab" data-v="persona">Personnalité</button>
       <button class="tab" data-v="agenda">Rappels & Missions</button>
       <button class="tab" data-v="admin">Console</button>
+    </div>
+    <div id="guildBox" style="display:flex;align-items:center;gap:8px;margin-left:auto">
+      <span style="font-size:11px;color:var(--dim);letter-spacing:.04em">SERVEUR</span>
+      <select id="guildSel" onchange="onGuildChange()" title="Filtre la mémoire par serveur"
+              style="background:var(--card,#1a1a1f);color:inherit;border:1px solid var(--line,#333);border-radius:8px;padding:5px 8px;font-size:12px;max-width:220px"></select>
+      <label id="orbisTog" style="display:none;align-items:center;gap:5px;font-size:11px;color:var(--dim);cursor:pointer">
+        <input type="checkbox" id="orbisChk" onchange="toggleOrbis()"> Forum&nbsp;Orbis
+      </label>
     </div>
     <button class="ghost" id="logoutBtn" style="padding:6px 12px;font-size:12px">Quitter</button>
   </div>
@@ -13154,6 +13307,60 @@ async function jpost(url,obj){
   finally{ loadEnd(); }
 }
 
+/* ---------- Sélecteur de SERVEUR (mémoire multi-serveur) ---------- */
+let GUILD = localStorage.getItem('tnbGuild') || '';   // '' = tous serveurs
+let GUILDS = [];                                       // options connues
+let HOME_GUILD = '';
+/* Ajoute ?guild=… (ou &guild=…) à une URL d'API quand un serveur est sélectionné. */
+function gq(url){
+  if(!GUILD) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'guild=' + encodeURIComponent(GUILD);
+}
+function renderGuildSel(guilds, home){
+  if(guilds){ GUILDS = guilds; }
+  if(home !== undefined){ HOME_GUILD = home || ''; }
+  const sel = $('#guildSel'); if(!sel) return;
+  let html = '<option value="">Tous les serveurs</option>';
+  for(const g of GUILDS){
+    const tags = (g.home?' ⌂':'') + (g.forum_orbis?' 🌐':'') + (g.present?'':' (absent)');
+    html += '<option value="'+g.gid+'"'+(String(g.gid)===String(GUILD)?' selected':'')+'>'+esc(g.name)+tags+'</option>';
+  }
+  sel.innerHTML = html;
+  if(GUILD && !GUILDS.some(g=>String(g.gid)===String(GUILD))){ GUILD=''; localStorage.removeItem('tnbGuild'); }
+  sel.value = GUILD;
+  updateOrbisToggle();
+}
+function updateOrbisToggle(){
+  const tog = $('#orbisTog'), chk = $('#orbisChk');
+  if(!tog || !chk) return;
+  const g = GUILDS.find(x=>String(x.gid)===String(GUILD));
+  if(!GUILD || !g){ tog.style.display='none'; return; }
+  tog.style.display='flex';
+  chk.checked = !!g.forum_orbis;
+}
+async function onGuildChange(){
+  GUILD = $('#guildSel').value || '';
+  if(GUILD) localStorage.setItem('tnbGuild', GUILD); else localStorage.removeItem('tnbGuild');
+  updateOrbisToggle();
+  reloadCurrentView();
+}
+async function toggleOrbis(){
+  if(!GUILD) return;
+  const val = $('#orbisChk').checked;
+  const {status, body} = await jpost('/admin/api/guild_settings', {gid:GUILD, key:'forum_orbis', value:val});
+  if(status!==200){ alert(body.error||'Échec'); $('#orbisChk').checked=!val; return; }
+  const g = GUILDS.find(x=>String(x.gid)===String(GUILD)); if(g) g.forum_orbis = val;
+  if(body.home_guild!==undefined){ HOME_GUILD = body.home_guild||''; }
+  renderGuildSel();
+}
+/* Recharge la vue active après un changement de serveur. */
+function reloadCurrentView(){
+  if(view==='dash') loadDash();
+  else if(view==='conv'){ refreshState(); if(current) refreshThread(); }
+  else if(view==='mem') loadMemories();
+  else if(view==='search'){ const q=$('#q'); if(q && q.value) doSearch(); }
+}
+
 /* Bouton occupé : il se désactive et tourne pendant que la requête vit. */
 async function busy(el, fn, texte){
   const b = (typeof el === 'string') ? $(el) : el;
@@ -13223,9 +13430,13 @@ function taskFollow(id, label, apres){
 }
 
 /* ---------- Auth ---------- */
+async function populateGuilds(){
+  const {status, body} = await jget('/admin/api/state');   /* sans filtre : liste complète */
+  if(status===200) renderGuildSel(body.guilds, body.home_guild);
+}
 async function tryEnter(){
   const {status} = await jget('/admin/api/state');
-  if(status===200){ showApp(); switchView('dash'); startTimers(); }
+  if(status===200){ showApp(); await populateGuilds(); switchView('dash'); startTimers(); }
   else showLogin();
 }
 function showLogin(){ $('#login').classList.remove('hidden'); $('#app').classList.add('hidden'); stopTimers(); }
@@ -13311,8 +13522,9 @@ function fromGraph(uid){ switchView('conv'); openThread(uid); }
 
 /* ---------- Liste conversations ---------- */
 async function refreshState(){
-  const {status, body} = await jget('/admin/api/state');
+  const {status, body} = await jget(gq('/admin/api/state'));
   if(status!==200){ if(status===401) showLogin(); return; }
+  renderGuildSel(body.guilds, body.home_guild);
   renderList(body.users);
 }
 /* Où parle la personne ? Message privé, ou salon d'un serveur ? */
@@ -13398,7 +13610,7 @@ function ficheHTML(b){
 
 async function refreshThread(){
   if(!current) return;
-  const {status, body} = await jget('/admin/api/thread?uid='+current);
+  const {status, body} = await jget(gq('/admin/api/thread?uid='+current));
   if(status!==200){ if(status===401) showLogin(); return; }
   curMeta = body;
   $('#head').classList.remove('hidden');
@@ -13458,7 +13670,7 @@ async function addNote(){
   const t = txt.trim(); if(!t) return;
   let imp = (window.prompt('Importance ? faible / normale / haute', 'normale')||'normale').trim().toLowerCase();
   if(['faible','normale','haute'].indexOf(imp)<0) imp='normale';
-  const {status} = await jpost('/admin/api/note', {uid: current, text: t, importance: imp, category: 'note admin'});
+  const {status} = await jpost('/admin/api/note', {uid: current, text: t, importance: imp, category: 'note admin', guild: GUILD});
   if(status===200) refreshThread();
 }
 async function delNote(i){
@@ -13515,20 +13727,31 @@ $('#q').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 
 /* ---------- Mémoire ---------- */
 async function loadMemories(){
-  const {status, body} = await jget('/admin/api/memories');
+  const {status, body} = await jget(gq('/admin/api/memories'));
   const box = $('#memList');
   if(status!==200){ if(status===401) showLogin(); return; }
-  if(!body.memories.length){ box.innerHTML='<div style="color:var(--dim)">Mémoire vide.</div>'; return; }
+  if(!body.memories.length){ box.innerHTML='<div style="color:var(--dim)">Mémoire vide'+(GUILD?' pour ce serveur':'')+'.</div>'; return; }
   box.innerHTML = body.memories.map(m =>
     '<div class="memrow"><span class="mc'+(m.directive?' dir':'')+'">'+esc(m.category)+'</span>'+
-    '<div class="mt">'+esc(m.text)+'<div class="nd" style="color:var(--dim);font-size:11px">'+esc(m.date)+'</div></div>'+
+    '<div class="mt">'+esc(m.text)+'<div class="nd" style="color:var(--dim);font-size:11px">'+esc(m.date)+guildTag(m.guild)+'</div></div>'+
     '<button class="mini ghost" onclick="editMem('+m.i+')">Éditer</button>'+
     '<button class="mini ghost" onclick="delMem('+m.i+')">🗑</button></div>').join('');
+}
+/* Étiquette du serveur d'origine (affichée surtout en vue « tous serveurs »). */
+function guildName(gid){
+  if(!gid) return '';
+  const g = GUILDS.find(x=>String(x.gid)===String(gid));
+  return g ? g.name : gid;
+}
+function guildTag(gid){
+  if(GUILD) return '';                 /* déjà filtré sur un serveur : inutile */
+  const nm = gid ? guildName(gid) : (HOME_GUILD ? 'hérité › '+guildName(HOME_GUILD) : 'hérité');
+  return ' · <span style="color:var(--accent,#8a7bff)">🌐 '+esc(nm)+'</span>';
 }
 async function addMem(){
   const inp = $('#newMem'); const t = inp.value.trim();
   if(!t) return;
-  const {status} = await jpost('/admin/api/memory', {text: t});
+  const {status} = await jpost('/admin/api/memory', {text: t, guild: GUILD});
   if(status===200){ inp.value=''; loadMemories(); }
   else if(status===401) showLogin();
 }
@@ -14100,7 +14323,7 @@ async function loadAdminUsers(){
 }
 
 async function openUser(uid){
-  const {status, body} = await jget('/admin/api/user?uid='+encodeURIComponent(uid));
+  const {status, body} = await jget(gq('/admin/api/user?uid='+encodeURIComponent(uid)));
   if(status!==200){ toast((body&&body.error)||'Introuvable.', true); return; }
   const impColor = {faible:'#888', normale:'#c9a227', haute:'#c96a27'};
   const notesHtml = (body.notes||[]).map(n =>
@@ -14169,7 +14392,7 @@ async function clearNotes(uid){
 async function addNote(uid){
   const t = $('#newNote').value.trim();
   if(!t) return;
-  const {status} = await jpost('/admin/api/user', {uid, action:'add_note', texte:t, importance:'haute'});
+  const {status} = await jpost('/admin/api/user', {uid, action:'add_note', texte:t, importance:'haute', guild: GUILD});
   if(status===200){ openUser(uid); toast('Note ajoutée (permanente).'); }
 }
 async function toggleAdmin(uid, val){
@@ -14581,13 +14804,14 @@ async def on_message(message):
         # Si non (simple conversation), VOIX est en place → court, tranché, humain.
         send_tools = tools_needed(content, user_id)
 
+        _gid_here = getattr(message.guild, "id", None)
         if mschap_user:
             system_prompt = build_system_prompt_mschap(
-                days_away, guild_ctx, content, others_ctx, user_ctx, voix=not send_tools
+                days_away, guild_ctx, content, others_ctx, user_ctx, voix=not send_tools, guild_id=_gid_here
             )
         else:
             system_prompt = build_system_prompt_other(
-                display_name or username, guild_ctx, user_ctx, others_ctx, content, voix=not send_tools
+                display_name or username, guild_ctx, user_ctx, others_ctx, content, voix=not send_tools, guild_id=_gid_here
             )
 
         past = summaries.get(user_id)
@@ -14820,7 +15044,7 @@ async def rapport(ctx):
             "Fais ton rapport à Mschap, ton Maître, avec ta personnalité de Tenebris : "
             "raconte l'état de son domaine, ce qui bouge, ce qui dort, ton avis. Court et vivant. N'invente rien."
         )
-        system = build_system_prompt_mschap(0, get_guild_context(ctx.message), voix=False)
+        system = build_system_prompt_mschap(0, get_guild_context(ctx.message), voix=False, guild_id=getattr(ctx.guild, "id", None))
         text, _ = await chat_with_tools(system, [{"role": "user", "content": prompt}], ctx.guild, tools=None)
     for chunk in smart_split(text):
         await ctx.send(chunk)
@@ -14840,7 +15064,7 @@ async def scan(ctx, channel_name: str = None, limit: int = SCAN_DEFAULT_LIMIT):
             f"Tu viens de lire un salon. Voici le résultat brut:\n\n{result[:TOOL_RESULT_MAX_CHARS]}\n\n"
             "Raconte à Mschap ce que tu as trouvé : les sujets, l'ambiance, ce qui t'a marquée. N'invente rien."
         )
-        system = build_system_prompt_mschap(0, get_guild_context(ctx.message), voix=False)
+        system = build_system_prompt_mschap(0, get_guild_context(ctx.message), voix=False, guild_id=getattr(ctx.guild, "id", None))
         text, _ = await chat_with_tools(system, [{"role": "user", "content": prompt}], ctx.guild, tools=None)
     for chunk in smart_split(text):
         await ctx.send(chunk)
@@ -15203,9 +15427,10 @@ async def remember(ctx, *, text):
     if not is_mschap(ctx.author.id, ctx.author.name):
         await ctx.send("Ma mémoire ne t'appartient pas.")
         return
-    if add_memory(text, "manuel"):
+    if add_memory(text, "manuel", guild_id=getattr(ctx.guild, "id", None)):
         await flush_memory()
-        await ctx.send(f"🧠 Noté, Maître. Je n'oublierai pas : *{text}*")
+        port = " (ce serveur)" if ctx.guild else ""
+        await ctx.send(f"🧠 Noté, Maître{port}. Je n'oublierai pas : *{text}*")
     else:
         await ctx.send("👁️ Je le savais déjà.")
 
@@ -15217,14 +15442,14 @@ async def consigne(ctx, *, text: str = None):
         await ctx.send("Mes consignes ne viennent que de mon Maître.")
         return
     if not text:
-        current = get_directives()
+        current = get_directives(getattr(ctx.guild, "id", None))
         if current:
-            for chunk in smart_split(f"📜 **Mes consignes permanentes :**\n{current}"):
+            for chunk in smart_split(f"📜 **Mes consignes permanentes (ce serveur) :**\n{current}"):
                 await ctx.send(chunk)
         else:
             await ctx.send("📜 Aucune consigne pour l'instant. Donne-m'en une : `²T consigne <texte>`.")
         return
-    if add_memory(text, DIRECTIVE_CATEGORY):
+    if add_memory(text, DIRECTIVE_CATEGORY, guild_id=getattr(ctx.guild, "id", None)):
         await flush_memory()
         schedule_directive_reconcile("commande consigne")
         await ctx.send(f"📜 Gravé, Maître. Je m'y tiendrai : *{text}*")
@@ -15237,14 +15462,18 @@ async def memories(ctx, category: str = None):
     if not is_mschap(ctx.author.id, ctx.author.name):
         await ctx.send("Accès refusé.")
         return
-    mems = memory()["memories"]
+    _gid = getattr(ctx.guild, "id", None)
+    # Index RÉEL conservé (position dans la liste complète) pour que ²T forget vise juste,
+    # mais on n'affiche que les souvenirs DE CE SERVEUR (multi-serveur).
+    mems = [(i, m) for i, m in enumerate(memory()["memories"]) if _note_visible_on(m, _gid)]
     if category:
-        mems = [m for m in mems if m.get("category") == category.lower()]
+        mems = [(i, m) for i, m in mems if m.get("category") == category.lower()]
     if not mems:
-        await ctx.send("📭 Rien dans cette mémoire-là.")
+        await ctx.send("📭 Rien dans cette mémoire-là (pour ce serveur).")
         return
-    text = "\n".join(f"`{i}` [{m.get('category','?')}] {m['text']}" for i, m in enumerate(mems))
-    for chunk in smart_split(f"🧠 **Mes souvenirs ({len(mems)}):**\n{text}"):
+    portee = "ce serveur" if _gid else "tous serveurs"
+    text = "\n".join(f"`{i}` [{m.get('category','?')}] {m['text']}" for i, m in mems)
+    for chunk in smart_split(f"🧠 **Mes souvenirs ({len(mems)} · {portee}):**\n{text}"):
         await ctx.send(chunk)
 
 @tenebris.command(name="forget", description="Oublie un souvenir précis ou tous (Maître uniquement)")
@@ -15258,11 +15487,19 @@ async def forget(ctx, index: str = None):
         await ctx.send("Précise : `²T forget <numéro>` (voir `²T memories`) ou `²T forget all`.")
         return
     if index.lower() == "all":
-        count = len(mem["memories"])
-        mem["memories"] = []
+        _gid = getattr(ctx.guild, "id", None)
+        if _gid:   # dans un serveur → on n'efface QUE les souvenirs de ce serveur
+            before = len(mem["memories"])
+            mem["memories"] = [m for m in mem["memories"] if not _note_visible_on(m, _gid)]
+            count = before - len(mem["memories"])
+            portee = "de ce serveur"
+        else:      # en MP → table rase globale
+            count = len(mem["memories"])
+            mem["memories"] = []
+            portee = "(tous serveurs)"
         mark_memory_dirty()
         await flush_memory()
-        await ctx.send(f"🗑️ {count} souvenirs effacés. Table rase.")
+        await ctx.send(f"🗑️ {count} souvenirs effacés {portee}.")
         return
     try:
         removed = mem["memories"].pop(int(index))
@@ -15277,6 +15514,7 @@ async def list_users(ctx):
     if not is_mschap(ctx.author.id, ctx.author.name):
         await ctx.send("Accès refusé.")
         return
+    _gid = getattr(ctx.guild, "id", None)
     users = memory()["users"]
     others = {uid: u for uid, u in users.items() if not is_mschap(int(uid), u.get("username"))}
     if not others:
@@ -15284,10 +15522,11 @@ async def list_users(ctx):
         return
     text = "\n".join(
         f"• {u.get('display_name') or u.get('username','?')} — {u['interactions']} interactions, "
-        f"{len(u.get('notes', []))} note(s), vu le {u.get('last_seen','?')}"
+        f"{len(_notes_here(u.get('notes', []), _gid))} note(s) ici, vu le {u.get('last_seen','?')}"
         for u in others.values()
     )
-    for chunk in smart_split(f"👥 **Utilisateurs (hors toi, le Maître) :**\n{text}"):
+    portee = "ce serveur" if _gid else "tous serveurs"
+    for chunk in smart_split(f"👥 **Utilisateurs (hors toi · notes sur {portee}) :**\n{text}"):
         await ctx.send(chunk)
 
 @tenebris.command(name="apropos", description="Ce que Tenebris sait sur une personne précise (Maître uniquement)")
@@ -15308,7 +15547,7 @@ async def apropos(ctx, *, name: str = None):
     if not rec:
         await ctx.send(f"Je n'ai encore rien noté sur {member.display_name}.")
         return
-    notes = rec.get("notes", [])
+    notes = _notes_here(rec.get("notes", []), getattr(ctx.guild, "id", None))   # notes DE CE serveur
     header = (f"👤 **{member.display_name}** — {rec.get('interactions', 0)} interactions, "
               f"vu le {rec.get('last_seen', '?')}")
     if notes:
