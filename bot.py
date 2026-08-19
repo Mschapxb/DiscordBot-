@@ -7540,7 +7540,13 @@ FORUM_INTERNAL_DIRECTIVE = (
     "interne (tes notes sur ce membre). Si tu ne connais pas cette personne, tu le dis simplement "
     "(« je connais pas ce membre », « j'ai rien sur lui ») — tu ne vas PAS sur le forum et tu "
     "n'inventes rien. On n'ouvre le forum que si on te le demande explicitement (« sur le forum », "
-    "un lien, « Orbis Naturae », l'univers/le RP)."
+    "un lien, « Orbis Naturae », l'univers/le RP).\n"
+    "TON — tu réponds COMME UN HUMAIN sur Discord, pas comme un rapport. Une ou deux phrases qui "
+    "coulent, à l'oral, dans ta voix. INTERDIT ICI : les titres « ### », le gras de rubrique, les "
+    "listes à puces, les sections « À vérifier / Sources », les recommandations numérotées. Tu ne "
+    "cites pas tes « souvenirs » comme des pièces à conviction : tu dis juste ce que tu sais de la "
+    "personne, naturellement, comme si tu parlais d'une connaissance. Si tu ne sais pas, une phrase "
+    "détendue suffit — pas un compte rendu d'enquête."
 )
 
 # Directive injectée quand le forum Orbis est DÉSACTIVÉ sur ce serveur.
@@ -14843,6 +14849,11 @@ async def on_message(message):
                     tools_for_user = [t for t in tools_for_user
                                       if t["function"]["name"] not in FORUM_LOOKUP_TOOLS]
                 system_prompt += FORUM_INTERNAL_DIRECTIVE
+                # Pas du forum → c'est une vraie discussion : on remet le ton Discord
+                # naturel (retiré plus haut parce que le message a déclenché le mode outil),
+                # pour qu'elle réponde humainement et non en rapport. Sauf en pleine scène RP.
+                if route != "roleplay" and NATUREL_DISCORD not in system_prompt:
+                    system_prompt += "\n\n" + NATUREL_DISCORD
         else:
             system_prompt += ORBIS_OFF_DIRECTIVE
 
