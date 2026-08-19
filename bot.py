@@ -975,13 +975,15 @@ def search_memories(keyword, guild=None, caller_id=None, caller_is_mschap=False)
                            f"- ({m['date'][:10]}) [{m.get('category','?')}] {m['text']}"))
     present = {str(m.id) for m in getattr(guild, "members", [])} if guild is not None else set()
     caller_uid = str(caller_id) if caller_id is not None else None
+    _gid = getattr(guild, "id", None)
     for uid, rec in memory()["users"].items():
         # Égalité d'accès, mais on n'évoque jamais quelqu'un d'absent du serveur.
         if not (caller_is_mschap or uid == caller_uid or uid in present):
             continue
         name = rec.get("display_name") or rec.get("username") or uid
         name_hit = 4.0 if (kw and kw in _fold(name)) else 0.0
-        for n in rec.get("notes", []):
+        # Cloisonnement : une note n'est trouvée que sur son serveur d'origine.
+        for n in _notes_here(rec.get("notes", []), _gid):
             s = name_hit + _score(n["text"])
             if s:
                 scored.append((s, n.get("date", ""),
@@ -1710,9 +1712,11 @@ def flag_note_obsolete(cible, texte_conteste, reporter_id, is_guild=False):
     print(f"⚠️ Note signalée caduque ({len(flaggers)}/{FLAG_THRESHOLD}) : {best.get('text','')[:60]}")
     return f"signalee:{manque}"       # combien de confirmations il manque encore
 
-def add_user_note(user_id, text, category="observation", importance="normale", author="IA", context="", confidence="normale"):
+def add_user_note(user_id, text, category="observation", importance="normale", author="IA", context="", confidence="normale", guild_id=None):
     """Mémorise un fait sur un utilisateur, avec métadonnées (§4).
-    Une note = {date, modified, text, category, importance, author}.
+    Une note = {date, modified, text, category, importance, author, guild}.
+    Le champ `guild` (serveur d'origine) assure le cloisonnement : une note apprise
+    sur un serveur n'est lue ni citée sur un autre (voir _note_visible_on).
     Le seuil d'importance (§6) ne s'applique qu'aux notes prises par l'IA."""
     text = text.strip()
     if not text:
@@ -1723,11 +1727,14 @@ def add_user_note(user_id, text, category="observation", importance="normale", a
         if IMPORTANCE_ORDER.get(importance, 1) < IMPORTANCE_ORDER.get(threshold, 1):
             return False
     rec = _user_record(str(user_id))
+    gtag = str(guild_id) if guild_id else ""
     # Note déjà connue ? On ne la jette pas : on la RECONFIRME (elle rajeunit et gagne en survie).
     for n in rec["notes"]:
         if _too_similar(n.get("text", ""), text):
             n["date"] = now().strftime("%Y-%m-%d %H:%M")     # rajeunit → repart pour un cycle d'oubli
             n["reviews"] = n.get("reviews", 0) + 1
+            if gtag and not n.get("guild"):
+                n["guild"] = gtag        # une note héritée gagne son serveur d'origine à la reconfirmation
             # une reconfirmation peut relever l'importance, jamais l'abaisser
             if IMPORTANCE_ORDER.get(importance, 1) > IMPORTANCE_ORDER.get(n.get("importance", "normale"), 1):
                 n["importance"] = importance
@@ -1743,6 +1750,7 @@ def add_user_note(user_id, text, category="observation", importance="normale", a
         "reviews": 0,
         "context": context[:200] if context else "",   # d'où vient l'info (salon, sujet abordé…)
         "confidence": confidence if confidence in ("faible", "normale", "haute") else "normale",
+        "guild": gtag,                                   # serveur d'origine (cloisonnement)
     })
     # Plus de troncature à 8 : on ne coupe qu'au plafond de SÉCURITÉ, et en enlevant
     # d'abord les notes les moins importantes / les plus vieilles (pas juste les premières).
@@ -1916,10 +1924,29 @@ def _time_gap_phrase(last_seen):
         return f"ça fait un bon moment — environ {int(round(days / 7))} semaine(s) sans se croiser"
     return "ça faisait très longtemps que vous ne vous étiez pas parlé"
 
+# ============================================================
+# CLOISONNEMENT DES NOTES PAR SERVEUR
+# Une note apprise sur un serveur n'est lue ni citée sur un autre. Les notes
+# héritées (sans champ `guild`) appartiennent au serveur d'attache (Orbis) ; tant
+# qu'aucun serveur d'attache n'est défini, on n'isole pas (compatibilité ascendante).
+# ============================================================
+def _note_visible_on(note, guild_id):
+    g = (note.get("guild") if isinstance(note, dict) else "") or ""
+    home = get_setting("home_guild_id")
+    eff = str(guild_id) if guild_id else (str(home) if home else "")
+    if not g:
+        return (not home) or (eff == str(home))
+    return eff == g
+
+def _notes_here(notes, guild_id):
+    """Ne garde que les notes visibles sur ce serveur (cloisonnement)."""
+    return [n for n in (notes or []) if _note_visible_on(n, guild_id)]
+
 def get_user_context(user_id, member=None, guild=None):
     """Résumé de ce que Tenebris sait sur CETTE personne précise. Structuré pour la COHÉRENCE :
     posture calculée sur sa mémoire, faits SÛRS séparés des IMPRESSIONS, doublons écartés à la lecture."""
     rec = memory()["users"].get(str(user_id))
+    _gid = getattr(guild, "id", None)
     lines = []
     rang = statut_membre(member, guild)
     if rang:
@@ -1943,7 +1970,7 @@ def get_user_context(user_id, member=None, guild=None):
         lines.append(prof_block)
 
     # Fraîcheur à la lecture, puis on montre l'extrait pertinent, EN SÉPARANT le sûr du tentatif.
-    notes = _dedup_for_context(rec.get("notes", []))
+    notes = _dedup_for_context(_notes_here(rec.get("notes", []), _gid))
     montrees = _notes_for_context(notes, NOTES_IN_CONTEXT)
     solides = [n for n in montrees if _note_is_solid(n)]
     molles = [n for n in montrees if not _note_is_solid(n)]
@@ -1977,7 +2004,7 @@ def member_notes_block(guild, members):
         rec = memory()["users"].get(uid)
         if not rec:
             continue
-        notes = rec.get("notes", [])
+        notes = _notes_here(rec.get("notes", []), guild.id)   # cloisonnement par serveur
         nom = getattr(mb, "display_name", None) or rec.get("display_name") or rec.get("username") or uid
         titre = rec.get("titre")
         entete = nom + (f" (titre : {titre})" if titre else "")
@@ -2019,7 +2046,7 @@ def get_cross_user_context(guild, exclude_user_id=None):
     for uid, rec in memory()["users"].items():
         if uid == exclude or uid not in present_ids:
             continue
-        notes = rec.get("notes", [])
+        notes = _notes_here(rec.get("notes", []), guild.id)   # cloisonnement par serveur
         if not notes:
             continue
         member = present_ids[uid]
@@ -2217,6 +2244,48 @@ def set_settings(patch):
             st[k] = v
     mark_memory_dirty()
     return get_settings()
+
+# ============================================================
+# RÉGLAGES PAR SERVEUR — chaque serveur Discord a ses propres options.
+# Aujourd'hui : "forum_orbis" (active/désactive tout ce qui touche au forum
+# Orbis Naturae : outils de fouille, surveillance, et la priorité forum sur les
+# questions d'univers). Désactivé par défaut — on l'allume serveur par serveur.
+# ============================================================
+DEFAULT_GUILD_SETTINGS = {
+    "forum_orbis": False,   # fonctions liées au forum Orbis Naturae sur CE serveur
+}
+
+def get_guild_settings(guild_id):
+    """Options effectives d'un serveur. En MP (guild_id None), on hérite des options
+    du serveur d'attache (celui où le forum Orbis a été allumé en premier) : c'est là
+    que le Maître discute de son univers en privé."""
+    base = dict(DEFAULT_GUILD_SETTINGS)
+    gid = guild_id
+    if gid is None:
+        home = get_setting("home_guild_id")
+        gid = home if home else None
+    if gid is None:
+        return base
+    g = memory().get("guilds", {}).get(str(gid), {})
+    base.update(g.get("settings", {}) or {})
+    return base
+
+def get_guild_setting(guild_id, key, default=None):
+    val = get_guild_settings(guild_id).get(key, default)
+    return val if val is not None else default
+
+def set_guild_setting(guild_id, key, value):
+    """Écrit une option sur un serveur précis. Le PREMIER serveur où l'on active
+    forum_orbis devient le « serveur d'attache » (home_guild_id) : c'est lui qui
+    hérite des anciennes notes sans origine et qui sert de repli en MP."""
+    rec = _guild_record(guild_id)
+    st = rec.setdefault("settings", {})
+    st[key] = value
+    if key == "forum_orbis" and value and not get_setting("home_guild_id"):
+        memory().setdefault("settings", {})["home_guild_id"] = str(guild_id)
+        print(f"🏠 Serveur d'attache Orbis défini : {guild_id}")
+    mark_memory_dirty()
+    return get_guild_settings(guild_id)
 
 def list_admins():
     return list(memory().get("admins", []))
@@ -6017,7 +6086,8 @@ async def _observe_guild_inner(guild, per_channel, max_authors, max_channels, fo
                     continue
                 rep["proposees"] += 1
                 imp = f.get("importance", "normale") if isinstance(f, dict) else "normale"
-                if add_user_note(member.id, text, category="observation", importance=imp, author="IA"):
+                if add_user_note(member.id, text, category="observation", importance=imp, author="IA",
+                                 guild_id=getattr(guild, "id", None)):
                     rep["notes"] += 1
                 else:
                     rep["filtrees"] += 1
@@ -7442,6 +7512,34 @@ MSCHAP_ONLY_TOOLS = ELEVATED_TOOLS  # alias rétro-compatible
 PUBLIC_TOOL_NAMES = {t["function"]["name"] for t in TOOLS} - ELEVATED_TOOLS
 PUBLIC_TOOLS = [t for t in TOOLS if t["function"]["name"] in PUBLIC_TOOL_NAMES]
 
+# Outils liés au forum Orbis Naturae : retirés sur les serveurs où l'option
+# forum_orbis est désactivée (option par serveur, cf. get_guild_setting).
+ORBIS_TOOL_NAMES = {"fouiller_forum", "consulter_forum", "surveiller_forum",
+                    "lister_missions", "arreter_mission"}
+
+def filter_tools_for_guild(tools, orbis_on):
+    """Retire les outils Orbis quand le forum n'est pas actif sur ce serveur."""
+    if not tools or orbis_on:
+        return tools
+    return [t for t in tools if t["function"]["name"] not in ORBIS_TOOL_NAMES]
+
+# Directive injectée quand le forum Orbis est ACTIF : « qui est X ? » → forum d'abord.
+FORUM_FIRST_DIRECTIVE = (
+    "\n\nPRIORITÉ FORUM (Orbis Naturae). Quand on te demande QUI EST quelqu'un, ou de parler d'un "
+    "personnage, d'un lieu, d'une faction, d'une créature ou de tout élément d'univers : ton TOUT "
+    "PREMIER réflexe est fouiller_forum — le forum officiel en ligne, la source qui fait autorité. "
+    "Tu ne te rabats sur tes notes internes d'un MEMBRE Discord (apropos_membre / ta mémoire) QUE si "
+    "le forum ne renvoie rien, OU s'il est manifeste qu'on parle de la personne réelle derrière "
+    "l'écran et non de son personnage. Forum d'abord, mémoire interne ensuite."
+)
+
+# Directive injectée quand le forum Orbis est DÉSACTIVÉ sur ce serveur.
+ORBIS_OFF_DIRECTIVE = (
+    "\n\nCE SERVEUR N'EST PAS rattaché au forum Orbis Naturae : tu n'as pas accès au forum ici, tu "
+    "n'en parles pas, tu ne proposes pas d'aller le consulter et tu ne mobilises pas son univers. "
+    "Tu restes sur ce qui concerne ce serveur-ci."
+)
+
 async def execute_tool(name, args, guild, caller_id=None, caller_name=None, caller_channel_id=None):
     here = bot.get_channel(caller_channel_id) if caller_channel_id else None
     """Exécute un outil demandé par le modèle. caller = qui parle (pour le cloisonnement mémoire)."""
@@ -7585,7 +7683,7 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             if member is None:
                 return f"Je ne trouve personne qui corresponde à « {who} » sur le serveur."
             touch_user(member.id, member.name, member.display_name)
-            if add_user_note(member.id, fait):
+            if add_user_note(member.id, fait, guild_id=getattr(guild, "id", None)):
                 return f"✅ Retenu sur {member.display_name}: {fait}"
             return f"Je le savais déjà sur {member.display_name}."
         if name == "apropos_membre":
@@ -7608,7 +7706,8 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
                 return f"« {who} » n'est pas sur ce serveur — je n'évoque pas les absents."
             if not rec:
                 return f"Aucune note sur « {who} » pour l'instant."
-            notes = rec.get("notes", [])
+            # Cloisonnement : on ne restitue que les notes apprises sur CE serveur.
+            notes = _notes_here(rec.get("notes", []), getattr(guild, "id", None))
             head = f"{label} — {rec.get('interactions', 0)} interactions, vu le {rec.get('last_seen', '?')}"
             if not notes:
                 return head + "\n(aucune note)"
@@ -8386,7 +8485,8 @@ async def learn_from_chatter(cid, guild):
                     if not texte:
                         continue
                     imp = f.get("importance", "normale") if isinstance(f, dict) else "normale"
-                    if add_user_note(uid, texte, category="écoute", importance=imp, author="IA"):
+                    if add_user_note(uid, texte, category="écoute", importance=imp, author="IA",
+                                     guild_id=getattr(guild, "id", None)):
                         print(f"👂 Apprise sur {d['nom']} : {texte[:80]}")
             except Exception as e:
                 if note_quota_error(e):
@@ -9271,7 +9371,7 @@ DIRECTIVE_CLAUSE = (
     "devient la consigne « Ne jamais se nommer IA ». Ces consignes sont importantes, ne les rate pas."
 )
 
-async def auto_extract_memories(history, user_id=None, subject_name=None, username=None):
+async def auto_extract_memories(history, user_id=None, subject_name=None, username=None, guild_id=None):
     """Extrait des faits d'une conversation et les range sous l'identité de la personne.
 
     ÉGALITÉ : les faits de chacun (Mschap inclus) vont dans SES notes.
@@ -9337,6 +9437,7 @@ async def auto_extract_memories(history, user_id=None, subject_name=None, userna
                     author="IA",
                     context=f.get("context", ""),
                     confidence=f.get("confidence", "normale"),
+                    guild_id=guild_id,
                 ) else 0
 
         if dir_added:
@@ -14538,6 +14639,17 @@ async def on_message(message):
         else:
             tools_for_user = PUBLIC_TOOLS if send_tools else None
 
+        # Option PAR SERVEUR : le forum Orbis Naturae est-il actif ici ?
+        #  - Actif   → outils forum disponibles + priorité forum sur « qui est X ? ».
+        #  - Inactif → on retire les outils forum et on lui dit de ne pas mobiliser Orbis.
+        # En MP (guild None), on hérite du serveur d'attache (get_guild_setting).
+        orbis_on = get_guild_setting(getattr(message.guild, "id", None), "forum_orbis", False)
+        tools_for_user = filter_tools_for_guild(tools_for_user, orbis_on)
+        if orbis_on:
+            system_prompt += FORUM_FIRST_DIRECTIVE
+        else:
+            system_prompt += ORBIS_OFF_DIRECTIVE
+
         # Conseil intérieur : sur une vraie question, deux agents délibèrent d'abord
         # (proposition → critique) et Tenebris rédige la révision finale dans sa voix.
         # On ne délibère pas quand un outil doit d'abord aller chercher les données
@@ -14608,7 +14720,8 @@ async def on_message(message):
         if msg_counters[user_id] >= threshold:
             msg_counters[user_id] = 0
             asyncio.create_task(
-                auto_extract_memories(conversations[user_id], user_id, display_name or username, username)
+                auto_extract_memories(conversations[user_id], user_id, display_name or username, username,
+                                      guild_id=getattr(message.guild, "id", None))
             )
 
         # Fil affectif : son humeur du moment glisse au gré des échanges (throttlé en interne,
@@ -14828,6 +14941,53 @@ async def rp_cmd(ctx, etat: str = None):
                        f"les moins bridés ({' → '.join(LLM_ROUTES['roleplay'])}), sans rompre l'immersion.")
     else:
         await ctx.send("👁️ Retour au monde réel : ce salon repasse en conversation normale.")
+
+
+@bot.command(name="orbis", help="Active/désactive les fonctions du forum Orbis Naturae sur CE serveur (Maître)")
+async def orbis_cmd(ctx, etat: str = None):
+    """²T orbis [on|off] — active ou coupe, POUR CE SERVEUR, tout ce qui touche au forum
+    Orbis Naturae : fouille et consultation du forum, surveillance, et la priorité forum
+    sur les questions « qui est X ? / parle-moi de… ». Désactivé par défaut."""
+    if not is_mschap(ctx.author.id, ctx.author.name):
+        await ctx.send("Cette clé n'appartient qu'à mon Maître.")
+        return
+    if ctx.guild is None:
+        await ctx.send("À utiliser sur un serveur (l'option est propre à chaque serveur).")
+        return
+    cur = get_guild_setting(ctx.guild.id, "forum_orbis", False)
+    if not etat:
+        etat_txt = "**activé** 🌐" if cur else "**désactivé** ⛓️"
+        await ctx.send(
+            f"Forum Orbis Naturae : {etat_txt} sur *{ctx.guild.name}*.\n"
+            f"`²T orbis on` pour l'activer · `²T orbis off` pour le couper."
+        )
+        return
+    e = etat.strip().lower()
+    if e in ("on", "oui", "1", "true", "actif", "active", "activer"):
+        val = True
+    elif e in ("off", "non", "0", "false", "inactif", "desactiver", "couper"):
+        val = False
+    else:
+        await ctx.send("Précise `on` ou `off`.")
+        return
+    set_guild_setting(ctx.guild.id, "forum_orbis", val)
+    audit_log("forum_orbis", f"{'activé' if val else 'désactivé'} sur {ctx.guild.name}",
+              actor=ctx.author.name)
+    if val:
+        home = get_setting("home_guild_id")
+        note_home = ""
+        if str(home) == str(ctx.guild.id):
+            note_home = (" C'est aussi mon **serveur d'attache** : les anciennes notes sans origine "
+                         "lui reviennent, et j'y réponds même en MP.")
+        await ctx.send(
+            f"🖤 Forum Orbis Naturae **activé** sur *{ctx.guild.name}*. Je fouille le forum, je le "
+            f"surveille, et je réponds forum d'abord sur les questions d'univers.{note_home}"
+        )
+    else:
+        await ctx.send(
+            f"⛓️ Forum Orbis Naturae **désactivé** sur *{ctx.guild.name}*. Je ne touche plus au "
+            f"forum ici et je n'en parle pas."
+        )
 
 
 @bot.command(name="onboard", help="Crée les fiches des membres et observe le serveur (Maître uniquement)")
