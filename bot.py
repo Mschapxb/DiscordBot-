@@ -2149,11 +2149,13 @@ def resolve_member(guild, name):
         found = discord.utils.find(lambda m: m.id == uid, guild.members)
         if found:
             return found
-    clean = raw.lstrip("@").lower()
+    # Matching INSENSIBLE AUX ACCENTS (via _fold) : « mael34 » retrouve « Maël34 »,
+    # « leo » retrouve « Léo ». Sinon un simple tréma casse la reconnaissance.
+    clean = _fold(raw.lstrip("@"))
     return discord.utils.find(
-        lambda m: clean in (m.display_name.lower(), m.name.lower()), guild.members
+        lambda m: clean in (_fold(m.display_name), _fold(m.name)), guild.members
     ) or discord.utils.find(
-        lambda m: clean in m.display_name.lower() or clean in m.name.lower(), guild.members
+        lambda m: clean in _fold(m.display_name) or clean in _fold(m.name), guild.members
     )
 
 def named_members_in_text(guild, content, already=()):
@@ -2163,7 +2165,8 @@ def named_members_in_text(guild, content, already=()):
     (mots >= 4 lettres, frontières de mot) pour éviter les faux positifs."""
     if guild is None or not content:
         return []
-    low = f" {content.lower()} "
+    # Pliage des accents des DEUX côtés : « parle-moi de mael34 » retrouve « Maël34 ».
+    low = f" {_fold(content)} "
     deja = {getattr(m, "id", None) for m in already}
     trouves = []
     for m in getattr(guild, "members", []):
@@ -2172,7 +2175,10 @@ def named_members_in_text(guild, content, already=()):
         for nom in (getattr(m, "display_name", ""), getattr(m, "name", "")):
             if not nom or len(nom) < 4:
                 continue
-            if re.search(r"(?<!\w)" + re.escape(nom.lower()) + r"(?!\w)", low):
+            nom_f = _fold(nom).strip()
+            if len(nom_f) < 4:
+                continue
+            if re.search(r"(?<!\w)" + re.escape(nom_f) + r"(?!\w)", low):
                 trouves.append(m)
                 deja.add(m.id)
                 break
@@ -7541,6 +7547,11 @@ FORUM_INTERNAL_DIRECTIVE = (
     "(« je connais pas ce membre », « j'ai rien sur lui ») — tu ne vas PAS sur le forum et tu "
     "n'inventes rien. On n'ouvre le forum que si on te le demande explicitement (« sur le forum », "
     "un lien, « Orbis Naturae », l'univers/le RP).\n"
+    "UN SEUL ET MÊME MEMBRE — un nom écrit avec une petite variante (accent en moins, majuscule, "
+    "faute de frappe : « mael34 » = « Maël34 », « leo » = « Léo ») désigne LA MÊME personne. Tu ne "
+    "crées JAMAIS deux membres distincts à partir d'une différence d'orthographe, et tu ne fais pas "
+    "de laïus « à ne pas confondre avec… » : tu rattaches au membre le plus proche que tu connais et "
+    "tu réponds sur lui.\n"
     "TON — tu réponds COMME UN HUMAIN sur Discord, pas comme un rapport. Une ou deux phrases qui "
     "coulent, à l'oral, dans ta voix. INTERDIT ICI : les titres « ### », le gras de rubrique, les "
     "listes à puces, les sections « À vérifier / Sources », les recommandations numérotées. Tu ne "
