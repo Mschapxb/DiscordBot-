@@ -59,6 +59,7 @@ class OnMessage(unittest.IsolatedAsyncioTestCase):
         p.start()
         self.addCleanup(p.stop)
         B._title_names_cache["cle"] = None
+        B.forum_changed()                       # la carte a changé : le moteur se réindexe
         B._forum_grace.clear()
         B._tool_grace.clear()
         B._channel_threads.pop(SALON, None)

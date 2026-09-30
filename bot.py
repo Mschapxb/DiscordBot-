@@ -41,6 +41,9 @@ from textutils import (
     _too_similar, _similarity, smart_split, _parse_json_loose,
 )
 
+# Lecture structurée des sujets du forum + moteur de recherche plein texte (module pur).
+import forum_engine
+
 # Pages HTML du panneau d'administration (/admin, /forum, /serveur) : de simples constantes,
 # rangées dans leur propre module (cf. admin_pages.py) pour alléger ce fichier.
 from admin_pages import ADMIN_HTML, FORUM_HTML, SERVEUR_HTML
@@ -2467,7 +2470,7 @@ def cancel_reminder(rid):
 # ============================================================
 # LECTURE WEB (pages / forums) — contenu nettoyé pour résumé + citation
 # ============================================================
-WEB_FETCH_MAX_BYTES = 400_000
+WEB_FETCH_MAX_BYTES = 2_000_000   # une page de sujet bien remplie pèse 150 à 500 Ko : on la veut ENTIÈRE
 # On se présente comme un navigateur : un User-Agent de robot se fait refuser (403)
 # par forumactif/phpBB et la plupart des forums, surtout depuis une IP de datacenter.
 BROWSER_HEADERS = {
@@ -3601,12 +3604,22 @@ async def _mission_forum(m, force=False, progress=None):
                 progress(40 + int(55 * _n / max(1, len(a_publier))),
                          f"{'Nouvelle réponse' if est_reponse else 'Nouveau sujet'} {_n}/{len(a_publier)}…")
             # Extrait : la fin du fil pour une réponse (le message récent), le début pour un sujet.
+            # Sur le forum officiel, le sujet est lu EN ENTIER et rangé dans la copie interne au
+            # passage : la recherche connaît la nouveauté dès qu'elle est annoncée.
             extrait, titre_reel = "", ""
-            got = await _read_topic_fully(_make_grab(session), rec["url"], rec["titre"])
-            if got:
-                _t, txt, _p, _l, _s = got
-                titre_reel = (_t or "").strip()
-                extrait = _smart_truncate(txt[-1400:] if est_reponse else txt, 400)
+            grab = _make_grab(session)
+            if _same_host(rec["url"], FORUM_URL):
+                lu = await copier_sujet(grab, rec["url"])
+            else:
+                lu = await read_topic(grab, rec["url"], rec["titre"], max_pages=FORUM_TOPIC_PAGES)
+            if lu:
+                titre_reel = (lu["titre"] or "").strip()
+                msg = lu["posts"][-1] if est_reponse else lu["posts"][0]
+                qui = f"{msg['auteur']} : " if (est_reponse and msg.get("auteur")) else ""
+                texte_msg = msg["texte"].strip()
+                if len(texte_msg) > 400:
+                    texte_msg = texte_msg[:400].rsplit(" ", 1)[0] + "…"
+                extrait = qui + texte_msg
             # Le titre de la page est le plus fiable ; sinon le libellé du lien, sinon le slug de l'URL
             # (sur l'accueil, le libellé capté est parfois une DATE — on l'évite).
             titre = titre_reel or rec["titre"] or _slug_title(rec["url"])
@@ -3690,6 +3703,11 @@ async def tool_lire_page(urls, allowed_hosts=None):
     if not urls:
         return "Aucune URL fournie."
     out = []
+    # Un lien vers un SUJET du forum officiel n'est pas une page web comme une autre : on le lit
+    # EN ENTIER (message d'ouverture + toutes les réponses, toutes les pages), pas ses 5000
+    # premiers caractères.
+    sujets_forum = [u for u in urls if _same_host(u, FORUM_URL) and _est_lien_de_sujet(u)]
+    place = FORUM_TOOL_RESULT_MAX - len(WEB_WRITE_DIRECTIVE) - 1500
     session = _web_session()
     try:
         for u in urls:
@@ -3697,6 +3715,11 @@ async def tool_lire_page(urls, allowed_hosts=None):
                 out.append(f"[REFUSÉ] {u} — hors du forum Orbis Naturae, et personne ne t'a donné "
                            "ce lien. Tu ne vas pas chercher ailleurs : dis ce que tu n'as pas trouvé "
                            "sur le forum, sans compléter avec une autre source.")
+                continue
+            if u in sujets_forum:
+                bloc, _texte = await _lire_sujet_bloc(_make_grab(session), u, copie_ok=False,
+                                                      budget=max(6000, place // len(sujets_forum)))
+                out.append(bloc or f"[ÉCHEC] {u} — sujet illisible (forum injoignable ou page introuvable).")
                 continue
             res = await fetch_url_text(u, session=session)
             if res is None:
@@ -3708,7 +3731,9 @@ async def tool_lire_page(urls, allowed_hosts=None):
                 out.append(f"=== SOURCE: {res['url']} ({head}) ===\n{res['text']}")
     finally:
         await session.close()
-    body = ("\n\n".join(out))[:WEB_TOOL_RESULT_MAX]
+    if sujets_forum:
+        save_forum_content()
+    body = ("\n\n".join(out))[:place + 1500 if sujets_forum else WEB_TOOL_RESULT_MAX]
     return WEB_WRITE_DIRECTIVE + body
 
 WEB_WRITE_DIRECTIVE = (
@@ -3808,7 +3833,18 @@ FORUM_ROOT_TEXT = 600          # texte gardé pour la page d'accueil (contexte)
 # donc on peut être généreux : un article de wiki mérite d'être conservé complet.
 FORUM_ARCHIVE_PAGES = 30       # pages suivantes lues par sujet lors d'une copie complète
 FORUM_ARCHIVE_TEXT = 60000     # texte gardé par sujet à l'archivage
-FORUM_TOOL_RESULT_MAX = 34000  # plafond du contenu agrégé réinjecté (fouille plus complète)
+FORUM_TOOL_RESULT_MAX = 52000  # plafond du contenu agrégé réinjecté (fouille plus complète)
+# --- RECHERCHE PAR LE MOTEUR (forum_engine) + LECTURE INTÉGRALE des meilleurs sujets -----------
+FORUM_LIVE_PAGES = 40          # pages suivantes lues quand on lit UN sujet en entier pour répondre
+SUJET_COMPLET_MAX = 30000      # un sujet est reproduit TEL QUEL jusqu'à cette taille ; au-delà, son
+                               # début reste tel quel et la suite est condensée (tout est LU quand même)
+FORUM_READ_TOP = 3             # sujets LUS après une recherche (les suivants sont listés avec extrait)
+FORUM_RESULTS_LISTED = 12      # résultats listés (titre, lien, extrait), comme une page de moteur web
+FORUM_FRESH_HOURS = 6          # une copie plus récente que ça est utilisée sans relire le forum
+FORUM_COPY_TTL_DAYS = 7        # au-delà, la copie d'un sujet est rafraîchie en tâche de fond
+FORUM_NEWS_CHECK_MIN = 10      # au plus un coup d'œil aux nouveautés du forum toutes les N minutes
+CONDENSE_CHUNK = 12000         # taille des tranches d'un sujet trop long, condensées une à une
+CONDENSE_MAX_CHUNKS = 8        # nb max de tranches condensées par sujet (borne le coût en appels)
 _LINK_RE = re.compile(r'(?is)<a\s[^>]*?href=["\']([^"\'\s#]+)[^>]*>(.*?)</a>')
 # Sujets/discussions : phpBB, forumactif (/t45-...), Discourse (/t/), wikis, etc.
 _TOPIC_RE = re.compile(
@@ -3898,6 +3934,19 @@ def _page_title(html):
     m = re.search(r"(?is)<title[^>]*>(.*?)</title>", html)
     return _html_to_text(m.group(1))[:150] if m else ""
 
+async def _read_body(r, maxi=None):
+    """Lit le corps d'une réponse JUSQU'AU BOUT (dans la limite de `maxi` octets).
+    `r.content.read(n)` ne le fait PAS : il rend ce qui est déjà arrivé, soit souvent le premier
+    tiers d'une page de forum — le reste du sujet (les réponses) était perdu sans un mot."""
+    maxi = maxi or WEB_FETCH_MAX_BYTES
+    morceaux, total = [], 0
+    async for morceau in r.content.iter_chunked(65536):
+        morceaux.append(morceau)
+        total += len(morceau)
+        if total >= maxi:
+            break
+    return b"".join(morceaux)[:maxi]
+
 class _Retryable(Exception):
     """Échec temporaire (anti-robot, serveur surchargé) : on retente."""
 
@@ -3953,7 +4002,7 @@ async def _fetch_via_reader(url, sess):
                     continue
                 if r.status != 200:
                     return None
-                raw = await r.content.read(WEB_FETCH_MAX_BYTES)
+                raw = await _read_body(r)
             html = raw.decode("utf-8", errors="replace")
             if len(html) < 200:            # réponse vide/inutile
                 return None
@@ -4017,7 +4066,7 @@ async def _fetch_raw(url, session=None):
                         ctype = r.headers.get("Content-Type", "")
                         if ctype and "html" not in ctype and "text" not in ctype and "xml" not in ctype:
                             return {"url": target, "error": f"type non lisible ({ctype.split(';')[0]})"}
-                        raw = await r.content.read(WEB_FETCH_MAX_BYTES)
+                        raw = await _read_body(r)
                         if attempt > 1:
                             print(f"🔁 Forum joint à la {attempt}e tentative : {target}")
                         return {"url": str(r.url), "html": raw.decode("utf-8", errors="replace")}
@@ -4127,8 +4176,11 @@ def _find_next_page(html, base_url, seen):
             return full
     return None
 
-_NAV_LINK_RE = re.compile(
-    r'(?is)<a\s[^>]*class=["\'][^"\']*\bnav\b[^"\']*["\'][^>]*href=["\']([^"\'\s]+)["\'][^>]*>(.*?)</a>')
+# Un lien du fil d'Ariane : <a … class="nav" …>. L'ORDRE des attributs varie selon le thème
+# (« href puis class » sur le forum officiel) : on lit la balise, puis ses attributs.
+_A_TAG_RE = re.compile(r'(?is)<a\s([^>]*)>(.*?)</a>')
+_NAV_CLASS_RE = re.compile(r'(?i)\bclass\s*=\s*["\'][^"\']*\bnav\b[^"\']*["\']')
+_HREF_ATTR_RE = re.compile(r'(?i)\bhref\s*=\s*["\']([^"\'\s]+)["\']')
 
 def _forum_breadcrumb(html, base_url, topic_url):
     """Fil d'Ariane OFFICIEL forumactif (liens class=\"nav\", dans l'ordre d'affichage) : la vraie
@@ -4136,8 +4188,11 @@ def _forum_breadcrumb(html, base_url, topic_url):
     exploration. Renvoie [(url, label), …] en excluant Index/Portail. Vide si le thème ne marque pas."""
     from urllib.parse import urljoin
     crumbs, seen = [], set()
-    for m in _NAV_LINK_RE.finditer(html):
-        href, label = m.group(1).strip(), _html_to_text(m.group(2)).strip()
+    for m in _A_TAG_RE.finditer(html):
+        lien = _HREF_ATTR_RE.search(m.group(1))
+        if not lien or not _NAV_CLASS_RE.search(m.group(1)):
+            continue
+        href, label = lien.group(1).strip(), _html_to_text(m.group(2)).strip()
         low = label.lower()
         if not label or len(label) > 70 or low in (
                 "index", "accueil", "portail", "portal", "faq", "rechercher", "membres",
@@ -4153,19 +4208,24 @@ def _forum_breadcrumb(html, base_url, topic_url):
         crumbs.append((full, label))
     return crumbs[:6]
 
-async def _read_topic_fully(grab, url, anchor="", integral=False):
-    """Lit UNE discussion en entier : page 1 + ses pages suivantes.
-    integral=True (archivage de la copie interne) : on lit BEAUCOUP plus de pages et on garde
-    le texte quasi entier — le forum est un wiki, une fiche tronquée à 5000 signes perd la moitié
-    de son lore. En fouille LIVE on reste borné (le résultat repart dans le prompt).
-    Renvoie (titre, texte, pages, liens_internes, sections) — `sections` vient du fil
-    d'Ariane : c'est la RUBRIQUE où vit le sujet (ex : « Empire Skaldien »). Sans ça,
-    elle ne sait pas où elle est et part chercher à l'autre bout du monde."""
-    pages, texts, title = [], [], ""
+async def read_topic(grab, url, anchor="", max_pages=None):
+    """Lit UN sujet EN ENTIER, message par message : le message d'ouverture ET chaque réponse,
+    page après page jusqu'à la dernière (dans la limite de `max_pages` pages suivantes).
+    Chaque message garde son auteur et sa date — on sait QUI a écrit QUOI, et les blocs de
+    publicité glissés entre les messages sont écartés.
+    Renvoie None si rien n'est lisible, sinon un dict :
+      titre, url, posts [{id, auteur, date, texte}], texte (rendu « ── Message n/N · … ── »),
+      pages (URLs lues), liens (vers d'autres sujets, cités dans les messages),
+      sections (fil d'Ariane : la RUBRIQUE où vit le sujet), complet (toutes les pages lues ?),
+      structure (messages reconnus ? sinon texte brut de la page), dernier_pid."""
+    from urllib.parse import urljoin
+    max_pages = FORUM_LIVE_PAGES if max_pages is None else max_pages
+    pages, posts, vus, title = [], [], set(), ""
     inner_links, sections = [], []
-    current = url
+    structure, brut = False, []
+    # On part TOUJOURS de la première page : /t45p25-sujet et /t45-sujet#312 → /t45-sujet.
+    current = re.sub(r"/t(\d+)p\d+-", r"/t\1-", (url or "").split("#")[0])
     seen = set()
-    max_pages = FORUM_ARCHIVE_PAGES if integral else FORUM_TOPIC_PAGES
     for _ in range(1 + max_pages):
         if not current or current in seen:
             break
@@ -4174,8 +4234,9 @@ async def _read_topic_fully(grab, url, anchor="", integral=False):
         if not page or page.get("error"):
             break
         html = page["html"]
+        lu = forum_engine.parse_topic_page(html)
         if not title:
-            title = _page_title(html) or anchor
+            title = _page_title(html) or lu["titre"] or anchor
         # Fil d'Ariane : d'abord le VRAI breadcrumb forumactif (liens class="nav", ordonnés),
         # repli sur l'ancienne heuristique (tous les liens de section) si le thème ne le marque pas.
         if not sections:
@@ -4184,21 +4245,57 @@ async def _read_topic_fully(grab, url, anchor="", integral=False):
             for full, a in _extract_links(html, page["url"]):
                 if _same_host(url, full) and _FORUM_RE.search(full):
                     sections.append((full, (a or "").strip()))
-        # Liens vers d'AUTRES discussions, cités à l'intérieur des messages
-        body_html = _clean_forum_html(html)
-        for full, a in _extract_links(body_html, page["url"]):
-            if _same_host(url, full) and _TOPIC_RE.search(full) and not _same_topic(url, full):
-                inner_links.append((full, a))
-        txt = _html_to_text(body_html).strip()
-        if txt:
-            texts.append(txt)
+        if lu["posts"]:
+            structure = True
+            for p in lu["posts"]:
+                if p["id"] in vus:
+                    continue
+                vus.add(p["id"])
+                posts.append(p)
+                # Liens vers d'AUTRES discussions, cités à l'intérieur des messages
+                for href, a in p.get("liens", ()):
+                    try:
+                        full = urljoin(page["url"], href).split("#")[0]
+                    except ValueError:
+                        continue
+                    if _same_host(url, full) and _TOPIC_RE.search(full) and not _same_topic(url, full):
+                        inner_links.append((full, a))
             pages.append(page["url"])
+        else:
+            # Thème inconnu ou page qui n'est pas un sujet : on garde le texte brut, nettoyé.
+            body_html = _clean_forum_html(html)
+            for full, a in _extract_links(body_html, page["url"]):
+                if _same_host(url, full) and _TOPIC_RE.search(full) and not _same_topic(url, full):
+                    inner_links.append((full, a))
+            txt = _html_to_text(body_html).strip()
+            if txt:
+                brut.append(txt)
+                pages.append(page["url"])
         current = _find_next_page(html, page["url"], seen)
-    if not texts:
+    if not posts and not brut:
         return None
-    full_text = "\n\n".join(texts)
+    if posts:
+        texte = forum_engine.render_posts(posts)
+    else:
+        texte = "\n\n".join(brut)
+        posts = [{"id": 0, "auteur": "", "date": "", "texte": texte}]
+    return {"titre": (title or "").strip(), "url": pages[0] if pages else url, "posts": posts,
+            "texte": texte, "pages": pages, "liens": inner_links, "sections": sections[:6],
+            "complet": not current, "structure": structure,
+            "dernier_pid": max((p["id"] for p in posts), default=0)}
+
+async def _read_topic_fully(grab, url, anchor="", integral=False):
+    """Ancienne signature, conservée pour la fouille par exploration et la veille : lit le sujet
+    avec read_topic et renvoie (titre, texte, pages, liens_internes, sections).
+    integral=True (archivage) : beaucoup plus de pages et le texte quasi entier. Sinon le texte
+    est BORNÉ (il repart dans un prompt avec une dizaine d'autres sujets)."""
+    sujet = await read_topic(grab, url, anchor,
+                             max_pages=FORUM_ARCHIVE_PAGES if integral else FORUM_TOPIC_PAGES)
+    if not sujet:
+        return None
     cap = FORUM_ARCHIVE_TEXT if integral else FORUM_TEXT_PER_PAGE
-    return title, _smart_truncate(full_text, cap), pages, inner_links, sections[:6]
+    return (sujet["titre"], _smart_truncate(sujet["texte"], cap), sujet["pages"],
+            sujet["liens"], sujet["sections"])
 
 # --- Second rebond : entités citées (noms propres) et liens internes --------------------
 # Quand un post sur Salina mentionne « Tasglev » sans l'expliquer, il faut aller lire
@@ -4614,7 +4711,35 @@ async def _find_topic_for(grab, origin, name, known_topics, index=None):
                 return fallback
     return None, None
 
-async def fouiller_forum(url, sujet="", strict=False):
+def _est_lien_de_sujet(url):
+    """Vrai si l'URL désigne UN sujet (et pas une section ni l'accueil) — y compris une de ses
+    pages suivantes (/t45p25-…)."""
+    return bool(url) and bool(_TOPIC_RE.search(url) or _topic_id(url)) and not _section_id(url)
+
+async def fouiller_forum(url, sujet="", strict=False, question=""):
+    """Point d'entrée de l'outil fouiller_forum. Trois cas :
+      • un lien de SUJET → on lit CE sujet en entier (message d'ouverture + toutes les réponses) ;
+      • le forum officiel, sans section imposée → RECHERCHE par le moteur (texte complet de tous
+        les sujets, classés par pertinence) puis lecture intégrale des meilleurs ;
+      • une section précise, un autre site, ou une copie interne encore vide → exploration
+        page par page (_fouiller_forum_crawl), comme avant."""
+    root = _safe_url(url)
+    if not root:
+        return "URL invalide ou adresse interne bloquée."
+    if _est_lien_de_sujet(root):
+        return await lire_un_sujet(root, question or sujet)
+    if _same_host(root, FORUM_URL) and not strict and not _section_id(root):
+        try:
+            resultat = await recherche_forum(sujet, question)
+        except Exception as e:
+            print(f"⚠️ Moteur de recherche du forum en panne ({type(e).__name__}: {str(e)[:120]}) "
+                  "— repli sur l'exploration page par page.")
+            resultat = None
+        if resultat:
+            return resultat
+    return await _fouiller_forum_crawl(root, sujet, strict=strict)
+
+async def _fouiller_forum_crawl(url, sujet="", strict=False):
     """Explore un forum/site depuis un lien pour rassembler l'info sur un sujet :
       1) utilise le MOTEUR DE RECHERCHE du forum si un sujet est donné,
       2) lit la page d'accueil,
@@ -5184,6 +5309,7 @@ async def library_map(progress=None):
             file.append(u)
     meta["a_resumer"] = [u for u in file if u in lib]
     mark_memory_dirty()
+    forum_changed()              # titres et rubriques ont pu changer : le moteur se réindexera
     if progress:
         progress(100, f"{len(index)} sujets cartographiés")
     return {"ok": True, "sujets": len(index), "a_resumer": len(meta["a_resumer"])}
@@ -5199,15 +5325,14 @@ async def _library_summarize_one(url):
         await asyncio.sleep(0.15)
         return await _fetch_raw(u)
 
-    got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
-    if not got or not got[1].strip():
+    # Copie interne : titre + chemin officiel (fil d'Ariane) + contenu complet + liens vers d'autres fiches.
+    sujet = await copier_sujet(grab, url, entry)
+    if not sujet:
         entry["resume"] = "(vide)"
         entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
         mark_memory_dirty()
         return False
-    title, ptxt, _pages, links, sections = got
-    # Copie interne : titre + chemin officiel (fil d'Ariane) + contenu complet + liens vers d'autres fiches.
-    store_topic_copy(url, entry, title, ptxt, links, sections)
+    ptxt = sujet["texte"]
 
     try:
         resp = await extract_completion(
@@ -5229,6 +5354,7 @@ async def _library_summarize_one(url):
     entry["resume"] = mots or "(vide)"      # on garde la clé "resume" pour ne pas casser l'existant
     entry["maj"] = now().strftime("%Y-%m-%d %H:%M")
     mark_memory_dirty()
+    forum_changed()
     return entry["resume"] != "(vide)"
 
 async def library_summarize_batch(n=LIBRARY_BATCH, progress=None):
@@ -5298,11 +5424,19 @@ def library_targets(sujet, limit=5):
 # copie/mise à jour. C'est la « vraie copie du forum » consultable dans la page /forum.
 FORUM_CONTENT_FILE = os.getenv("FORUM_CONTENT_FILE", "forum_content.json")
 FORUM_CONTENT_MAX_CHARS = 60000       # copie quasi intégrale par sujet (wiki : on garde tout)
-AUTO_COPY_BATCH = int(os.getenv("FORUM_AUTO_COPY_BATCH", "4"))  # sujets auto-copiés par passage de veille
+AUTO_COPY_BATCH = int(os.getenv("FORUM_AUTO_COPY_BATCH", "8"))  # sujets auto-copiés par passage de veille
+AUTO_COPY_RATTRAPAGE = 40             # …et par passage tant qu'il en manque plus que ça (rattrapage)
 WEAVE_EVERY_HOURS = 12                # tissage automatique (rétroliens + rubriques inférées)
 _autocopy_skip = set()                # sujets vides/illisibles : on ne s'acharne pas dessus
 _forum_content = None
 _forum_content_dirty = False
+_forum_rev = 0                        # change à chaque modification de la copie ou de la carte :
+                                      # c'est ce qui dit au moteur de recherche de se réindexer
+
+def forum_changed():
+    """À appeler quand la carte (titres, rubriques, mots-clés) ou la copie du forum a changé."""
+    global _forum_rev
+    _forum_rev += 1
 
 def forum_content():
     """Charge (paresseusement) la copie du forum : { url: {titre, chemin, contenu, maj} }."""
@@ -5315,7 +5449,9 @@ def forum_content():
             _forum_content = {}
     return _forum_content
 
-def set_forum_content(url, titre, chemin, texte, liens=None):
+def set_forum_content(url, titre, chemin, texte, liens=None, messages=None, dernier_pid=None):
+    """Range un sujet dans la copie interne. `messages` (nombre de messages lus) et `dernier_pid`
+    (identifiant du dernier message) permettent de savoir plus tard si le sujet a bougé."""
     global _forum_content_dirty
     fc = forum_content()
     ancien = fc.get(url, {})
@@ -5332,7 +5468,12 @@ def set_forum_content(url, titre, chemin, texte, liens=None):
                "liens": nouveaux[:40], "coupes": coupes,
                "synthese": ancien.get("synthese", ""), "notes": ancien.get("notes", []),
                "maj": now().strftime("%Y-%m-%d %H:%M")}
+    if messages is not None:
+        fc[url]["messages"] = int(messages)
+    if dernier_pid:
+        fc[url]["dernier_pid"] = int(dernier_pid)
     _forum_content_dirty = True
+    forum_changed()
 
 def _forum_liens(inner_links, self_url):
     """Transforme les renvois bruts [(url, ancre)] trouvés dans un article en liens NOMMÉS
@@ -5351,7 +5492,7 @@ def _forum_liens(inner_links, self_url):
             break
     return out
 
-def store_topic_copy(url, entry, title, ptxt, links, sections):
+def store_topic_copy(url, entry, title, ptxt, links, sections, messages=None, dernier_pid=None):
     """Enregistre un article dans la copie interne : titre, CHEMIN officiel (fil d'Ariane), CONTENU
     complet et LIENS vers d'autres fiches. Met à jour le chemin de l'index quand le fil d'Ariane
     est plus fiable que la carte reconstruite. Renvoie les liens résolus."""
@@ -5361,8 +5502,44 @@ def store_topic_copy(url, entry, title, ptxt, links, sections):
     if crumb:
         entry["chemin"] = crumb[:220]
     liens = _forum_liens(links, url)
-    set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt, liens)
+    set_forum_content(url, entry.get("titre", ""), entry.get("chemin", ""), ptxt, liens,
+                      messages=messages, dernier_pid=dernier_pid)
     return liens
+
+def _cle_bibliotheque(url):
+    """La clé sous laquelle ce sujet est déjà connu (même sujet = même numéro /t45-…, quels que
+    soient la page ou l'ancre du lien), sinon l'URL de sa première page."""
+    base = re.sub(r"/t(\d+)p\d+-", r"/t\1-", (url or "").split("#")[0])
+    lib = library()
+    if base in lib:
+        return base
+    tid = _topic_id(base)
+    if tid and _same_host(base, FORUM_URL):
+        for u in lib:
+            if _topic_id(u) == tid and _same_host(u, FORUM_URL):
+                return u
+    return base
+
+async def copier_sujet(grab, url, entry=None):
+    """Lit un sujet EN ENTIER (toutes ses pages) et le range dans la copie interne, message par
+    message. Un sujet inconnu de la carte y est ajouté. Renvoie le sujet lu (cf. read_topic)
+    avec sa clé de bibliothèque dans `cle`, ou None si rien n'était lisible."""
+    lib = library()
+    cle = url if url in lib else _cle_bibliotheque(url)
+    if entry is None:
+        entry = lib.get(cle)
+    sujet = await read_topic(grab, cle, (entry or {}).get("titre", ""), max_pages=FORUM_ARCHIVE_PAGES)
+    if not sujet or not sujet["texte"].strip():
+        return None
+    if entry is None:
+        entry = lib.setdefault(cle, {"titre": "", "chemin": "", "resume": "", "maj": "",
+                                     "vu": now().strftime("%Y-%m-%d %H:%M")})
+    store_topic_copy(cle, entry, sujet["titre"], _smart_truncate(sujet["texte"], FORUM_ARCHIVE_TEXT),
+                     sujet["liens"], sujet["sections"],
+                     messages=len(sujet["posts"]), dernier_pid=sujet["dernier_pid"])
+    mark_memory_dirty()
+    sujet["cle"] = cle
+    return sujet
 
 def _chemin_of(url):
     """Rubrique d'un article (index prioritaire, sinon copie). '' si aucune."""
@@ -5434,12 +5611,9 @@ async def forum_repair(progress=None):
         if progress:
             progress(int(78 * i / total), f"Relecture {i}/{total}…")
         entry = lib.get(url, {})
-        got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
-        if not got or not got[1].strip():
-            continue
-        title, ptxt, _p, links, sections = got
         avant = _chemin_of(url)
-        store_topic_copy(url, entry, title, ptxt, links, sections)
+        if not await copier_sujet(grab, url, entry):
+            continue
         if _chemin_of(url) and not avant:
             relues += 1
         if i % 10 == 0:
@@ -5592,11 +5766,9 @@ def forum_link_remove(url, cible):
 async def consulter_forum(sujet):
     """Répond depuis la COPIE INTERNE du forum (synthèses + notes + liens) — INSTANTANÉ, sans rien
     re-télécharger. C'est la mémoire du wiki : Tenebris s'y réfère au lieu de tout relire à chaque fois."""
-    hits = library_lookup(sujet, limit=4)
-    if not hits:
-        # Le sujet peut n'apparaître QUE dans le CORPS des fiches (pas dans les titres) :
-        # la recherche plein-texte de la copie prend le relais avant de déclarer forfait.
-        hits = [{"url": r["url"], "titre": r["titre"]} for r in forum_search(sujet, limit=4)]
+    # Recherche par le MOTEUR : texte complet des fiches (pas seulement leurs titres), classées
+    # par pertinence, fautes de frappe et variantes de noms comprises.
+    hits = (await forum_index_async()).search(sujet, limit=4)
     # La PLATEFORME /forum complète la copie : recherche plein-texte FTS5 (accents
     # ignorés, corps des messages inclus), entités du graphe (personnage:X, lieu:Y),
     # et surtout les sujets écrits DIRECTEMENT sur /forum (absents de la copie externe).
@@ -5625,7 +5797,11 @@ async def consulter_forum(sujet):
             bloc += f"\nRubrique : {chemin}"
         if notes:
             bloc += "\nPoints clés : " + " · ".join(notes)
-        if corps:
+        if corps and len(corps) > 3500 and not e.get("synthese"):
+            # Fiche longue : les passages qui parlent du sujet, plutôt que ses 3500 premiers signes.
+            passages, _n, _total = forum_engine.meilleurs_passages(corps, sujet, 3500)
+            bloc += "\n" + (passages or corps[:3500]) + "\n[…fiche plus longue : fouiller_forum avec son url pour la lire en entier]"
+        elif corps:
             bloc += "\n" + corps[:3500]
         if liens:
             bloc += "\nLiée à : " + ", ".join(liens)
@@ -5707,53 +5883,12 @@ def forum_tree():
     return dict(sorted(sections.items(), key=lambda kv: kv[0].lower()))
 
 def forum_search(q, limit=30):
-    """Recherche interne dans la copie du forum : titre, rubrique, mots-clés ET contenu complet.
-    Renvoie des résultats avec un court extrait autour du terme trouvé."""
-    termes = [t for t in _norm(q or "").split() if len(t) >= 3]
-    if not termes:
-        return []
-    lib = library()
-    fc = forum_content()
-    out = []
-    for url, e in lib.items():
-        titre = e.get("titre", "")
-        entry = fc.get(url, {})
-        contenu = entry.get("contenu", "")
-        notes = " ".join(entry.get("notes", []) or [])
-        n_titre, n_chemin = _norm(titre), _norm(e.get("chemin", ""))
-        n_meta = _norm(f"{e.get('resume','')} {notes} {entry.get('synthese','')}")
-        n_contenu = _norm(contenu)
-        score, trouves = 0.0, 0
-        for t in termes:
-            s = 0.0
-            if t in n_titre:
-                s += 6                        # le titre pèse lourd
-            if t in n_chemin:
-                s += 3                        # la rubrique aussi
-            if t in n_meta:
-                s += 2                        # mots-clés, notes, synthèse
-            occ = n_contenu.count(t)
-            if occ:
-                s += min(occ, 5)              # le corps compte, sans qu'un pavé écrase tout
-            if s:
-                trouves += 1
-            score += s
-        if not score:
-            continue
-        if trouves == len(termes) and len(termes) > 1:
-            score += 5                        # toutes les pièces du puzzle dans la même fiche
-        # Extrait : recherche INSENSIBLE AUX ACCENTS mais découpe dans le texte d'origine.
-        extrait, plat = "", _fold(contenu)
-        for t in termes:
-            i = plat.find(t)
-            if i >= 0:
-                a = max(0, i - 60)
-                extrait = ("…" if a > 0 else "") + contenu[a:i + 140].strip() + "…"
-                break
-        out.append((score, {"url": url, "titre": titre, "chemin": e.get("chemin", ""),
-                            "extrait": extrait, "copie": bool(contenu)}))
-    out.sort(key=lambda x: -x[0])
-    return [r for _s, r in out[:limit]]
+    """Recherche dans la copie du forum (page /forum du panneau) : le même MOTEUR que la fouille —
+    texte complet, classement par pertinence, variantes et fautes de frappe — avec un extrait
+    centré sur les mots trouvés."""
+    return [{"url": r["url"], "titre": r["titre"], "chemin": r["chemin"],
+             "extrait": r["extrait"], "copie": r["copie"]}
+            for r in forum_index().search(q or "", limit=limit, passages_par_doc=1)]
 
 async def library_copy_all(progress=None, with_keywords=True):
     """COPIE COMPLÈTE : (re)cartographie le forum puis LIT et STOCKE le contenu de chaque sujet
@@ -5777,11 +5912,10 @@ async def library_copy_all(progress=None, with_keywords=True):
         if progress:
             progress(25 + int(70 * i / total), f"Copie {i}/{total}…")
         entry = lib.get(url, {})
-        got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
-        if not got or not got[1].strip():
+        sujet = await copier_sujet(grab, url, entry)
+        if not sujet:
             continue
-        title, ptxt, _pages, links, sections = got
-        store_topic_copy(url, entry, title, ptxt, links, sections)
+        ptxt = sujet["texte"]
         copies += 1
         # Mots-clés (bonus, pour la recherche interne) — seulement si le quota tient.
         if with_keywords and not quota_exhausted():
@@ -5804,6 +5938,7 @@ async def library_copy_all(progress=None, with_keywords=True):
 
     save_forum_content(force=True)
     mark_memory_dirty()
+    forum_changed()
     forum_weave()               # tisse le graphe (rétroliens) + infère les rubriques manquantes
     save_forum_content(force=True)
     library_meta()["a_resumer"] = [u for u in library_meta().get("a_resumer", []) if not _library_fresh(lib.get(u, {}))]
@@ -5820,35 +5955,480 @@ async def library_autocopy_batch(n=AUTO_COPY_BATCH):
     fc = forum_content()
     manquants = [u for u in lib
                  if u not in _autocopy_skip and not fc.get(u, {}).get("contenu")]
-    if not manquants:
+    # Une fois tout copié, on ENTRETIENT la copie : les sujets reçoivent des réponses, et une
+    # copie qui date ne les contient pas. On relit d'abord les copies d'avant la lecture message
+    # par message (souvent tronquées), puis les plus anciennes.
+    a_relire = [] if manquants else _copies_a_rafraichir(max(1, n))
+    if not manquants and not a_relire:
         return 0
+    # Copie encore très incomplète (premier démarrage, disque remis à zéro) : on accélère, car
+    # tant qu'un sujet n'est pas copié, la recherche ne le trouve que par son titre.
+    if len(manquants) > AUTO_COPY_RATTRAPAGE:
+        n = max(n, AUTO_COPY_RATTRAPAGE)
 
     async def grab(u):
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)          # politesse : le forum limite les rafales (HTTP 429)
         return await _fetch_raw(u)
 
     copies = 0
-    for url in manquants[:max(1, n)]:
-        entry = lib.get(url, {})
+    for url in (manquants or a_relire)[:max(1, n)]:
         try:
-            got = await _read_topic_fully(grab, url, entry.get("titre", ""), integral=True)
+            sujet = await copier_sujet(grab, url, lib.get(url, {}))
         except Exception as e:
             print(f"⚠️ Auto-copie {url} : {str(e)[:80]}")
             _autocopy_skip.add(url)
             continue
-        if not got or not got[1].strip():
+        if not sujet:
             _autocopy_skip.add(url)       # rien à lire : on n'y reviendra pas ce cycle de vie
             continue
-        title, ptxt, _pages, links, sections = got
-        store_topic_copy(url, entry, title, ptxt, links, sections)
         copies += 1
     if copies:
         forum_weave()                     # rubriques inférées + rétroliens, sans intervention
         save_forum_content(force=True)
         mark_memory_dirty()
-        print(f"📥 Auto-copie forum : {copies} sujet(s) intégré(s) au schéma "
-              f"({len(manquants) - copies} restant(s)).")
+        if manquants:
+            print(f"📥 Auto-copie forum : {copies} sujet(s) intégré(s) au schéma "
+                  f"({len(manquants) - copies} restant(s)).")
+        else:
+            print(f"🔄 Copie du forum : {copies} sujet(s) relu(s) pour rester à jour.")
     return copies
+
+def _copies_a_rafraichir(limit):
+    """Sujets dont la copie mérite d'être relue : d'abord les copies faites AVANT la lecture
+    message par message (pas de compteur `messages`), puis les plus vieilles au-delà de
+    FORUM_COPY_TTL_DAYS."""
+    lib, fc = library(), forum_content()
+    seuil = (now() - timedelta(days=FORUM_COPY_TTL_DAYS)).strftime("%Y-%m-%d %H:%M")
+    candidats = []
+    for u in lib:
+        e = fc.get(u) or {}
+        if u in _autocopy_skip or not e.get("contenu"):
+            continue
+        if "messages" not in e:
+            candidats.append(("", u))
+        elif (e.get("maj") or "") < seuil:
+            candidats.append((e.get("maj") or "", u))
+    candidats.sort()
+    return [u for _maj, u in candidats[:limit]]
+
+# ============================================================
+# RECHERCHE SUR LE FORUM — moteur plein texte + lecture INTÉGRALE des meilleurs sujets
+# ============================================================
+# Comme une recherche web, mais sur le forum : on interroge un index du TEXTE COMPLET de tous
+# les sujets (forum_engine), on liste les résultats classés avec leur extrait, puis on LIT EN
+# ENTIER les meilleurs — le message d'ouverture et toutes les réponses, toutes les pages.
+# L'ancienne fouille ne regardait que les TITRES (et le moteur du forum, incomplet pour les
+# invités) : un sujet qui parlait de X sans le nommer dans son titre était invisible.
+_forum_idx = None             # (révision de la copie, ForumIndex)
+_forum_noms = (None, {})      # (révision, {nom propre plié: [urls des fiches qui le portent]})
+_forum_news_check = -1e9      # dernier coup d'œil aux nouveautés (time.monotonic)
+
+def _forum_fiches():
+    """Ce que le moteur indexe : une fiche par sujet connu (carte + copie)."""
+    lib, fc = library(), forum_content()
+    fiches = []
+    for url in dict.fromkeys(list(lib) + list(fc)):
+        le, e = lib.get(url) or {}, fc.get(url) or {}
+        mots = [le.get("resume") or ""] + list(e.get("notes") or [])
+        fiches.append({"url": url,
+                       "titre": le.get("titre") or e.get("titre") or _slug_title(url),
+                       "chemin": le.get("chemin") or e.get("chemin") or "",
+                       "mots": " ".join(m for m in mots if m and m != "(vide)"),
+                       "contenu": e.get("contenu") or "",
+                       "maj": e.get("maj") or ""})
+    return fiches
+
+def forum_index():
+    """L'index de recherche du forum, reconstruit seulement quand la copie a changé."""
+    global _forum_idx
+    if _forum_idx is None or _forum_idx[0] != _forum_rev:
+        _forum_idx = (_forum_rev, forum_engine.ForumIndex.build(_forum_fiches()))
+    return _forum_idx[1]
+
+async def forum_index_async():
+    """Comme forum_index, mais l'indexation (une fraction de seconde pour tout le forum) part
+    dans un thread : la conversation des autres membres n'attend pas."""
+    global _forum_idx
+    if _forum_idx is None or _forum_idx[0] != _forum_rev:
+        rev, fiches = _forum_rev, _forum_fiches()
+        _forum_idx = (rev, await asyncio.to_thread(forum_engine.ForumIndex.build, fiches))
+    return _forum_idx[1]
+
+def _copie_fraiche(entree):
+    """Une copie message par message, relue il y a moins de FORUM_FRESH_HOURS heures."""
+    if not entree or not entree.get("contenu") or "messages" not in entree:
+        return False
+    try:
+        maj = datetime.strptime(entree.get("maj") or "", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return (now() - maj).total_seconds() < FORUM_FRESH_HOURS * 3600
+
+async def _forum_nouveautes(grab):
+    """Coup d'œil à l'accueil du forum (au plus toutes les FORUM_NEWS_CHECK_MIN minutes) : un
+    sujet inconnu, ou un sujet qui a reçu une réponse depuis sa copie, est relu tout de suite —
+    la recherche porte ainsi sur le forum tel qu'il est MAINTENANT."""
+    global _forum_news_check
+    if time.monotonic() - _forum_news_check < FORUM_NEWS_CHECK_MIN * 60:
+        return 0
+    _forum_news_check = time.monotonic()
+    page = await grab(FORUM_URL)
+    if not page or page.get("error"):
+        return 0
+    lib, fc = library(), forum_content()
+    par_tid = {_topic_id(u): u for u in lib if _topic_id(u)}
+    a_lire = []
+    for tid, rec in _forum_listing_scan(page["html"], page["url"]).items():
+        connu = par_tid.get(tid)
+        if connu is None:
+            a_lire.append(rec["url"])                                   # sujet tout neuf
+        elif (fc.get(connu) or {}).get("dernier_pid", 0) and rec["last_pid"] > fc[connu]["dernier_pid"]:
+            a_lire.append(connu)                                        # nouvelle réponse
+    relus = 0
+    for u in a_lire[:3]:
+        try:
+            if await copier_sujet(grab, u):
+                relus += 1
+        except Exception as e:
+            print(f"⚠️ Nouveauté du forum illisible ({u}) : {str(e)[:80]}")
+    if relus:
+        print(f"🆕 Forum : {relus} sujet(s) nouveau(x) ou mis à jour intégré(s) avant la recherche.")
+    return relus
+
+async def _renfort_moteur_forum(grab, sujet, deja):
+    """Tant que la copie interne est incomplète, on demande AUSSI au moteur du forum : il peut
+    connaître un sujet que notre index n'a pas encore lu. Renvoie des URLs de sujets nouvelles."""
+    origin = _origin(FORUM_URL)
+    trouves = []
+    for surl in _build_search_urls(origin, sujet)[:2]:
+        page = await grab(surl)
+        if not page or page.get("error"):
+            continue
+        for full, _ancre in _extract_links(page["html"], surl):
+            if not (_same_host(origin, full) and _est_lien_de_sujet(full)):
+                continue
+            cle = _cle_bibliotheque(full)
+            if cle not in deja and cle not in trouves:
+                trouves.append(cle)
+        if trouves:
+            break
+    return trouves[:3]
+
+# --- Un sujet trop long pour être recopié : on le LIT quand même en entier ------------------
+CONDENSE_SYSTEM = (
+    "Tu prends des NOTES DE LECTURE fidèles sur un extrait de sujet de forum (univers de jeu de "
+    "rôle). Pour CHAQUE message de l'extrait, dans l'ordre, écris « Message N (auteur) : » puis "
+    "l'essentiel de ce qu'il contient : faits, noms propres, lieux, dates, chiffres, décisions, "
+    "qui fait quoi à qui, et ce qui change par rapport aux messages précédents. Tu restes factuel "
+    "et complet, tu n'interprètes pas, tu n'inventes rien et tu ne sautes aucun message. Si une "
+    "QUESTION est fournie, tu détailles surtout ce qui y répond, en citant les mots exacts quand "
+    "ils comptent. Pas d'introduction, pas de conclusion."
+)
+
+def _entete_message(p, total):
+    return (f"── Message {p['n']}/{total} · {p['auteur'] or 'auteur inconnu'} · "
+            f"{p['date'] or 'date inconnue'} ──")
+
+def _unites_de_lecture(contenu, taille):
+    """Le sujet en unités d'au plus ~`taille` caractères, chacune précédée de l'en-tête de son
+    message (un message plus long est réparti sur plusieurs unités « suite »)."""
+    posts = forum_engine.split_posts(contenu)
+    unites = []
+    for p in posts:
+        morceaux = [p["texte"]] if len(p["texte"]) <= taille else forum_engine._decouper(p["texte"], taille)
+        for i, m in enumerate(morceaux):
+            unites.append(_entete_message(p, len(posts)) + (" (suite)" if i else "") + "\n" + m)
+    return unites
+
+async def _condenser(tranche, question, max_tokens):
+    """Notes de lecture d'une tranche de sujet. Renvoie '' si le modèle d'analyse est indisponible."""
+    if quota_exhausted():
+        return ""
+    try:
+        resp = await extract_completion(
+            [{"role": "system", "content": CONDENSE_SYSTEM},
+             {"role": "user", "content": f"QUESTION : {question or '(aucune — notes générales)'}\n\n"
+                                         f"EXTRAIT DU SUJET :\n{tranche}"}],
+            max_tokens=max_tokens, temperature=0.1)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        note_quota_error(e)
+        print(f"⚠️ Notes de lecture indisponibles ({str(e)[:80]}) — extraits à la place.")
+        return ""
+
+async def rendre_sujet(contenu, question="", budget=SUJET_COMPLET_MAX, condenser=True):
+    """Le texte d'un sujet tel qu'il part au modèle, dans la limite de `budget` caractères.
+    Renvoie (texte, mode) :
+      « entier »   — tout le sujet, mot pour mot (le cas normal) ;
+      « condense » — sujet trop long : le début mot pour mot, puis TOUTE la suite lue tranche
+                     par tranche et condensée en notes fidèles, plus les passages exacts qui
+                     répondent à la question ;
+      « extraits » — le début et les passages les plus pertinents (sujets secondaires, ou
+                     modèle d'analyse indisponible)."""
+    contenu = (contenu or "").strip()
+    if len(contenu) <= budget:
+        return contenu, "entier"
+    part_tete = int(budget * 0.4)
+    unites = _unites_de_lecture(contenu, max(500, min(CONDENSE_CHUNK, part_tete) - 120))
+    tete, taille = [], 0
+    while unites and taille + len(unites[0]) <= part_tete:
+        taille += len(unites[0]) + 2
+        tete.append(unites.pop(0))
+    if not tete:
+        tete.append(unites.pop(0)[:part_tete])
+    suite = "\n\n".join(unites)
+    blocs = ["[DÉBUT DU SUJET — reproduit mot pour mot]\n" + "\n\n".join(tete)]
+    mode = "extraits"
+    if condenser and unites:
+        # Tranches de lecture : au plus CONDENSE_MAX_CHUNKS, quitte à les faire plus grosses.
+        # On ferme une tranche dès qu'elle ATTEINT la taille visée : il ne peut donc pas y en
+        # avoir plus que prévu.
+        cible = max(CONDENSE_CHUNK, -(-len(suite) // CONDENSE_MAX_CHUNKS))
+        tranches, courant = [], ""
+        for u in unites:
+            courant = (courant + "\n\n" + u) if courant else u
+            if len(courant) >= cible:
+                tranches.append(courant)
+                courant = ""
+        if courant:
+            tranches.append(courant)
+        jetons = max(250, min(700, int(budget * 0.42 / len(tranches) / 3.5)))
+        verrou = asyncio.Semaphore(2)
+
+        async def _une(tr):
+            async with verrou:
+                return await _condenser(tr, question, jetons)
+        notes = await asyncio.gather(*(_une(tr) for tr in tranches))
+        if all(notes):
+            mode = "condense"
+            blocs.append("[SUITE DU SUJET — lue EN ENTIER, tranche par tranche, et condensée en notes "
+                         "de lecture fidèles : ce sont des notes, pas des citations]\n" + "\n\n".join(notes))
+    reste = budget - sum(len(b) for b in blocs)
+    if reste > 800:
+        demande = question or forum_engine.split_posts(contenu)[0]["texte"][:200]
+        passages, n, total = forum_engine.meilleurs_passages(suite, demande, reste - 300)
+        if passages:
+            blocs.append(f"[PASSAGES EXACTS de la suite les plus proches de la question — {n} sur {total}, "
+                         "mot pour mot]\n" + passages)
+        elif mode == "extraits":
+            blocs.append("[SUITE DU SUJET — début, mot pour mot]\n" + _smart_truncate(suite, reste - 300))
+    return "\n\n".join(blocs), mode
+
+async def _lire_sujet_bloc(grab, url, question="", budget=SUJET_COMPLET_MAX, copie_ok=True,
+                           condenser=True):
+    """Lit UN sujet en entier et le met en forme pour le modèle. La copie interne sert si elle
+    est toute fraîche (copie_ok) ou si le forum ne répond pas ; sinon le sujet est relu en direct
+    et la copie mise à jour au passage. Renvoie (bloc, texte intégral) ou (None, '')."""
+    officiel = _same_host(url, FORUM_URL)
+    cle = _cle_bibliotheque(url) if officiel else url
+    e = forum_content().get(cle) or {}
+    contenu, origine, n_pages, complet, structure = "", "", 1, True, True
+    if copie_ok and _copie_fraiche(e):
+        contenu, origine = e["contenu"], f"copie interne du {e.get('maj', '?')}"
+    else:
+        try:
+            sujet = await (copier_sujet(grab, url) if officiel
+                           else read_topic(grab, url, max_pages=FORUM_LIVE_PAGES))
+        except Exception as ex:
+            print(f"⚠️ Lecture du sujet {url} : {str(ex)[:100]}")
+            sujet = None
+        if sujet:
+            contenu, origine = sujet["texte"], "lu en direct sur le forum à l'instant"
+            n_pages, complet, structure = len(sujet["pages"]), sujet["complet"], sujet["structure"]
+            cle = sujet.get("cle", cle)
+            e = forum_content().get(cle) or {"titre": sujet["titre"]}
+        elif e.get("contenu"):
+            contenu = e["contenu"]
+            origine = f"le forum n'a pas répondu : copie interne du {e.get('maj', '?')}"
+    if not contenu:
+        return None, ""
+    titre = (library().get(cle) or {}).get("titre") or e.get("titre") or _slug_title(cle)
+    n_messages = len(forum_engine.split_posts(contenu))
+    texte, mode = await rendre_sujet(contenu, question, budget, condenser=condenser)
+    if not structure:
+        portee = "PAGE LUE EN ENTIER (les messages n'ont pas pu être distingués un à un)"
+    else:
+        portee = (f"SUJET LU EN ENTIER — {n_messages} message(s)"
+                  + (f" sur {n_pages} page(s)" if n_pages > 1 else "")
+                  + " : le message d'ouverture et toutes les réponses")
+    if not complet:
+        portee += (f". ATTENTION : seules les {n_pages} premières pages ont pu être lues, "
+                   "le sujet continue au-delà — signale-le")
+    forme = {"entier": "reproduits mot pour mot ci-dessous",
+             "condense": "trop long pour être recopié : le début est mot pour mot, la suite est "
+                         "condensée en notes de lecture",
+             "extraits": "trop long pour être recopié ici : le début et les passages les plus "
+                         f"pertinents (pour le lire entièrement : fouiller_forum avec url={cle})"}[mode]
+    chemin = _chemin_of(cle)
+    bloc = (f"=== SOURCE: {cle} ({titre}) ===\n"
+            + (f"Rubrique : {chemin}\n" if chemin else "")
+            + f"{portee}, {forme}. [{origine}]\n\n{texte}")
+    return bloc, contenu
+
+def _forum_noms_de_fiches():
+    """{ nom propre plié : [urls] } — les fiches du forum, retrouvables par un nom de leur titre."""
+    global _forum_noms
+    if _forum_noms[0] != _forum_rev:
+        idx, noms = forum_index(), {}
+        for url, e in library().items():
+            # Seul le DÉBUT du titre nomme la fiche (« Morwen Orphée — matriarche… de Skaldia » est
+            # la fiche de Morwen, pas celle de Skaldia), et un mot courant n'est pas un nom.
+            tete = forum_engine._TETE_TITRE_RE.split((e.get("titre") or "").strip(), maxsplit=1)[0]
+            for nom in _proper_nouns_of_title(tete):
+                if not idx.mot_courant(nom):
+                    noms.setdefault(nom, []).append(url)
+        _forum_noms = (_forum_rev, noms)
+    return _forum_noms[1]
+
+def _fiches_liees(textes, deja, requete="", limit=5, taille=420):
+    """Les ENTITÉS citées dans ce qu'on vient de lire et qui ont leur propre fiche sur le forum
+    (un personnage, un lieu, une faction nommés en passant) : le début de leur fiche, pour que
+    ces noms ne restent pas des inconnus. Sans appel au modèle, sans requête réseau."""
+    noms = _forum_noms_de_fiches()
+    if not noms:
+        return ""
+    demandes = set(forum_engine.termes(requete))
+    compte = {}
+    for mot in re.findall(r"[a-z0-9]{4,}", _fold(" ".join(textes)[:80000])):
+        for cand in (mot, mot[:-1] if mot.endswith("s") else mot + "s"):
+            if cand in noms and forum_engine.racine(cand) not in demandes:
+                compte[cand] = compte.get(cand, 0) + 1
+                break
+    fc, lib, lignes, vus = forum_content(), library(), [], set(deja)
+    for nom in sorted(compte, key=lambda n: -compte[n]):
+        urls = [u for u in noms[nom] if u not in vus]
+        if not urls or len(noms[nom]) > 3:          # un nom porté par trop de fiches ne désigne rien
+            continue
+        u = urls[0]
+        vus.add(u)
+        messages = forum_engine.split_posts((fc.get(u) or {}).get("contenu") or "")
+        debut = re.sub(r"\s+", " ", messages[0]["texte"])[:taille].strip() if messages else ""
+        titre = (lib.get(u) or {}).get("titre") or _slug_title(u)
+        lignes.append(f"• {titre} — {u}\n  " + (debut + "…" if debut else "(fiche pas encore copiée)"))
+        if len(lignes) >= limit:
+            break
+    if not lignes:
+        return ""
+    return ("\n\n=== FICHES LIÉES — noms cités dans ce qui précède et qui ont leur propre fiche sur le "
+            "forum (seulement le DÉBUT de chaque fiche ; pour en lire une en entier : fouiller_forum "
+            "avec son url) ===\n" + "\n".join(lignes))
+
+async def lire_un_sujet(url, question=""):
+    """Outil : lit CE sujet du forum en entier — message d'ouverture et toutes les réponses, page
+    après page — et le rend au modèle avec les fiches des entités qu'il cite."""
+    session = _web_session()
+    try:
+        bloc, contenu = await _lire_sujet_bloc(
+            _make_grab(session), url, question, copie_ok=False,
+            budget=FORUM_TOOL_RESULT_MAX - len(WEB_WRITE_DIRECTIVE) - 3500)
+    finally:
+        await session.close()
+    if not bloc:
+        return (f"[ÉCHEC] Impossible de lire le sujet {url} (forum injoignable, page introuvable ou "
+                "réservée aux membres). Dis-le honnêtement, sans inventer son contenu.")
+    if _same_host(url, FORUM_URL):
+        save_forum_content()
+        bloc += _fiches_liees([contenu], {_cle_bibliotheque(url)}, question)
+    return WEB_WRITE_DIRECTIVE + bloc
+
+_LISTE_INTENT_RE = re.compile(
+    r"membre|liste|lister|recens|effectif|tous les|toutes les|qui sont|qui compos|composent|"
+    r"affili|adepte|adh[ée]r|combien|lesquel|quels|quelles", re.IGNORECASE)
+
+async def recherche_forum(sujet, question=""):
+    """La recherche « comme sur le web », sur le forum officiel :
+      1. un coup d'œil aux nouveautés du forum (sujets neufs, nouvelles réponses) ;
+      2. recherche PLEIN TEXTE dans tous les sujets, classés par pertinence ;
+      3. lecture INTÉGRALE des meilleurs (relus en direct si leur copie n'est pas toute fraîche) ;
+      4. le début des fiches des entités qu'ils citent.
+    Renvoie le texte pour le modèle, ou None si l'index ne permet pas de répondre (copie interne
+    vide ou trop partielle) — l'appelant retombe alors sur l'exploration page par page."""
+    sujet, question = (sujet or "").strip(), (question or "").strip()
+    # Les MOTS-CLÉS décident de ce qui est un résultat ; la question en clair ne fait que
+    # départager et choisir les passages (« liste », « membres »… ne désignent aucun sujet).
+    requete, appoint = (sujet, question) if sujet else (question, "")
+    if not requete:
+        return None
+    libelle = f"« {requete} »" + (f" (question : {appoint})" if appoint and appoint != requete else "")
+    session = _web_session()
+    grab = _make_grab(session)
+    try:
+        await _forum_nouveautes(grab)
+        idx = await forum_index_async()
+        if not len(idx):
+            return None
+        liste = bool(_LISTE_INTENT_RE.search(f"{requete} {appoint}"))
+        hits = idx.search(requete, limit=40 if liste else 25, appoint=appoint)
+        if not hits and appoint:
+            # Les mots-clés n'ont rien donné : on retente avec les mots de la question elle-même.
+            hits = idx.search(appoint, limit=40 if liste else 25)
+        partielle = idx.couverture < 0.8
+        renfort = []
+        if partielle:
+            renfort = await _renfort_moteur_forum(grab, sujet or question, {h["url"] for h in hits[:8]})
+        if not hits and not renfort:
+            if partielle:
+                return None
+            return (WEB_WRITE_DIRECTIVE +
+                    f"RECHERCHE SUR LE FORUM pour {libelle} : AUCUN RÉSULTAT dans le texte des "
+                    f"{len(idx)} sujets du forum (titres, rubriques et contenu complet). Le forum n'en "
+                    "parle pas sous ces mots. Essaie UNE autre formulation (synonyme, nom propre seul) ; "
+                    "si c'est encore vide, dis franchement que tu n'as rien trouvé sur le forum.")
+
+        # Quels sujets LIRE : les meilleurs, tant qu'ils restent dans la course du premier.
+        # Pour un recensement (« liste les membres de… »), on en ouvre davantage : chaque fiche compte.
+        n_lire = FORUM_READ_TOP + 2 if liste else FORUM_READ_TOP
+        seuil = (0.2 if liste else 0.3) * hits[0]["score"] if hits else 0.0
+        a_lire = [h["url"] for h in hits[:8] if h["score"] >= seuil][:n_lire]
+        for u in renfort:                       # trouvés par le moteur du forum, pas encore indexés
+            if len(a_lire) < n_lire + 1 and u not in a_lire:
+                a_lire.append(u)
+
+        # Budget de lecture : ce qui reste une fois la liste des résultats posée (plus longue
+        # quand on demande un recensement : « liste les membres de… »).
+        dispo = FORUM_TOOL_RESULT_MAX - len(WEB_WRITE_DIRECTIVE) - (15000 if liste else 7000)
+        blocs, textes, lus = [], [], []
+        for i, u in enumerate(a_lire):
+            if i == 0:     # le meilleur sujet prend la place qu'il lui faut, les autres se partagent le reste
+                budget = min(dispo, max(SUJET_COMPLET_MAX, dispo - 4000 * (len(a_lire) - 1)))
+            else:
+                budget = max(4000, dispo // (len(a_lire) - i))
+            bloc, contenu = await _lire_sujet_bloc(grab, u, question or sujet, budget=budget,
+                                                   condenser=(i == 0))
+            if not bloc:
+                continue
+            blocs.append(bloc)
+            textes.append(contenu)
+            lus.append(_cle_bibliotheque(u))
+            dispo = max(0, dispo - len(bloc))
+            if dispo < 2500:
+                break
+        save_forum_content()
+
+        lignes = []
+        for i, h in enumerate(hits[:30 if liste else FORUM_RESULTS_LISTED], 1):
+            marque = "  [LU EN ENTIER CI-DESSOUS]" if h["url"] in lus else ""
+            rubrique = f" — {h['chemin']}" if h["chemin"] else ""
+            extrait = f"\n   « {h['extrait']} »" if h["extrait"] else ""
+            lignes.append(f"{i}. {h['titre']}{rubrique}{marque}\n   {h['url']}{extrait}")
+        tete = (f"RÉSULTATS DE LA RECHERCHE SUR LE FORUM pour {libelle} — {len(hits)} sujet(s) "
+                f"trouvé(s) dans le texte complet de {len(idx)} sujets, classés par pertinence :\n"
+                + "\n".join(lignes)
+                + "\n\nLes premiers sont LUS EN ENTIER ci-dessous (message d'ouverture et toutes les "
+                  "réponses). Pour lire en entier un autre résultat de la liste : fouiller_forum avec "
+                  "son url. Si rien ici ne répond à la question, relance UNE recherche avec d'autres "
+                  "mots — ou dis que le forum n'en parle pas.")
+        if partielle:
+            tete += (f"\n(Index encore partiel : le contenu de {int(idx.couverture * 100)} % des sujets est "
+                     "copié, les autres ne sont trouvables que par leur titre.)")
+        if not blocs:
+            tete += ("\n\n[ÉCHEC DE LECTURE] Aucun de ces sujets n'a pu être ouvert à l'instant "
+                     "(forum injoignable ?). Tu n'as que les extraits ci-dessus : dis-le.")
+        liees = _fiches_liees(textes, set(lus), requete) if blocs else ""
+        print(f"🔎 Recherche forum « {requete[:60]} » : {len(hits)} résultat(s), {len(blocs)} sujet(s) lu(s).")
+        return (WEB_WRITE_DIRECTIVE + tete + "\n\n" + "\n\n".join(blocs) + liees)[:FORUM_TOOL_RESULT_MAX]
+    finally:
+        await session.close()
 
 # ============================================================
 # ONBOARDING SERVEUR — fiches auto + observation discrète
@@ -7417,22 +7997,23 @@ TOOLS = [
             "required": ["id"]}}},
     {"type": "function", "function": {
         "name": "lire_page",
-        "description": "Lit une ou plusieurs pages web/forums (URLs) pour en extraire le contenu ; tu résumes ensuite CLAIREMENT en CITANT les sources (les liens). À utiliser dès qu'on te donne un lien ou qu'on te demande des infos sur une page/un forum. Uniquement des liens qu'on t'a RÉELLEMENT donnés (ou des pages du forum officiel) : tu ne devines et ne fabriques JAMAIS une URL pour aller chercher une réponse ailleurs.",
+        "description": "Lit une ou plusieurs pages web/forums (URLs) pour en extraire le contenu ; tu résumes ensuite CLAIREMENT en CITANT les sources (les liens). À utiliser dès qu'on te donne un lien ou qu'on te demande des infos sur une page/un forum. Un lien vers un SUJET du forum officiel est lu EN ENTIER : le message d'ouverture et toutes les réponses, toutes les pages. Uniquement des liens qu'on t'a RÉELLEMENT donnés (ou des pages du forum officiel) : tu ne devines et ne fabriques JAMAIS une URL pour aller chercher une réponse ailleurs.",
         "parameters": {"type": "object", "properties": {
             "urls": {"type": "string", "description": "Une ou plusieurs URLs (séparées par des espaces ou virgules)"}},
             "required": ["urls"]}}},
     {"type": "function", "function": {
         "name": "consulter_forum",
-        "description": "COUP D'ŒIL RAPIDE dans ta copie interne + la plateforme /forum (fiches déjà lues, notes, sujets écrits par les membres directement sur la plateforme). PRATIQUE mais PAS la référence : ta copie peut être incomplète, périmée, ou ne rien avoir sur le sujet. Le VRAI forum, la source qui fait autorité, c'est le forum officiel en ligne — que tu lis avec fouiller_forum. RÈGLE : pour toute question de lore/univers (Orbis Naturae), va D'ABORD fouiller le forum en direct (fouiller_forum) ; consulter_forum ne sert qu'à (a) te donner une amorce instantanée, (b) retrouver un sujet écrit UNIQUEMENT sur la plateforme interne, ou (c) dépanner si le forum en ligne est injoignable. Ne t'en contente JAMAIS pour une réponse complète : ce qui n'y figure pas n'est pas « inexistant », c'est juste hors de ta copie — dans ce cas, fouille en direct.",
+        "description": "COUP D'ŒIL RAPIDE dans ta copie interne du forum + la plateforme /forum, sans rien télécharger : les passages des fiches qui parlent du sujet, et les sujets écrits directement sur la plateforme. PRATIQUE mais PAS la référence : ta copie peut dater de quelques heures ou être incomplète. RÈGLE : pour toute question de lore/univers (Orbis Naturae), c'est fouiller_forum qui fait autorité — il relit les sujets EN ENTIER et en direct. consulter_forum ne sert qu'à (a) une amorce instantanée, (b) retrouver un sujet écrit UNIQUEMENT sur la plateforme interne, ou (c) dépanner si le forum en ligne est injoignable. Ce qui n'y figure pas n'est pas « inexistant » : dans ce cas, fouille en direct.",
         "parameters": {"type": "object", "properties": {
             "sujet": {"type": "string", "description": "Ce que tu cherches dans ta copie (ex : 'Linnorms', 'Empire Skaldien', 'Malaso')"}},
             "required": ["sujet"]}}},
     {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "TON OUTIL PRINCIPAL POUR LE FORUM — la vraie recherche, complète et en profondeur, sur le forum officiel EN LIGNE (la source qui fait autorité). C'est le PREMIER réflexe pour TOUTE question de lore/univers du projet (personnages, lieux, factions, créatures, événements, règles…) : « dis-moi tout sur les Linnorms », « c'est qui Salina ? », « parle-moi de l'Empire Skaldien ». Tu fouilles comme un moteur de recherche moderne (à la Grok) : tu interroges le moteur du forum, tu descends dans les sous-forums, tu lis PLUSIEURS discussions en entier, tu suis les liens vers les entités citées, et tu synthétises TOUT en un rapport détaillé et SOURCÉ. Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : la référence par défaut, tu n'as PAS besoin qu'on te donne le lien — lance-toi directement. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS du forum — une SECTION (ex : /f2-les-heros-incarnes) ou un SUJET : tu explores alors CETTE page directement. Tu ne sors PAS du forum officiel de ta propre initiative : jamais un wiki, un autre forum ou un autre site pour compléter (un lien extérieur n'est suivi que si la personne te l'a donné elle-même). Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien). Préfère TOUJOURS cet outil à consulter_forum pour une vraie réponse : consulter_forum n'est qu'une amorce, ici tu vas chercher la vérité à la source.",
+        "description": "TON OUTIL PRINCIPAL POUR LE FORUM — un vrai moteur de recherche sur le forum officiel EN LIGNE, https://orbis-naturae.forumactif.com/ (la source qui fait autorité). C'est le PREMIER réflexe pour TOUTE question de lore/univers du projet (personnages, lieux, factions, créatures, événements, règles…) : « dis-moi tout sur les Linnorms », « c'est qui Salina ? », « parle-moi de l'Empire Skaldien ». Il cherche dans le TEXTE COMPLET de tous les sujets (pas seulement leurs titres), classe les résultats par pertinence comme un moteur web, puis LIT EN ENTIER les meilleurs sujets — le message d'ouverture ET toutes les réponses, toutes les pages — avant de te laisser répondre. Tu n'as PAS besoin qu'on te donne le lien : lance-toi directement. 'sujet' = les mots-clés (noms propres d'abord) ; 'question' = la question exacte qu'on te pose, pour retenir les bons passages. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS du forum : un SUJET (/t45-…) → tu lis CE sujet en entier, réponses comprises ; une SECTION (ex : /f2-les-heros-incarnes) → tu explores cette section. Mets 'strict'=true quand on te demande de rester DANS une section (« dans cette section », « parmi ceux qui s'y trouvent », « ton préféré ici »). Si la liste de résultats montre un sujet prometteur qui n'a pas été lu, rappelle l'outil avec son 'url' ; si rien ne répond, relance UNE recherche avec d'autres mots avant de conclure que le forum n'en parle pas. Tu ne sors PAS du forum officiel de ta propre initiative : jamais un wiki, un autre forum ou un autre site pour compléter (un lien extérieur n'est suivi que si la personne te l'a donné elle-même). Ensuite tu résumes en citant chaque source (lien). Préfère TOUJOURS cet outil à consulter_forum pour une vraie réponse.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string", "description": "À remplir dès qu'un lien précis du forum est donné : section (/f2-...) ou sujet (/t45-...). Laisse vide pour une recherche générale sur tout le forum officiel. Jamais une URL que tu aurais devinée."},
-            "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"},
+            "url": {"type": "string", "description": "À remplir dès qu'un lien précis du forum est donné : un sujet (/t45-...) pour le lire en entier, ou une section (/f2-...). Laisse vide pour une recherche sur tout le forum officiel. Jamais une URL que tu aurais devinée."},
+            "sujet": {"type": "string", "description": "Les mots-clés de la recherche : le ou les noms propres d'abord (ex : 'Linnorms', 'Salina Tasglev'). Entre guillemets pour exiger une expression exacte."},
+            "question": {"type": "string", "description": "La question exacte posée par la personne (ex : 'qui est le roi des Linnorms ?'). Sert à retenir les passages qui y répondent."},
             "strict": {"type": "boolean", "description": "true = reste STRICTEMENT dans la section/page de 'url', sans explorer le reste du forum. À activer quand on restreint à « cette section / cette partie » ou qu'on demande ton avis sur celle-ci."}},
             "required": ["sujet"]}}},
     {"type": "function", "function": {
@@ -7754,15 +8335,19 @@ def _forum_known_names():
     """{ nom propre plié : titre de la fiche } tiré de la bibliothèque du forum (titres et
     rubriques). Reconstruit seulement quand la carte change."""
     lib = library()
-    cle = (len(lib), library_meta().get("derniere_carte", ""))
+    cle = (len(lib), library_meta().get("derniere_carte", ""), _forum_rev)
     if _title_names_cache["cle"] != cle:
-        noms = {}
+        # Un mot qu'on lit surtout SANS majuscule dans les textes du forum (« terre », « ordre »)
+        # n'est pas un nom propre, même capitalisé dans un titre.
+        idx, noms = forum_index(), {}
         for e in lib.values():
             titre = (e.get("titre") or "").strip()
             for nom in _proper_nouns_of_title(titre):
-                noms.setdefault(nom, titre)
+                if not idx.mot_courant(nom):
+                    noms.setdefault(nom, titre)
             for nom in _proper_nouns_of_title(e.get("chemin") or ""):
-                noms.setdefault(nom, (e.get("chemin") or "").strip())
+                if not idx.mot_courant(nom):
+                    noms.setdefault(nom, (e.get("chemin") or "").strip())
         _title_names_cache["cle"], _title_names_cache["noms"] = cle, noms
     return _title_names_cache["noms"]
 
@@ -8058,31 +8643,24 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             return await consulter_forum(args.get("sujet", ""))
         if name == "fouiller_forum":
             sujet = args.get("sujet", "")
-            # La bibliothèque ne REMPLACE plus la lecture (elle ne stocke que des mots-clés) :
-            # elle sert à CIBLER. On repère les sujets pertinents connus, et on part fouiller
-            # normalement — le contenu est toujours lu frais, mais on sait où chercher.
-            depart = None
+            # Sans lien : recherche par le moteur (texte complet de tous les sujets) puis lecture
+            # intégrale des meilleurs. Avec un lien de sujet : ce sujet, en entier. Avec un lien
+            # de section : exploration de cette section (cf. fouiller_forum).
             url_arg = (args.get("url") or "").strip()
             if url_arg.startswith("/"):
                 # Lien relatif (« /f2-les-heros-incarnes ») : il désigne une page du forum officiel.
-                from urllib.parse import urljoin
                 url_arg = urljoin(FORUM_URL, url_arg)
             if url_arg and allowed_hosts is not None and _host(url_arg) not in allowed_hosts:
                 # SOURCE UNIQUE : un site que personne ne lui a donné → on reste sur le forum officiel.
                 print(f"🚧 fouiller_forum : {url_arg} est hors forum, fouille ramenée sur {FORUM_URL}")
                 url_arg = ""
-            if sujet and not url_arg:
-                cibles = library_targets(sujet, limit=3)
-                if cibles:
-                    noms = ", ".join(c["titre"] for c in cibles if c.get("titre"))
-                    print(f"📖 Bibliothèque : sujets ciblés pour « {sujet} » → {noms}")
-                    depart = cibles[0]["url"]     # on démarre la fouille sur le sujet le plus pertinent
             strict = bool(args.get("strict", False))
             # Un lien de SECTION explicite (/f2-…, /c3-…) ⇒ on reste dedans par défaut : l'utilisateur
             # a pointé une zone précise. On n'écrase pas un strict=false posé volontairement.
             if url_arg and _section_id(url_arg) and "strict" not in args:
                 strict = True
-            return await fouiller_forum(depart or url_arg or FORUM_URL, sujet, strict=strict)
+            return await fouiller_forum(url_arg or FORUM_URL, sujet, strict=strict,
+                                        question=str(args.get("question") or ""))
         if name == "recherche_web":
             return await recherche_web(args.get("requete", ""), lire=args.get("lire", 2))
         if name == "resumer_salon":
@@ -9207,9 +9785,13 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
             # TRACE DE TOUTE ACTION : sans ça, impossible de savoir si elle a vraiment agi
             # ou si elle s'est contentée de dire qu'elle l'avait fait.
             log_tool_call(tc.function.name, args, result, caller_name or str(caller_id))
+            # lire_page sur un lien du forum officiel = lecture d'un sujet : même régime que la fouille.
+            lit_le_forum = (tc.function.name in ("fouiller_forum", "consulter_forum")
+                            or (tc.function.name == "lire_page"
+                                and _host(FORUM_URL) in str(args.get("urls", ""))))
             if not execute:
                 cap = TOOL_RESULT_MAX_CHARS
-            elif tc.function.name in ("fouiller_forum", "consulter_forum"):
+            elif lit_le_forum:
                 cap = FORUM_TOOL_RESULT_MAX
                 long_reply = True
                 # RESTITUTION FORUM : on écarte la mémoire des joueurs du contexte, pour qu'elle
@@ -10668,7 +11250,9 @@ LIBRARY_REMAP_HOURS = 24        # on recartographie le forum une fois par jour
 async def library_loop():
     """Construit et entretient la bibliothèque sans jamais bloquer le bot :
     (re)carte du forum une fois par jour, puis résumés par petits lots."""
-    if not get_setting("forum_library", True) or quota_exhausted():
+    # La carte et la copie du forum ne demandent AUCUN appel au modèle : elles continuent même
+    # quand le quota est épuisé (seuls les mots-clés, à l'étape 2, attendent qu'il revienne).
+    if not get_setting("forum_library", True):
         return
     meta = library_meta()
     # 1) Carte quotidienne (ou première carte si jamais faite)
@@ -10684,7 +11268,7 @@ async def library_loop():
         except Exception as e:
             print(f"⚠️ Cartographie forum échouée : {str(e)[:100]}")
     # 2) Un lot de résumés
-    if meta.get("a_resumer"):
+    if meta.get("a_resumer") and not quota_exhausted():
         try:
             r = await library_summarize_batch()
             if r["faits"]:
@@ -13075,6 +13659,7 @@ async def on_message(message):
             #    mémoire interne (ou dit qu'elle ne connaît pas ce membre), sans rien inventer.
             peut_fouiller = any(t["function"]["name"] in FORUM_LOOKUP_TOOLS for t in (tools_for_user or []))
             if peut_fouiller and not mentionnes and route != "roleplay":
+                await forum_index_async()      # réindexation éventuelle hors de la boucle principale
                 fiches = forum_titles_in_text(content)
                 suite = _forum_grace.get(user_id, 0) > 0
             if fouille_demandee:

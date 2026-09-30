@@ -71,11 +71,22 @@ class ResolveurPublic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([i["host"] for i in infos], ["192.168.1.20"])
 
 
+class _Corps:
+    """Le flux d'une réponse : livré par morceaux, comme sur le réseau."""
+
+    def __init__(self, corps):
+        self.corps = corps
+
+    async def iter_chunked(self, taille):
+        for i in range(0, len(self.corps), taille):
+            yield self.corps[i:i + taille]
+
+
 class _Reponse:
     def __init__(self, url, status=200, headers=None, corps=b"<html><title>T</title>ok</html>"):
         self.url, self.status = url, status
         self.headers = {"Content-Type": "text/html", **(headers or {})}
-        self.content = types.SimpleNamespace(read=mock.AsyncMock(return_value=corps))
+        self.content = _Corps(corps)
 
     async def __aenter__(self):
         return self

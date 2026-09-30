@@ -32,6 +32,7 @@ class AvecBibliotheque:
         p.start()
         self.addCleanup(p.stop)
         B._title_names_cache["cle"] = None          # la carte a changé : on oublie le cache
+        B.forum_changed()                           # …et le moteur de recherche se réindexe
 
 
 class SignalWeb(unittest.TestCase):
@@ -121,17 +122,22 @@ class RelanceApresFouille(unittest.TestCase):
 class OutilsDeLecture(AvecBibliotheque, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         super().setUp()
-        self.lus, self.fouilles = [], []
+        self.lus, self.fouilles, self.sujets_lus = [], [], []
 
         async def faux_fetch(url, session=None):
             self.lus.append(url)
             return {"url": url, "title": "T", "text": "contenu"}
 
-        async def fausse_fouille(url, sujet="", strict=False):
+        async def fausse_fouille(url, sujet="", strict=False, question=""):
             self.fouilles.append((url, sujet, strict))
             return "ok"
 
-        for nom, faux in (("fetch_url_text", faux_fetch), ("fouiller_forum", fausse_fouille)):
+        async def faux_sujet(grab, url, question="", **kw):
+            self.sujets_lus.append(url)
+            return f"=== SOURCE: {url} (T) ===\nSUJET LU EN ENTIER", "texte"
+
+        for nom, faux in (("fetch_url_text", faux_fetch), ("fouiller_forum", fausse_fouille),
+                          ("_lire_sujet_bloc", faux_sujet)):
             p = mock.patch.object(B, nom, faux)
             p.start()
             self.addCleanup(p.stop)
@@ -142,7 +148,9 @@ class OutilsDeLecture(AvecBibliotheque, unittest.IsolatedAsyncioTestCase):
             "https://warhammer.fandom.com/wiki/Skaven "
             f"https://{FORUM}/t3-linnorms https://example.org/a")}, None, allowed_hosts=self.hotes)
         self.assertIn("[REFUSÉ] https://warhammer.fandom.com/wiki/Skaven", resultat)
-        self.assertEqual(self.lus, [f"https://{FORUM}/t3-linnorms", "https://example.org/a"])
+        self.assertEqual(self.lus, ["https://example.org/a"])                  # page web ordinaire
+        self.assertEqual(self.sujets_lus, [f"https://{FORUM}/t3-linnorms"])    # sujet du forum : lu en entier
+        self.assertIn("SUJET LU EN ENTIER", resultat)
 
     async def test_lire_page_libre_hors_serveur_orbis(self):
         await B.execute_tool("lire_page", {"urls": "https://warhammer.fandom.com/wiki/Skaven"}, None)
@@ -159,9 +167,9 @@ class OutilsDeLecture(AvecBibliotheque, unittest.IsolatedAsyncioTestCase):
                              None, allowed_hosts=self.hotes)
         self.assertEqual(self.fouilles[-1], (f"https://{FORUM}/f2-les-heros-incarnes", "héros", True))
 
-    async def test_fouiller_forum_part_de_la_fiche_connue(self):
+    async def test_fouiller_forum_sans_lien_cherche_sur_tout_le_forum(self):
         await B.execute_tool("fouiller_forum", {"sujet": "linnorm"}, None, allowed_hosts=self.hotes)
-        self.assertTrue(self.fouilles[-1][0].endswith("/t3-linnorms"))
+        self.assertEqual(self.fouilles[-1], (B.FORUM_URL, "linnorm", False))
 
 
 # --- Faux modèle : mêmes attributs que ceux lus par chat_with_tools ---
