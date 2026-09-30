@@ -1,7 +1,21 @@
-# Fichiers à ignorer
+# Secrets — ne JAMAIS versionner
 .env
-history.json
+cookies.txt
+
+# Données du bot (mémoire, conversations, copie du forum, état du panneau admin)
 memory.json
+history.json
+admin_state.json
+forum_content.json
+forum_platform.db
+forum_platform.db-wal
+forum_platform.db-shm
+
+# Dérivés de ces fichiers : écriture atomique en cours, sauvegarde d'annulation,
+# fichier illisible mis de côté au chargement
+*.tmp
+*.bak
+*.corrompu-*
 
 # Python bytecode (généré, ne jamais versionner)
 __pycache__/
