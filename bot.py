@@ -3247,6 +3247,12 @@ async def _mission_consigne(m, force=False, progress=None):
         "tu utilises tes outils (lancer_des, resoudre_attaques) et tu rapportes leurs chiffres "
         "EXACTS. Réponse compacte : Discord coupe à 2000 caractères.",
     ])
+    # Même cloison qu'en conversation : sur un serveur Orbis, la consigne ne sort pas du forum
+    # (pas de recherche web sauf si la consigne la demande, pas d'URL devinée).
+    outils, hotes = TOOLS, None
+    if get_guild_setting(m.get("guild_id"), "forum_orbis", False):
+        outils, hotes = orbis_source_scope(TOOLS, consigne)
+        system += ORBIS_ONLY_DIRECTIVE
     if progress:
         progress(45, "Exécution de la consigne…")
     try:
@@ -3254,12 +3260,13 @@ async def _mission_consigne(m, force=False, progress=None):
             system,
             [{"role": "user", "content": consigne}],
             guild,
-            tools=TOOLS,
+            tools=outils,
             caller_id=MSCHAP_ID,
             caller_name="Mschap",
             caller_channel_id=(int(m["channel_id"]) if m.get("channel_id") else None),
             long_reply=True,
             route="chat",
+            allowed_hosts=hotes,
         )
     except Exception as e:
         m["erreurs"] = m.get("erreurs", 0) + 1
@@ -3565,8 +3572,10 @@ async def run_mission(m, force=False, progress=None):
         return await _mission_meme(m, force=force, progress=progress)
     return await _mission_forum(m, force=force, progress=progress)
 
-async def tool_lire_page(urls):
-    """Lit 1 à 4 URLs et renvoie leur contenu nettoyé, chaque bloc préfixé par sa source."""
+async def tool_lire_page(urls, allowed_hosts=None):
+    """Lit 1 à 4 URLs et renvoie leur contenu nettoyé, chaque bloc préfixé par sa source.
+    allowed_hosts (serveur Orbis) : seuls ces hôtes sont lus — le forum officiel et les sites
+    dont quelqu'un a donné le lien. Une URL devinée par le modèle est refusée, pas suivie."""
     if isinstance(urls, str):
         urls = [u.strip() for u in re.split(r"[\s,]+", urls) if u.strip()]
     urls = [u for u in (urls or []) if u][:4]
@@ -3577,6 +3586,11 @@ async def tool_lire_page(urls):
                                     cookie_jar=aiohttp.CookieJar(unsafe=True))
     try:
         for u in urls:
+            if allowed_hosts is not None and _host(u) not in allowed_hosts:
+                out.append(f"[REFUSÉ] {u} — hors du forum Orbis Naturae, et personne ne t'a donné "
+                           "ce lien. Tu ne vas pas chercher ailleurs : dis ce que tu n'as pas trouvé "
+                           "sur le forum, sans compléter avec une autre source.")
+                continue
             res = await fetch_url_text(u, session=session)
             if res is None:
                 out.append(f"[REFUSÉ] {u} — URL invalide ou adresse interne bloquée.")
@@ -3614,6 +3628,9 @@ WEB_WRITE_DIRECTIVE = (
     "forum » — et reste vague plutôt que d'inventer.\n"
     "Attention aussi aux citations : un texte du forum peut reprendre une œuvre extérieure "
     "(film, roman) ; ne la confonds pas avec le lore du monde.\n"
+    "AUCUN AUTRE UNIVERS : tu ne complètes jamais ces sources avec ce que tu connais d'une autre "
+    "œuvre (Warhammer, Donjons & Dragons, Tolkien, Warcraft, mythologies…). Un nom qui existe aussi "
+    "ailleurs désigne ici ce que CES sources en disent, et rien de plus.\n"
     "CLOISON ÉTANCHE — TU N'UTILISES QUE LE FORUM ICI : ta réponse s'appuie EXCLUSIVEMENT sur les "
     "sources ci-dessous et sur ta copie du forum. Tes notes sur les MEMBRES Discord (ce que les "
     "joueurs t'ont raconté en conversation, ce que tu sais d'eux, leurs habitudes, vos échanges) "
@@ -4917,7 +4934,8 @@ async def _fouiller_forum_inner(session, root, origin, kw, sujet, fetches,
         context_blocks.append(
             "(Aucune discussion exploitable trouvée sur ce sujet : le forum n'a peut-être aucun résultat, "
             "exige une connexion, ou charge son contenu en JavaScript." + detail +
-            " Résume ce qui a pu être lu, cite les liens, et signale honnêtement ce qui a échoué.)")
+            " Résume ce qui a pu être lu, cite les liens, et signale honnêtement ce qui a échoué."
+            " Ne comble pas ce vide avec une autre source ni avec un autre univers.)")
     tete = ""
     if strict:
         tete = ("[CADRE STRICT] On t'a demandé de rester DANS cette section précise du forum. "
@@ -7278,7 +7296,7 @@ TOOLS = [
             "required": ["id"]}}},
     {"type": "function", "function": {
         "name": "lire_page",
-        "description": "Lit une ou plusieurs pages web/forums (URLs) pour en extraire le contenu ; tu résumes ensuite CLAIREMENT en CITANT les sources (les liens). À utiliser dès qu'on te donne un lien ou qu'on te demande des infos sur une page/un forum.",
+        "description": "Lit une ou plusieurs pages web/forums (URLs) pour en extraire le contenu ; tu résumes ensuite CLAIREMENT en CITANT les sources (les liens). À utiliser dès qu'on te donne un lien ou qu'on te demande des infos sur une page/un forum. Uniquement des liens qu'on t'a RÉELLEMENT donnés (ou des pages du forum officiel) : tu ne devines et ne fabriques JAMAIS une URL pour aller chercher une réponse ailleurs.",
         "parameters": {"type": "object", "properties": {
             "urls": {"type": "string", "description": "Une ou plusieurs URLs (séparées par des espaces ou virgules)"}},
             "required": ["urls"]}}},
@@ -7290,15 +7308,15 @@ TOOLS = [
             "required": ["sujet"]}}},
     {"type": "function", "function": {
         "name": "fouiller_forum",
-        "description": "TON OUTIL PRINCIPAL POUR LE FORUM — la vraie recherche, complète et en profondeur, sur le forum officiel EN LIGNE (la source qui fait autorité). C'est le PREMIER réflexe pour TOUTE question de lore/univers du projet (personnages, lieux, factions, créatures, événements, règles…) : « dis-moi tout sur les Linnorms », « c'est qui Salina ? », « parle-moi de l'Empire Skaldien ». Tu fouilles comme un moteur de recherche moderne (à la Grok) : tu interroges le moteur du forum, tu descends dans les sous-forums, tu lis PLUSIEURS discussions en entier, tu suis les liens vers les entités citées, et tu synthétises TOUT en un rapport détaillé et SOURCÉ. Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : la référence par défaut, tu n'as PAS besoin qu'on te donne le lien — lance-toi directement. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS — une SECTION (ex : /f2-les-heros-incarnes), un SUJET, ou un autre site : tu explores alors CETTE page directement. Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien). Préfère TOUJOURS cet outil à consulter_forum pour une vraie réponse : consulter_forum n'est qu'une amorce, ici tu vas chercher la vérité à la source.",
+        "description": "TON OUTIL PRINCIPAL POUR LE FORUM — la vraie recherche, complète et en profondeur, sur le forum officiel EN LIGNE (la source qui fait autorité). C'est le PREMIER réflexe pour TOUTE question de lore/univers du projet (personnages, lieux, factions, créatures, événements, règles…) : « dis-moi tout sur les Linnorms », « c'est qui Salina ? », « parle-moi de l'Empire Skaldien ». Tu fouilles comme un moteur de recherche moderne (à la Grok) : tu interroges le moteur du forum, tu descends dans les sous-forums, tu lis PLUSIEURS discussions en entier, tu suis les liens vers les entités citées, et tu synthétises TOUT en un rapport détaillé et SOURCÉ. Le forum officiel et unique du projet est https://orbis-naturae.forumactif.com/ : la référence par défaut, tu n'as PAS besoin qu'on te donne le lien — lance-toi directement. RENSEIGNE 'url' dès qu'on te pointe un LIEN PRÉCIS du forum — une SECTION (ex : /f2-les-heros-incarnes) ou un SUJET : tu explores alors CETTE page directement. Tu ne sors PAS du forum officiel de ta propre initiative : jamais un wiki, un autre forum ou un autre site pour compléter (un lien extérieur n'est suivi que si la personne te l'a donné elle-même). Mets 'strict'=true quand on te demande de rester DANS cette section/partie (« dans cette section », « sur cette partie du forum », « parmi ceux qui s'y trouvent », « ton préféré ici ») : tu ne liras QUE cette section. Passe TOUJOURS le sujet dans 'sujet' (si on ne cible qu'une section sans thème, mets-y un mot large comme « personnages » ou « héros »). Ensuite tu résumes en citant chaque source (lien). Préfère TOUJOURS cet outil à consulter_forum pour une vraie réponse : consulter_forum n'est qu'une amorce, ici tu vas chercher la vérité à la source.",
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string", "description": "À remplir dès qu'un lien précis est donné : section (/f2-...), sujet (/t45-...) ou autre site. Laisse vide seulement pour une recherche générale sur tout le forum officiel."},
+            "url": {"type": "string", "description": "À remplir dès qu'un lien précis du forum est donné : section (/f2-...) ou sujet (/t45-...). Laisse vide pour une recherche générale sur tout le forum officiel. Jamais une URL que tu aurais devinée."},
             "sujet": {"type": "string", "description": "Le sujet recherché (ex : 'Linnorms') — indispensable pour cibler la recherche"},
             "strict": {"type": "boolean", "description": "true = reste STRICTEMENT dans la section/page de 'url', sans explorer le reste du forum. À activer quand on restreint à « cette section / cette partie » ou qu'on demande ton avis sur celle-ci."}},
             "required": ["sujet"]}}},
     {"type": "function", "function": {
         "name": "recherche_web",
-        "description": "Cherche sur le WEB (moteur de recherche) et lit les meilleurs résultats. À utiliser quand on te demande une information que tu ne connais pas et qu'AUCUN lien ne t'est donné : actualité, définition, personne, jeu, code, fait récent. Tu résumes ensuite en citant tes sources.",
+        "description": "Cherche sur le WEB (moteur de recherche) et lit les meilleurs résultats. À utiliser quand on te demande une information du MONDE RÉEL que tu ne connais pas et qu'AUCUN lien ne t'est donné : actualité, définition, personne, jeu, code, fait récent. JAMAIS pour le lore ou l'univers du serveur (personnages, lieux, factions, créatures, règles du jeu de rôle) : le web ne connaît que d'AUTRES univers aux noms voisins, qui n'ont rien à voir. Tu résumes ensuite en citant tes sources.",
         "parameters": {"type": "object", "properties": {
             "requete": {"type": "string", "description": "Ce qu'il faut chercher (mots-clés efficaces)"},
             "lire": {"type": "integer", "description": "Nombre de résultats à ouvrir vraiment (1 à 3, défaut 2)"}},
@@ -7528,6 +7546,132 @@ def filter_tools_for_guild(tools, orbis_on):
         return tools
     return [t for t in tools if t["function"]["name"] not in ORBIS_TOOL_NAMES]
 
+# ============================================================
+# SOURCE UNIQUE — sur un serveur Orbis, elle ne cherche QUE sur le forum officiel
+# ============================================================
+# Le défaut constaté : sans mot « forum » dans la question, les outils forum étaient retirés
+# mais la recherche web restait offerte → « c'est quoi un X ? » partait sur un moteur
+# généraliste et revenait avec le lore d'un AUTRE univers aux noms voisins (Warhammer, D&D…).
+# Trois verrous DÉTERMINISTES (aucun ne repose sur la bonne volonté du modèle) :
+#   1. recherche_web n'est proposée que si la personne DEMANDE explicitement internet ;
+#   2. lire_page / fouiller_forum ne touchent que le forum officiel, ou un site dont la
+#      personne a elle-même donné le lien — jamais une URL devinée par le modèle ;
+#   3. chat_with_tools refuse tout outil qui n'a pas été proposé pour ce message.
+WEB_SEARCH_TOOLS = {"recherche_web"}
+_WEB_SIGNAL_RE = re.compile(
+    r"(?<!\w)(internet|web|google\w*|wikip[ée]dia|duckduckgo|bing|sur\s+le\s+net)(?!\w)",
+    re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s<>\"'\]\)]+", re.IGNORECASE)
+
+def web_signal(content):
+    """Vrai si la personne demande EXPLICITEMENT une recherche sur internet."""
+    return bool(content) and bool(_WEB_SIGNAL_RE.search(content))
+
+def orbis_allowed_hosts(*textes):
+    """Hôtes que lire_page / fouiller_forum ont le droit de toucher sur un serveur Orbis :
+    le forum officiel, plus les sites dont un HUMAIN a donné le lien dans `textes`."""
+    hosts = {_host(FORUM_URL)}
+    for t in textes:
+        for u in _URL_RE.findall(t or ""):
+            h = _host(u)
+            if h:
+                hosts.add(h)
+    return hosts
+
+def orbis_source_scope(tools, texte, historique=()):
+    """Applique la SOURCE UNIQUE à un tour de parole sur un serveur Orbis.
+    Renvoie (outils, hôtes_autorisés) : la recherche web est retirée sauf demande explicite,
+    et la lecture d'URL est bornée au forum + aux liens donnés par les gens."""
+    if tools and not web_signal(texte):
+        tools = [t for t in tools if t["function"]["name"] not in WEB_SEARCH_TOOLS]
+    return tools, orbis_allowed_hosts(texte, *historique)
+
+# --- Une question peut viser le forum SANS le mot « forum » : elle NOMME une fiche ----------
+# « c'est qui Lorenzo ? », « parle-moi de Skaldia » : aucun mot-clé, mais un nom propre connu du
+# forum. On le repère dans la carte mémorisée (bibliothèque), en ne retenant que les NOMS
+# PROPRES des titres et rubriques — un mot courant (« organisation », « maître ») ne doit pas
+# envoyer toute la conversation sur le forum.
+_TITLE_SEP_RE = re.compile(r"\s+-\s+|[—–:|,;/()«»\"›]")
+_TITLE_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+# Mots qui prennent une majuscule dans un titre sans être le nom d'une entité.
+_TITLE_GENERIC = _GENERIC_FACTION | {
+    "orbis", "naturae", "monde", "continent", "archipel", "archipels", "iles", "terres",
+    "nord", "ouest", "grand", "grande", "grands", "grandes", "haut", "haute", "hauts", "hautes",
+    "saint", "sainte", "saints", "saintes", "nouveau", "nouvelle", "vieux", "vieille", "ancien",
+    "ancienne", "premier", "premiere", "guerre", "guerres", "bataille", "batailles", "histoire",
+    "fiche", "fiches", "personnage", "personnages", "heros", "regle", "regles", "reglement",
+    "presentation", "contexte", "annonce", "annonces", "guide", "carte", "liste", "sujet",
+    "forum", "serveur", "discord", "maitre", "seigneur", "dame", "sire", "prince", "princesse",
+    "reine", "comte", "comtesse", "baron", "baronne", "capitaine", "general", "pere", "mere",
+}
+_title_names_cache = {"cle": None, "noms": {}}
+
+def _proper_nouns_of_title(titre):
+    """Noms propres d'un titre, pliés (sans accents, minuscules) : un mot à majuscule qui n'ouvre
+    pas le segment, ou qui l'ouvre suivi d'un autre mot à majuscule (« Lorenzo Stenode »), ou un
+    titre d'un seul mot (« Linnorms »)."""
+    noms = set()
+    segments = [s for s in _TITLE_SEP_RE.split(titre or "") if s.strip()]
+    for n_seg, seg in enumerate(segments):
+        mots = _TITLE_TOKEN_RE.findall(seg)
+        while mots and len(mots[0]) == 1:      # article élidé en tête (« L'Illumination… »)
+            mots.pop(0)
+        for i, m in enumerate(mots):
+            if not m[0].isupper():
+                continue
+            if i == 0:
+                suivi_majuscule = len(mots) > 1 and mots[1][0].isupper()
+                titre_d_un_mot = len(mots) == 1 and n_seg == 0
+                if not (suivi_majuscule or titre_d_un_mot):
+                    continue
+            f = _fold(m).strip()
+            if len(f) >= 4 and f not in _TITLE_GENERIC:
+                noms.add(f)
+    return noms
+
+def _forum_known_names():
+    """{ nom propre plié : titre de la fiche } tiré de la bibliothèque du forum (titres et
+    rubriques). Reconstruit seulement quand la carte change."""
+    lib = library()
+    cle = (len(lib), library_meta().get("derniere_carte", ""))
+    if _title_names_cache["cle"] != cle:
+        noms = {}
+        for e in lib.values():
+            titre = (e.get("titre") or "").strip()
+            for nom in _proper_nouns_of_title(titre):
+                noms.setdefault(nom, titre)
+            for nom in _proper_nouns_of_title(e.get("chemin") or ""):
+                noms.setdefault(nom, (e.get("chemin") or "").strip())
+        _title_names_cache["cle"], _title_names_cache["noms"] = cle, noms
+    return _title_names_cache["noms"]
+
+def forum_titles_in_text(content, limit=3):
+    """Titres des fiches du forum que le message NOMME (par un nom propre de leur titre),
+    singulier/pluriel tolérés. Liste vide si la bibliothèque est vide ou si rien ne correspond."""
+    noms = _forum_known_names()
+    if not noms or not content:
+        return []
+    titres = []
+    for w in sorted(_words(content)):
+        for cand in (w, w[:-1] if w.endswith("s") else w + "s"):
+            t = noms.get(cand)
+            if t:
+                if t not in titres:
+                    titres.append(t)
+                break
+    return titres[:limit]
+
+# Une relance juste après une fouille (« et son frère ? ») ne répète pas le mot « forum » :
+# pendant quelques tours, elle garde ses outils de forum au lieu de retomber sur « membre Discord ».
+FORUM_GRACE_TURNS = 2
+_forum_grace = {}  # user_id -> tours restants où une relance reste rattachée au forum
+
+def update_forum_grace(user_id, used_tools):
+    if FORUM_LOOKUP_TOOLS & set(used_tools or ()):
+        _forum_grace[user_id] = FORUM_GRACE_TURNS
+    elif _forum_grace.get(user_id, 0) > 0:
+        _forum_grace[user_id] -= 1
+
 # Directive injectée quand le forum Orbis est ACTIF : « qui est X ? » → forum d'abord.
 # Injectée quand le message POINTE vers le forum (signal détecté) : là, elle fouille.
 FORUM_FIRST_DIRECTIVE = (
@@ -7575,9 +7719,49 @@ ORBIS_OFF_DIRECTIVE = (
     "Tu restes sur ce qui concerne ce serveur-ci."
 )
 
-async def execute_tool(name, args, guild, caller_id=None, caller_name=None, caller_channel_id=None):
+# Injectée à CHAQUE tour sur un serveur Orbis, quel que soit le signal : la cloison entre
+# l'univers du projet et tout le reste (autres œuvres, web). Complète les verrous d'outils.
+ORBIS_ONLY_DIRECTIVE = (
+    "\n\nSOURCE UNIQUE — LE FORUM ORBIS NATURAE, ET RIEN D'AUTRE. Ici, l'univers dont on parle est "
+    "TOUJOURS Orbis Naturae. Pour toute question de savoir sur un monde, un personnage, un lieu, une "
+    "faction, une créature, un dieu ou une règle de jeu, ta SEULE source est le forum officiel "
+    f"({FORUM_URL}). Tu ne vas PAS chercher la réponse ailleurs — ni moteur de recherche, ni wiki, "
+    "ni autre forum, ni autre site — et tu ne la complètes JAMAIS avec ce que tu connais d'AUTRES "
+    "univers : Warhammer, Donjons & Dragons, Le Seigneur des Anneaux, Warcraft, The Witcher, les "
+    "mythologies, ou n'importe quelle autre œuvre. Un nom qui existe aussi ailleurs (un empire, un "
+    "ordre, une race, une créature, un dieu) désigne ICI sa version Orbis Naturae, pas celle d'un "
+    "autre univers : tu ne plaques pas le lore d'une autre œuvre dessus, même « pour donner une "
+    "idée » ou « par comparaison ». Si le forum n'en dit rien — ou si tu ne l'as pas consulté pour "
+    "ce message — tu le dis franchement plutôt que de combler le vide avec autre chose. Seules "
+    "exceptions : on te demande EXPLICITEMENT une recherche sur internet, ou on te donne soi-même "
+    "un lien à lire."
+)
+
+def forum_maybe_directive(fiches=(), suite=False):
+    """Directive du cas INTERMÉDIAIRE : pas de mot « forum », mais le message nomme une fiche
+    connue ou prolonge une fouille. Elle garde ses outils de forum et tranche elle-même."""
+    raisons = []
+    if fiches:
+        raisons.append("il nomme ce qui ressemble à une fiche du forum ("
+                       + ", ".join(f"« {t[:80]} »" for t in fiches) + ")")
+    if suite:
+        raisons.append("tu viens de fouiller le forum et c'est peut-être la suite de la question")
+    return (
+        "\n\nCE MESSAGE TOUCHE PEUT-ÊTRE À L'UNIVERS ORBIS NATURAE : " + " ; ".join(raisons) + ". "
+        "S'il porte bien sur le monde, un personnage, un lieu, une faction, une créature ou une règle "
+        "du jeu, tu vas chercher à la SOURCE avec fouiller_forum, tu lis vraiment ce que tu trouves et "
+        "tu SOURCES (liens) ; si le forum ne renvoie rien, tu le dis — « j'ai rien trouvé sur X sur le "
+        "forum » — sans jamais inventer. S'il porte manifestement sur autre chose (un membre Discord, "
+        "le serveur, la vie de tous les jours, une simple réaction), tu réponds normalement, dans ta "
+        "voix, sans ouvrir le forum."
+    )
+
+async def execute_tool(name, args, guild, caller_id=None, caller_name=None, caller_channel_id=None,
+                       allowed_hosts=None):
+    """Exécute un outil demandé par le modèle. caller = qui parle (pour le cloisonnement mémoire).
+    allowed_hosts = hôtes que les outils de lecture ont le droit de toucher (serveur Orbis :
+    forum officiel + liens donnés par les gens) ; None = aucune restriction."""
     here = bot.get_channel(caller_channel_id) if caller_channel_id else None
-    """Exécute un outil demandé par le modèle. caller = qui parle (pour le cloisonnement mémoire)."""
     print(f"🔧 Outil: {name}({args})")
     caller_is_mschap = is_mschap(caller_id, caller_name)
     caller_is_admin = is_admin(caller_id, caller_name)
@@ -7748,7 +7932,7 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
                 return head + "\n(aucune note)"
             return head + "\n" + "\n".join(f"- ({n['date'][:10]}) {n['text']}" for n in notes)
         if name == "lire_page":
-            return await tool_lire_page(args.get("urls", ""))
+            return await tool_lire_page(args.get("urls", ""), allowed_hosts=allowed_hosts)
         if name == "consulter_forum":
             return await consulter_forum(args.get("sujet", ""))
         if name == "fouiller_forum":
@@ -7757,13 +7941,21 @@ async def execute_tool(name, args, guild, caller_id=None, caller_name=None, call
             # elle sert à CIBLER. On repère les sujets pertinents connus, et on part fouiller
             # normalement — le contenu est toujours lu frais, mais on sait où chercher.
             depart = None
-            if sujet and not args.get("url"):
+            url_arg = (args.get("url") or "").strip()
+            if url_arg.startswith("/"):
+                # Lien relatif (« /f2-les-heros-incarnes ») : il désigne une page du forum officiel.
+                from urllib.parse import urljoin
+                url_arg = urljoin(FORUM_URL, url_arg)
+            if url_arg and allowed_hosts is not None and _host(url_arg) not in allowed_hosts:
+                # SOURCE UNIQUE : un site que personne ne lui a donné → on reste sur le forum officiel.
+                print(f"🚧 fouiller_forum : {url_arg} est hors forum, fouille ramenée sur {FORUM_URL}")
+                url_arg = ""
+            if sujet and not url_arg:
                 cibles = library_targets(sujet, limit=3)
                 if cibles:
                     noms = ", ".join(c["titre"] for c in cibles if c.get("titre"))
                     print(f"📖 Bibliothèque : sujets ciblés pour « {sujet} » → {noms}")
                     depart = cibles[0]["url"]     # on démarre la fouille sur le sujet le plus pertinent
-            url_arg = args.get("url")
             strict = bool(args.get("strict", False))
             # Un lien de SECTION explicite (/f2-…, /c3-…) ⇒ on reste dedans par défaut : l'utilisateur
             # a pointé une zone précise. On n'écrase pas un strict=false posé volontairement.
@@ -8763,16 +8955,21 @@ def strip_player_memory(prompt):
         "\n\nRAPPEL : pour cette réponse, tu ne disposes QUE de tes sources forum. Tes notes sur les "
         "membres Discord ont été volontairement écartées — n'invente pas ce qui manque, dis-le.")
 
-async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=None, caller_name=None, caller_channel_id=None, long_reply=False, route="chat", temperature=0.85):
+async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=None, caller_name=None, caller_channel_id=None, long_reply=False, route="chat", temperature=0.85, allowed_hosts=None):
     """Boucle de conversation avec tool calling natif.
     tools = liste d'outils autorisés pour cet interlocuteur (None = aucun).
     long_reply = True si une délibération a eu lieu (réponse plus développée attendue).
     temperature = chaleur de génération (conversation pure : plus haut, pour varier ; restitution : plus bas).
     route = « chat » ou « roleplay » (mêmes modèles, réglages différents).
-    Renvoie (texte, used_tools) — used_tools sert au gating des tours suivants."""
+    allowed_hosts = hôtes lisibles par les outils de lecture (cf. orbis_source_scope) ; None = libre.
+    Renvoie (texte, used_tools) — used_tools est l'ENSEMBLE des outils réellement exécutés
+    (vide = aucun) ; il sert au gating des tours suivants."""
     messages = [{"role": "system", "content": system_prompt}] + thread
     tools = list(tools) if tools else None
-    used_tools = False
+    # Seuls les outils PROPOSÉS pour ce message sont exécutables : le retrait d'un outil
+    # (forum, web, outils élevés) est ainsi une vraie barrière, pas une simple suggestion.
+    offered = {t["function"]["name"] for t in tools} if tools else set()
+    used_tools = set()
     conv_temp = max(0.1, min(1.2, float(temperature)))   # borne de sécurité
     # long_reply passe aussi à True si une recherche web/forum a lieu (résultat riche)
 
@@ -8853,12 +9050,21 @@ async def chat_with_tools(system_prompt, thread, guild, tools=None, caller_id=No
                     args = json.loads(raw or "{}")
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-            used_tools = True
-            result = await execute_tool(tc.function.name, args, guild, caller_id, caller_name, caller_channel_id)
+            execute = tc.function.name in offered
+            if execute:
+                used_tools.add(tc.function.name)
+                result = await execute_tool(tc.function.name, args, guild, caller_id, caller_name,
+                                            caller_channel_id, allowed_hosts=allowed_hosts)
+            else:
+                print(f"🚧 Outil non proposé refusé : {tc.function.name}")
+                result = ("Outil indisponible pour ce message : il ne t'a pas été proposé. Réponds "
+                          "sans lui, et dis franchement ce que tu n'as pas pu faire ou trouver.")
             # TRACE DE TOUTE ACTION : sans ça, impossible de savoir si elle a vraiment agi
             # ou si elle s'est contentée de dire qu'elle l'avait fait.
             log_tool_call(tc.function.name, args, result, caller_name or str(caller_id))
-            if tc.function.name in ("fouiller_forum", "consulter_forum"):
+            if not execute:
+                cap = TOOL_RESULT_MAX_CHARS
+            elif tc.function.name in ("fouiller_forum", "consulter_forum"):
                 cap = FORUM_TOOL_RESULT_MAX
                 long_reply = True
                 # RESTITUTION FORUM : on écarte la mémoire des joueurs du contexte, pour qu'elle
@@ -14856,27 +15062,49 @@ async def on_message(message):
         # En MP (guild None), on hérite du serveur d'attache (get_guild_setting).
         orbis_on = get_guild_setting(getattr(message.guild, "id", None), "forum_orbis", False)
         tools_for_user = filter_tools_for_guild(tools_for_user, orbis_on)
+        allowed_hosts = None      # None = lecture d'URL libre (serveurs sans forum Orbis)
         if orbis_on:
-            # Déduction DÉTERMINISTE joueur vs forum : on n'autorise la fouille du forum
-            # QUE si le message le signale (mot-clé, lien, univers/RP). Sinon on RETIRE les
-            # outils de consultation du forum — elle ne peut plus fouiller ni inventer, elle
-            # répond depuis sa mémoire interne (ou dit qu'elle ne connaît pas ce membre).
+            # SOURCE UNIQUE : pas de recherche web sauf demande explicite, et lecture d'URL
+            # bornée au forum + aux liens que des humains ont donnés (ce message, ses tours
+            # précédents, le fil récent du salon). Jamais une URL sortie de la tête du modèle.
+            liens_humains = [m.get("content", "") for m in conversations[user_id][-6:]
+                             if m.get("role") == "user"]
+            if not is_dm:
+                liens_humains += [t.get("content", "") for t in _channel_threads.get(message.channel.id, [])
+                                  if t.get("role") == "user"]
+            tools_for_user, allowed_hosts = orbis_source_scope(tools_for_user, content, liens_humains)
+            # Déduction DÉTERMINISTE joueur vs forum, à trois issues :
+            #  - signal EXPLICITE (mot-clé, lien, univers/RP) → elle fouille le forum ;
+            #  - signal PROBABLE (le message nomme une fiche connue du forum, ou prolonge une
+            #    fouille), sans membre Discord nommé → elle garde ses outils et tranche ;
+            #  - rien → on RETIRE les outils de consultation du forum : elle répond depuis sa
+            #    mémoire interne (ou dit qu'elle ne connaît pas ce membre), sans rien inventer.
+            fiches, suite = [], False
+            peut_fouiller = any(t["function"]["name"] in FORUM_LOOKUP_TOOLS for t in (tools_for_user or []))
+            if peut_fouiller and not mentionnes and route != "roleplay":
+                fiches = forum_titles_in_text(content)
+                suite = _forum_grace.get(user_id, 0) > 0
             if forum_signal(content):
                 system_prompt += FORUM_FIRST_DIRECTIVE
             else:
-                if tools_for_user:
-                    tools_for_user = [t for t in tools_for_user
-                                      if t["function"]["name"] not in FORUM_LOOKUP_TOOLS]
-                system_prompt += FORUM_INTERNAL_DIRECTIVE
-                # Pas du forum → c'est une vraie discussion : on remet sa VOIX, son humeur
-                # et le ton Discord naturel (retirés plus haut parce que le message a
+                if fiches or suite:
+                    system_prompt += forum_maybe_directive(fiches, suite)
+                else:
+                    if tools_for_user:
+                        tools_for_user = [t for t in tools_for_user
+                                          if t["function"]["name"] not in FORUM_LOOKUP_TOOLS]
+                    system_prompt += FORUM_INTERNAL_DIRECTIVE
+                # Pas (forcément) du forum → c'est une vraie discussion : on remet sa VOIX, son
+                # humeur et le ton Discord naturel (retirés plus haut parce que le message a
                 # déclenché le mode outil), pour qu'elle réponde avec sa personnalité et son
-                # esprit, pas en rapport factuel. Sauf en pleine scène RP.
+                # esprit, pas en rapport factuel. Sauf en pleine scène RP. Si elle fouille quand
+                # même, la consigne de restitution du résultat d'outil reprend la main.
                 if route != "roleplay":
                     if VOIX not in system_prompt:
                         system_prompt += "\n\n" + VOIX + "\n\n" + self_state_block()
                     if NATUREL_DISCORD not in system_prompt:
                         system_prompt += "\n\n" + NATUREL_DISCORD
+            system_prompt += ORBIS_ONLY_DIRECTIVE
         else:
             system_prompt += ORBIS_OFF_DIRECTIVE
 
@@ -14907,8 +15135,10 @@ async def on_message(message):
                                                       tools=tools_for_user, caller_id=user_id, caller_name=username,
                                                       caller_channel_id=message.channel.id,
                                                       long_reply=long_answer, route=route,
-                                                      temperature=conv_temp)
+                                                      temperature=conv_temp,
+                                                      allowed_hosts=allowed_hosts)
         update_tool_grace(user_id, used_tools)
+        update_forum_grace(user_id, used_tools)
 
         reply = reply or "👁️ ..."
         reply_clean = _CUT_RE.sub("\n", reply).strip() or reply  # historique lisible, sans [cut]
@@ -14942,7 +15172,7 @@ async def on_message(message):
 
         # Après une recherche web/forum (used_tools), on montre les liens en clair,
         # sans les intégrations Discord qui se déploient : juste l'URL.
-        await send_reply(message, reply, no_embeds=used_tools)
+        await send_reply(message, reply, no_embeds=bool(used_tools))
 
         # Extraction mémoire, cadencée par utilisateur (jamais mélangée entre personnes)
         threshold = MEMORY_EXTRACT_EVERY if mschap_user else get_setting("extract_every", USER_EXTRACT_EVERY)
